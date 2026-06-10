@@ -16,6 +16,13 @@
  */
 import { afterAll, describe, expect, it } from 'vitest';
 
+// 动态 import 的 index/persistence/db 会触发 env.ts 全量校验（含 LLM_*）；本套件 mock LLM，
+// 注入 LLM 占位，使「只设 DATABASE_URL、未设真实 LLM key」时套件能干净运行，
+// 而非在 import 期因 env 校验失败而报错（mock 路径不发起真实 LLM 调用）。
+process.env.LLM_API_KEY ||= 'integration-placeholder';
+process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
+process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
+
 const databaseUrl = process.env.DATABASE_URL;
 
 const VALID_OUTPUT = {

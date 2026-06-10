@@ -26,17 +26,35 @@ export async function pingRedis(timeoutMs = 2000): Promise<boolean> {
     enableOfflineQueue: false,
   });
 
+  // ioredis 的 Redis 是 EventEmitter：连接失败会发 'error' 事件，无监听器时
+  // ioredis 会打印 "[ioredis] Unhandled error event"。健康探针已通过下面的
+  // race/catch 处理失败并返回 false，故在此吞掉 error 事件，避免 redis 不可达时刷屏。
+  client.on('error', () => {
+    /* 失败语义由 pingRedis 的返回值承载，无需再噪声化 */
+  });
+
+  // connect+ping 链：即便 timeout 先赢得 race、随后 disconnect() 把 client 拆掉，
+  // 该链最终仍会 reject。必须给它挂 catch 吞掉，否则成为 unhandledRejection
+  // （redis 慢/不可达时的噪声，严格模式下可能崩进程）。
+  const connectAndPing = client.connect().then(() => client.ping());
+  connectAndPing.catch(() => {
+    /* race 已由 timeout 决出胜负；孤儿 reject 在此被处理 */
+  });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const pong = await Promise.race([
-      client.connect().then(() => client.ping()),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('redis ping 超时')), timeoutMs),
-      ),
+      connectAndPing,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('redis ping 超时')), timeoutMs);
+      }),
     ]);
     return pong === 'PONG';
   } catch {
     return false;
   } finally {
+    // 清掉未触发的超时定时器，避免无谓地保活事件循环。
+    if (timer) clearTimeout(timer);
     // disconnect() 立即断开，不等待 pending 重连，避免句柄泄漏。
     client.disconnect();
   }

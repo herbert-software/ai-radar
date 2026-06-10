@@ -9,6 +9,13 @@
  */
 import { afterAll, describe, expect, it } from 'vitest';
 
+// 本套件只需真实 pg+redis；但动态 import 的 app→db→env.ts 会校验**全部** env（含 LLM_*）。
+// 注入 LLM 占位，使「只设 DATABASE_URL+REDIS_URL、未设 LLM key」时套件仍能干净运行，
+// 而非在 import 期因 env 校验失败而报错（占位仅过校验，本套件不发起任何 LLM 调用）。
+process.env.LLM_API_KEY ||= 'integration-placeholder';
+process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
+process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
+
 const hasInfra = Boolean(process.env.DATABASE_URL && process.env.REDIS_URL);
 
 describe.skipIf(!hasInfra)('/health integration（真实依赖）', () => {
