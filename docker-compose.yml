@@ -1,0 +1,47 @@
+# ai-radar P0 本地基础设施编排
+#
+# 一键启动：docker compose up -d
+# 健康查看：docker compose ps（两服务均应进入 healthy）
+# 停止清理：docker compose down（加 -v 可一并删卷）
+#
+# 不变量（来自 platform-foundation spec）：
+# - postgres 使用 pgvector/pgvector 镜像作为地基，但本期零向量：
+#   不挂任何 init SQL 去 CREATE EXTENSION vector，不建 vector 列。
+#   pgvector 镜像默认不会自动启用扩展，此处也不引入任何启用逻辑。
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ai_radar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_radar}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_radar}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_radar} -d ${POSTGRES_DB:-ai_radar}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  postgres_data:
+  redis_data:

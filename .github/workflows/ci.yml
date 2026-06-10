@@ -1,0 +1,67 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ai_radar
+          POSTGRES_PASSWORD: ai_radar
+          POSTGRES_DB: ai_radar
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_radar -d ai_radar"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Migrate smoke (drizzle-kit migrate against ephemeral Postgres)
+        env:
+          DATABASE_URL: postgres://ai_radar:ai_radar@localhost:5432/ai_radar
+        run: npm run migrate
+
+      - name: Test (vitest)
+        env:
+          # CI 无真实基础设施/密钥：注入占位 env 让 src/config/env.ts 的
+          # import 即 Zod 校验通过；依赖真实服务的 integration 用例由各自
+          # 测试以 skipIf 跳过，纯 mock/单元用例正常运行。
+          DATABASE_URL: postgres://ai_radar:ai_radar@localhost:5432/ai_radar
+          REDIS_URL: redis://localhost:6379
+          LLM_API_KEY: ci-placeholder-key
+          LLM_MODEL: gpt-4o-mini
+          LLM_BASE_URL: https://example.invalid/v1
+        run: npm run test

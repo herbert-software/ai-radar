@@ -217,4 +217,80 @@ DEFAULT_TIMEZONE=Asia/Shanghai
 
 本项目采用 **OpenSpec（spec-driven）** 工作流。项目上下文与不变量沉淀在 [`openspec/config.yaml`](./openspec/config.yaml)，需求权威文档为 [`QA.md`](./QA.md)。AI 协作约定见 [`CLAUDE.md`](./CLAUDE.md)。
 
-> 当前仓库处于设计 / 提案阶段，尚未包含运行代码。
+> P0「行走骨架」已落地：脚手架 + 核心 3 表 + `/health` + Value Judge Zod 往返雏形 + CI/Dependabot。下面是从零到验证的命令序列。
+
+## 本地起步 / 快速开始
+
+前置：Node ≥ 20、Docker（含 `docker compose`）。
+
+```bash
+# 1) 准备环境变量
+cp .env.example .env
+# 编辑 .env：
+#   - DATABASE_URL / REDIS_URL：用 docker-compose 默认即可（见下方说明）
+#   - LLM_API_KEY：填 OpenRouter key（形如 sk-or-...）
+#   - LLM_BASE_URL：默认 https://openrouter.ai/api/v1（可省）
+#   - LLM_MODEL：如 openai/gpt-4o-mini
+
+# 2) 起基础设施（postgres + redis）并确认健康
+docker compose up -d
+docker compose ps          # 两个服务都应显示 (healthy)
+
+# 3) 安装依赖
+npm install
+
+# 4) 迁移：对空库落 raw_items / ai_news_events / push_records 三张表（幂等，可重跑）
+npm run migrate
+
+# 5) 起 Hono 服务并验证健康检查
+npm run dev                # 监听 http://localhost:3000（PORT 可覆盖）
+curl http://localhost:3000/health
+# 期望：{"status":"ok","db":"ok","redis":"ok"}；任一依赖不可达会如实反映为 down
+
+# 6) Value Judge 真实往返（需真实 LLM key）：
+#    seed 一条假 raw_item → generateObject + Zod 校验 → 按字段名映射写 ai_news_events
+#    → 读回比对各 *_score 列；成功时会 dump 落库行作为可审计 artifact
+npm run roundtrip
+```
+
+> **DATABASE_URL 与 compose 默认对齐**：`docker-compose.yml` 默认用户/密码/库均为 `ai_radar`。
+> 若沿用 compose 默认，`.env` 里应填：
+> `DATABASE_URL=postgres://ai_radar:ai_radar@localhost:5432/ai_radar`、`REDIS_URL=redis://localhost:6379`。
+> （仓库内 `.env.example` 的示例串仅为占位，请按你的 compose 凭据填写。）
+
+辅助脚本：
+
+```bash
+npm run typecheck   # tsc --noEmit（strict）
+npm run lint        # eslint（flat config）
+npm run test        # vitest run（/health、迁移断言、Value Judge mock 往返等）
+```
+
+## P0 退出标准核对表
+
+逐条对照 `bootstrap-walking-skeleton` 提案的退出标准。状态如实反映（实测 / 待人工），
+手动验证步骤见 [`docs/verify-p0.md`](./docs/verify-p0.md)。
+
+| # | 退出标准 | 状态 | 证据 / 备注 |
+|---|---|---|---|
+| 1 | compose 健康（pg + redis healthy） | ✅ 已验证 | 实跑 `docker compose up`，pg+redis 进入 healthy |
+| 2 | migrate 落 3 表且幂等 | ✅ 已验证 | 对真实 pg 连跑两次，落 `raw_items`/`ai_news_events`/`push_records`，重跑不报错 |
+| 3 | `push_records` 唯一约束就位 | ✅ 已验证 | `information_schema` 断言测试验证 `UNIQUE(target_type, target_id, channel, push_date)` |
+| 4 | `/health` 通过 | ✅ 已验证 | 单测 + 实跑（双服务齐全返回 ok）；依赖不可达时如实反映 down |
+| 5 | Zod 校验失败可观测 | ✅ 已验证 | 单测覆盖：记录日志 → 有限重试 → 仍失败则降级（不写库），不静默吞掉 |
+| 6 | 一次**真实** generateObject + Zod 往返按映射落库读回 | ⏳ 待人工 | 往返代码 + mock-LLM 对真实 pg 落库往返已验证；仅缺真实 LLM 调用一次。**交付用户执行**，见下 |
+| 7 | Actions 全绿 | ⏳ 待人工 | CI 已完整实现并本地验证（lint/typecheck/migrate/test 全绿，含 postgres+redis service）；需 push 分支触发。**交付用户执行**，见下 |
+| 8 | Dependabot 激活 | ⏳ 待人工 | `.github/dependabot.yml` 覆盖 npm + github-actions；需在 GitHub 仓库确认已激活。**交付用户执行**，见下 |
+
+### 交付用户执行（待人工项）
+
+以下三项依赖真实凭据或 GitHub 侧操作，无法在本地无 key 环境完成，交付用户执行：
+
+- **退出标准 6 — 真实 LLM 往返（对应任务 5.6）**：在带真实 OpenRouter key 的环境跑
+  `npm run roundtrip`，把 stdout 输出的 `artifact: "value-judge-roundtrip"` JSON（含 `agentOutput`
+  与落库读回的 `persistedEvent`）作为 PR artifact 附上。完整步骤见
+  [`docs/verify-p0.md`](./docs/verify-p0.md)。
+- **退出标准 7 — Actions 全绿（对应任务 6.5）**：推一个分支触发 `.github/workflows/ci.yml`，
+  在 GitHub Actions 页确认 lint / typecheck / migrate / test 全绿。
+- **退出标准 8 — Dependabot 激活（对应任务 6.5）**：在 GitHub 仓库 Settings → Code security
+  确认 Dependabot 已读取 `.github/dependabot.yml` 并对 npm 与 github-actions 两个 ecosystem 生效。
