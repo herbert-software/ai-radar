@@ -1,0 +1,30 @@
+# 构建上下文排除：缩小镜像层、杜绝把本地依赖/密钥/测试拷进镜像。
+# 保留：src/、drizzle/（迁移）、package*.json、tsconfig.json、drizzle.config.ts。
+
+# 本地依赖与构建产物（镜像内由 npm ci 重新安装；dist 本项目不产）
+node_modules
+dist
+
+# 密钥 / 本地环境（绝不进镜像；运行期由 compose env_file/environment 注入）
+.env
+.env.*
+!.env.example
+
+# 版本控制 / CI / 文档（运行期无关）
+.git
+.github
+*.md
+openspec
+
+# 测试与本地工具配置（运行期无关；tsx 不需要它们）
+**/__tests__
+**/*.test.ts
+vitest.config.*
+eslint.config.*
+.vscode
+.idea
+
+# Docker 自身
+Dockerfile
+.dockerignore
+docker-compose*.yml

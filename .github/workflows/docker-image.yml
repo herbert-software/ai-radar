@@ -1,0 +1,71 @@
+name: docker-image
+
+# 构建（并在 main/tag 推送）多架构运行镜像到 GHCR。
+# - PR：只 buildx 构建验证 Dockerfile（不推送），与 CI 测试解耦。
+# - push main / 打 tag v*：构建 linux/amd64 + linux/arm64 并推 ghcr.io/<owner>/ai-radar。
+#   双架构覆盖 amd64 与 arm64 目标主机，部署侧可直接 docker compose pull。
+#
+# 权衡（已知）：本 workflow 与 ci.yml（lint/typecheck/migrate/test）相互独立、不互为门控——
+# 即镜像构建通过即推送，不强制等 CI 测试通过。本仓 main 仅经 PR 合入（PR 上 ci.yml 已门控），
+# 且部署为运维显式 `docker compose pull` 按需触发、非自动部署，故坏 latest 在到达生产前可见，
+# 风险可控。若要严格门控（仅 CI 通过后才发布），可改为 workflow_run 依赖 "CI" 成功后触发。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU (跨架构构建)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 仅非 PR 事件登录并推送（PR 来自 fork 时无 packages 写权限，且本就只验证构建）。
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ai-radar
+          # latest=false 关掉 metadata-action 默认的 latest=auto：否则推 v* semver tag 时会自动
+          # 再打一个 :latest，覆盖「跟随 main 的滚动镜像」。改由下方 type=raw 仅在 main 打 latest。
+          flavor: |
+            latest=false
+          # semver tag 形如 v1.2.3 → 产出 :1.2.3（{{version}} 去掉 v 前缀）；另产 :sha-<短哈希>。
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build (and push on non-PR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
