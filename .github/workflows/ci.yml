@@ -37,7 +37,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          # 与运行镜像（Dockerfile: node:22-alpine）对齐，使 CI 跑的就是部署运行时版本。
+          node-version: 22
           cache: npm
 
       - name: Install dependencies

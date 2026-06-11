@@ -4,6 +4,11 @@ name: docker-image
 # - PR：只 buildx 构建验证 Dockerfile（不推送），与 CI 测试解耦。
 # - push main / 打 tag v*：构建 linux/amd64 + linux/arm64 并推 ghcr.io/<owner>/ai-radar。
 #   双架构覆盖 amd64 与 arm64 目标主机，部署侧可直接 docker compose pull。
+#
+# 权衡（已知）：本 workflow 与 ci.yml（lint/typecheck/migrate/test）相互独立、不互为门控——
+# 即镜像构建通过即推送，不强制等 CI 测试通过。本仓 main 仅经 PR 合入（PR 上 ci.yml 已门控），
+# 且部署为运维显式 `docker compose pull` 按需触发、非自动部署，故坏 latest 在到达生产前可见，
+# 风险可控。若要严格门控（仅 CI 通过后才发布），可改为 workflow_run 依赖 "CI" 成功后触发。
 on:
   push:
     branches: [main]

@@ -54,14 +54,14 @@ git clone <repo> ai-radar && cd ai-radar
 docker compose --profile app up -d --build
 docker compose ps                 # postgres/redis healthy，migrate 已 Exit 0，worker/web Up
 docker compose logs -f worker     # 看到「已启动 N 条调度链」即成功
-curl localhost:3000/health        # {"status":"ok",...}
+curl localhost:3000/health        # {"db":"ok","redis":"ok"}（全 ok 返回 200，任一 down 返回 503）
 ```
 
 arm64 / amd64 主机都能本地构建（基础镜像均为多架构）。
 
 ### 方式 B：拉 CI 构建的镜像（GHCR）
 
-CI（`.github/workflows/docker-image.yml`）在 push main / 打 `v*` tag 时构建 **amd64+arm64** 多架构镜像并推 `ghcr.io/<owner>/ai-radar:latest`。目标主机直接拉：
+CI（`.github/workflows/docker-image.yml`）在 push main / 打 `v*` tag 时构建 **amd64+arm64** 多架构镜像并推 `ghcr.io/herbert-software/ai-radar:latest`（owner 取 `github.repository_owner`，与 compose 的 `image:` 默认值一致）。目标主机直接拉：
 
 ```bash
 # 若该 GHCR package 为私有，先登录（PAT 需 read:packages）：
@@ -72,6 +72,7 @@ docker compose --profile app up -d
 ```
 
 > 公开该 package 后可免登录直接 pull。
+> 镜像名如需改（如 fork 到别的 owner），设环境变量 `AI_RADAR_IMAGE=ghcr.io/<owner>/ai-radar:latest` 即可，compose 会用它覆盖默认值。
 
 ---
 

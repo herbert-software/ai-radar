@@ -23,13 +23,18 @@
 x-app: &app
   build: .
   # 本地 build 与 CI 推送（GHCR）共用此 tag：`up --build` 本地构建、`pull` 拉 CI 多架构镜像。
-  image: ghcr.io/herbertgao/ai-radar:latest
+  # owner 必须与 CI 推送口径一致——docker-image.yml 用 ${{ github.repository_owner }}，
+  # 本仓 owner = herbert-software，故默认 ghcr.io/herbert-software/ai-radar；可用 AI_RADAR_IMAGE 覆盖。
+  image: ${AI_RADAR_IMAGE:-ghcr.io/herbert-software/ai-radar:latest}
   env_file:
     - .env
   environment:
     # 覆盖 .env 里的 localhost：容器内经服务名互联。
     DATABASE_URL: postgres://${POSTGRES_USER:-ai_radar}:${POSTGRES_PASSWORD:-ai_radar}@postgres:5432/${POSTGRES_DB:-ai_radar}
     REDIS_URL: redis://redis:6379
+    # 钉死容器内监听端口为 3000：防 .env 里若写了 PORT 经 env_file 注入 web、
+    # 令其监听非 3000 而主机映射写死 :3000 → /health 探活失配。migrate/worker 不起 HTTP，忽略此值。
+    PORT: "3000"
 
 services:
   postgres:
@@ -74,7 +79,8 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # ── 应用：常驻 worker（profile=app）。四条调度链；周报默认禁用。
+  # ── 应用：常驻 worker（profile=app）。默认 3 条调度链生效（日报/产品发现/实时告警）；
+  #    周报为第 4 条、默认禁用（WEEKLY_REPORT_ENABLED=false）。
   worker:
     <<: *app
     profiles: ["app"]
@@ -88,7 +94,7 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  # ── 应用：HTTP 健康端点（profile=app）。暴露 /health 供监控/Tailscale 探活。
+  # ── 应用：HTTP 健康端点（profile=app）。暴露 /health 供监控/内网探活。
   web:
     <<: *app
     profiles: ["app"]
@@ -103,6 +109,14 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+    # 把 /health 接入编排：busybox wget 在 503（DB/Redis down）时非零退出 → 容器转 unhealthy，
+    # 使 `docker compose ps` 的健康状态可信、而非进程活着就恒显 Up。
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
 volumes:
   postgres_data:
