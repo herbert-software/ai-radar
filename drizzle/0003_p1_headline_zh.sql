@@ -1,0 +1,1 @@
+ALTER TABLE "ai_news_events" ADD COLUMN "headline_zh" text;

@@ -16,7 +16,7 @@
 | 期 | 里程碑 | 工期 | 周次 | 估算日历 | 关键交付物 | 依赖 | 退出标准（可观测） |
 |---|---|---|---|---|---|---|---|
 | **P0** | 地基 / Walking skeleton | 1 周 | W1 | 06-16 ~ 06-22 | TS+Hono+Drizzle 脚手架、docker-compose(pg+redis)、核心表 migration、`.env.example`、CI、一次 Zod 校验的真实 LLM 调用 | — | `docker compose up` 起得来；migration 落表；健康检查通过；`generateObject` 跑通一次 |
-| **P1** | 最小情报流（**首个真上线**） | 2–3 周 | W2 ~ W4 | 06-23 ~ 07-13 | RSS + HN/GitHub 两源、`raw_items` 入库、**硬去重**、Value Judge(Zod)、中文摘要、**Telegram 单通道 + 幂等**、BullMQ 每日任务 | P0 | 每日定时推 Top N；同一天同一条不重复；带 utm 的 URL 被归一为同一条 |
+| **P1** ✅ | 最小情报流（**首个真上线**） | 2–3 周 | W2 ~ W4 | 06-23 ~ 07-13 | RSS + HN/GitHub 三源、`raw_items` 入库、**硬去重**、Value Judge(Zod)、中文摘要、**Telegram 单通道 + 幂等**、BullMQ 每日任务 | P0 | **退出标准达成**（见下「P1 退出标准达成」）：每日定时推 Top N（BullMQ cron + `runDailyWorkflow`）；同一天同一条不重复（`push_records` 幂等 + 单例锁）；带 utm 的 URL 被归一为同一条（URL 归一 + `dedup_key` 塌缩） |
 | **P2** | 扩源 + 双通道 + 产品发现 | 3–4 周 | W5 ~ W8 | 07-14 ~ 08-10 | GitHub/Product Hunt/Reddit/arXiv collector、飞书通道、`ai_products` 表 + **硬规则产品合并**、实时重大发布告警、周报 | P1 | 双通道均不重复推；每日产品发现推送；实时告警跑通 |
 | **P3** | 语义去重 + 知识库 | 3–4 周 | W9 ~ W12 | 08-11 ~ 09-07 | pgvector embedding 去重 + LLM 二次判断、`ai_news_events` 事件合并、KB 入库（本地表 → Dify HTTP）、只入 `long_term_value≥70` | P2 + 真实数据积累 | 中英文同一事件被识别为一条；阈值经真实数据调过；KB 可检索 |
 | **P4** | MCP 查询入口 | 1.5–2 周 | W9 ~ W11（与 P3 并行） | 08-11 ~ 08-24 | MCP server：`get_today_ai_digest` / `search_ai_events` / `search_ai_products` / `mark_*` / `push_event_now` | P2 | 从 Claude/Cursor 查到当日日报与历史 |
@@ -24,6 +24,21 @@
 | **P6** | Web 控制台（可选，延后） | 按需 | — | — | 前后端同 TS、复用 Zod schema 的人工干预面板 | P4 | — |
 
 **关键路径**：P0 → P1 → P2 → P3 → P5 ≈ **13–17 周（约 3.5–4 个月）** 到完整顾问；**首个可用版本约第 4 周末（7 月中）** 上线。
+
+## P1 退出标准达成
+
+`minimal-intel-pipeline` 提案已实现，三条可观测退出标准均由程序 + DB 保障并有不变量测试覆盖：
+
+| 退出标准 | 状态 | 实现与证据 |
+|---|---|---|
+| 每日定时推 Top N | ✅ 已实现 | BullMQ 每日 cron 重复任务（`DAILY_DIGEST_CRON`，默认 08:00 Asia/Shanghai）触发 `runDailyWorkflow()`（`src/pipeline/`）；组合分排序 + importance 下限闸 + 确定性 tiebreaker 取 Top N。`npm run worker` 起常驻调度，`npm run smoke` 手动触发一次。 |
+| 同一天同一条不重复 | ✅ 已实现 | event 粒度幂等：`UNIQUE(target_type, target_id, channel, push_date)` + 待发集合显式排除「今日已 success」+ Redis 全局单例锁（同 `push_date` 仅一实例）。覆盖测试：`src/push/__tests__/dispatch.integration.test.ts`（pushIdempotency / 单例锁，本地实跑 7 用例全绿）。 |
+| 带 utm 的 URL 被归一为同一条 | ✅ 已实现 | URL 归一去 `utm/ref/gclid/fbclid/spm` + query 排序 + host 小写 + 去尾斜杠 → `canonical_url`；`dedup_key` 经 `ON CONFLICT` 塌缩为单一 `ai_news_events`。覆盖测试：`src/dedup/__tests__/normalize.test.ts` + `collapse.integration.test.ts`（dedup 不变量，本地实跑全绿）。 |
+
+> 验证：本地 `docker compose up -d` + `npm run migrate`（两次重跑验证迁移幂等）后，全量 vitest **126 测试全绿**
+> （含 pushIdempotency / dedup / URL 归一 / 降级熔断 10.4 / 单例锁五组不变量，连真实 pg+redis 实跑不 skip）。
+> CI（`.github/workflows/ci.yml`）带 postgres(pgvector) + redis services，迁移幂等与上述不变量测试在 CI 路径内实跑。
+> **真实 Telegram 送达**需真实 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` + 外网，交付用户本地执行 `npm run smoke` 确认。
 
 ## 排序依据
 

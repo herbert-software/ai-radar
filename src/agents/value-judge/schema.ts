@@ -13,13 +13,14 @@
  * `*_score` 列，禁止假定同名直插。映射逻辑见 ./mapping.ts。
  */
 import { z } from 'zod';
+import { looksLikeMojibake } from '../mojibake.js';
 
 /**
  * 0–100 评分字段公共约束。
  *
  * 必须为整数（`.int()`）：QA.md §10.4 的评分输出均为整数，且落库列为
  * `NUMERIC(5,2)`——若放行小数（如 82.555），DB 会静默四舍五入到 82.56，
- * 使「读回各 *_score 列与 Agent 输出一致」的往返比对（roundtrip.ts）假阴性。
+ * 使「读回各 *_score 列与 Agent 输出一致」的往返比对假阴性。
  * 用 `.int()` 把小数挡在 Zod 层（触发重试/降级，不落库），与 NUMERIC 整数语义对齐。
  */
 const scoreField = z.number().int().min(0).max(100);
@@ -45,7 +46,15 @@ export const valueJudgeOutputSchema = z.object({
   /** 是否应推送。 */
   should_push: z.boolean(),
   /** 判断理由（自然语言）。 */
-  reason: z.string().min(1),
+  reason: z
+    .string()
+    .min(1)
+    // 与 digest 同：上游间歇性双重编码会把中文 reason 返回成 mojibake（乱码）；
+    // 命中即视同未产出，走与 Zod 失败相同的重试/降级路径，绝不落库乱码。
+    .refine(
+      (v) => !looksLikeMojibake(v),
+      'reason 检出 mojibake（上游双重编码乱码）：必须触发重试/降级，绝不落库乱码',
+    ),
 });
 
 /** 经校验的 Value Judge 输出类型。 */

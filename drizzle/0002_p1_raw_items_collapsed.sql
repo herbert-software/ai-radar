@@ -1,0 +1,1 @@
+ALTER TABLE "raw_items" ADD COLUMN "collapsed" boolean DEFAULT false NOT NULL;

@@ -68,7 +68,11 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 
 /** 真实 SDK 适配：保留宽松签名以便依赖注入。 */
 const defaultGenerateObject: GenerateObjectFn = (args) =>
-  generateObject(args) as unknown as Promise<{ object: unknown }>;
+  // 加 abortSignal 超时：防一条挂起的 LLM 响应卡死整个评分阶段（超时抛错 → 走既有重试/降级链路）。
+  generateObject({
+    ...args,
+    abortSignal: AbortSignal.timeout(env.LLM_TIMEOUT_MS),
+  }) as unknown as Promise<{ object: unknown }>;
 
 function buildModel(): ReturnType<ReturnType<typeof createOpenAI>> {
   const provider = createOpenAI({

@@ -15,6 +15,9 @@ import { afterAll, describe, expect, it } from 'vitest';
 process.env.LLM_API_KEY ||= 'integration-placeholder';
 process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
+// 同理注入 Telegram 占位：P1 起 env.ts 把 TELEGRAM_* 列为必填，本套件不发推送，仅过校验。
+process.env.TELEGRAM_BOT_TOKEN ||= 'integration-placeholder';
+process.env.TELEGRAM_CHAT_ID ||= 'integration-placeholder';
 
 const hasInfra = Boolean(process.env.DATABASE_URL && process.env.REDIS_URL);
 

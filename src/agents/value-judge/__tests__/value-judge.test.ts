@@ -6,8 +6,8 @@
  * 2. 字段名映射正确（importance→importance_score 等，不串列）。
  * 3. 校验失败时降级抛错（不返回未校验数据；由调用方保证不写库）。
  *
- * 纯逻辑用例无需 DB。涉及真实落库的往返见同目录 roundtrip.integration.test.ts，
- * 由 DATABASE_URL 控制 skip。
+ * 纯逻辑用例无需 DB。真实落库（按 dedup_key 塌缩 + 写分往返）由 P1 流水线相关组实现，
+ * 其 integration 测试将另行落地（P0 的 seed roundtrip 脚手架已随 surrogate event_id 迁移退役）。
  */
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { valueJudgeOutputSchema } from '../schema.js';
@@ -29,6 +29,9 @@ beforeAll(async () => {
   // LLM_BASE_URL 虽有 .default()，但 .default() 不救空串（`export LLM_BASE_URL=`），
   // .url('') 会拒 → 套件 import 期假红。故同样用 ||= 占位，覆盖空串与 undefined 两态。
   process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
+  // P1 起 env.ts 把 TELEGRAM_* 列为必填；本纯单元套件不发推送，注入占位仅过 import 期校验。
+  process.env.TELEGRAM_BOT_TOKEN ||= 'test-bot-token';
+  process.env.TELEGRAM_CHAT_ID ||= 'test-chat-id';
   const mod = await import('../index.js');
   judgeRawItem = mod.judgeRawItem;
   ValueJudgeFailureError = mod.ValueJudgeFailureError;

@@ -217,7 +217,7 @@ DEFAULT_TIMEZONE=Asia/Shanghai
 
 本项目采用 **OpenSpec（spec-driven）** 工作流。项目上下文与不变量沉淀在 [`openspec/config.yaml`](./openspec/config.yaml)，需求权威文档为 [`QA.md`](./QA.md)。AI 协作约定见 [`CLAUDE.md`](./CLAUDE.md)。
 
-> P0「行走骨架」已落地：脚手架 + 核心 3 表 + `/health` + Value Judge Zod 往返雏形 + CI/Dependabot。下面是从零到验证的命令序列。
+> P0「行走骨架」与 P1「最小情报流」均已落地：P0 给出脚手架 + 核心 3 表 + `/health` + Value Judge Zod 往返雏形 + CI/Dependabot；P1 把脚手架接成端到端流水线（采集 → 去重 → 价值判断 → 中文摘要 → Telegram 推送 + BullMQ 每日定时）。下面先是 P0 的从零到验证序列，随后是 **P1 流水线运行说明**。
 
 ## 本地起步 / 快速开始
 
@@ -265,6 +265,51 @@ npm run typecheck   # tsc --noEmit（strict）
 npm run lint        # eslint（flat config）
 npm run test        # vitest run（/health、迁移断言、Value Judge mock 往返等）
 ```
+
+## P1 流水线运行说明（采集 → 去重 → 判断 → 摘要 → Telegram 推送）
+
+P1 把每日情报流水线接成一条 `runDailyWorkflow()`：三源采集（RSS / Hacker News /
+GitHub，`Promise.allSettled` 容错）→ URL/标题归一 + `dedup_key` 硬去重塌缩 → Value Judge
+逐条评分（只判未评分事件）→ Top N 组合分排序 + importance 下限闸 → 中文摘要 → grammY
+单通道 Telegram 推送（`push_records` 幂等 + 全局单例锁）。BullMQ 只当「每日 cron 定时
+触发器 + 整 job 重试外壳」，不拆阶段队列。
+
+> **日报格式（自 `improve-digest-format` 起）**：日报渲染已从「每条堆叠完整长摘要」改为
+> 「序号 + 代表标题（粗体，渲染期按 code point 截断 ≤`TITLE_MAX`）+ 一句话要点
+> （`headline_zh`，≤`HEADLINE_MAX`=80 字）+ 原文可点击链接（`canonical_url`）」——
+> 一眼能扫完、想深入再点链接。Digest Agent 在同一次结构化输出里新增 `headline_zh`
+> 短要点（落 `ai_news_events.headline_zh` 列，与长摘要 `summary_zh` 并存：`headline_zh`
+> 进日报，`summary_zh` 落库留待知识库 / Web 控制台）。回退链：`headline_zh` 缺失（旧事件/降级）
+> → `summary_zh` 截断前 ~80 字 → 仅标题；`canonical_url` 缺失则不渲染链接。因标题与要点均有界，
+> Top N（默认 8 条）一条消息远低于 Telegram ~4000 字上限，**截断顺延从常态退化为极少触发的兜底**
+> （截断逻辑与告警保留不变）。`HEADLINE_MAX`(80) / `TITLE_MAX`(120) 是代码内常量
+> （`src/agents/digest/`、`src/push/message.ts`），非环境变量，本变更未新增必填 env。
+
+前置同上：`docker compose up -d`（postgres + redis healthy）+ `npm run migrate`。
+此外 P1 需在 `.env` 补齐（见 [`.env.example`](./.env.example) 各项注释）：
+
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`：必填，否则启动即报错（推送目标）。
+- `RSS_FEEDS`：逗号分隔的真实 feed URL（留空则不采 RSS；三源全空会触发系统级故障告警、无内容可推）。
+- `GITHUB_TOKEN`：可选，提升 GitHub API 速率上限（留空匿名调用受更严限流）。
+- `TOP_N` / `RANK_WEIGHT_*` / `IMPORTANCE_FLOOR` / `DEGRADE_ABORT_RATIO` /
+  `FIRST_SEEN_WINDOW_DAYS` / `PUSH_TIMEZONE`：均有默认值，按需覆盖。
+- `DAILY_DIGEST_CRON`（默认 `0 8 * * *`）/ `DAILY_DIGEST_CRON_TZ`（默认 `Asia/Shanghai`）：定时触发时刻。
+
+```bash
+# A) 手动触发一次完整流水线（端到端冒烟，对应退出标准）：
+npm run smoke              # 真实推送：用 grammY 真把当日 Top N 日报发到 TELEGRAM_CHAT_ID
+npm run smoke -- --dry-run # 链路冒烟：不连 Telegram，把待发日报消息打到 stdout（验证链路不抛错）
+# stdout 末尾输出结构化 artifact（"daily-workflow-smoke"，含 outcome / 各阶段降级统计）作可审计证据。
+
+# B) 起常驻 worker：按 DAILY_DIGEST_CRON 每日定时触发日报（生产形态）
+npm run worker             # 注册每日 cron 重复任务 + 启动 BullMQ worker；Ctrl-C 优雅退出
+```
+
+> **幂等与单例不变量**：同一 `push_date`（Asia/Shanghai 口径）由 Redis 全局单例锁保证只跑一个实例；
+> 推送以 event 粒度走 `UNIQUE(target_type, target_id, channel, push_date)`，当天重跑「今日已 success」
+> 的事件不再重发；带 `utm/ref/gclid/fbclid/spm` 的 URL 经归一为同一 `canonical_url` 塌缩为同一事件。
+> 真实 Telegram 送达需真实凭据 + 外网，沙箱不可验证——`npm run smoke -- --dry-run` 已在本地 DB 上
+> 验证非 Telegram 部分链路不抛错；真实送达请按上面前置在本地执行 `npm run smoke` 确认。
 
 ## P0 退出标准核对表
 
