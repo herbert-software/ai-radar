@@ -7,8 +7,9 @@
  * 关键不变量（绝不可违背）：
  * - 候选窗口三条件齐：`should_push=true`
  *   AND `first_seen_at 在近 N 天`
- *   AND `该 event 从未被任何 push_date 以该 channel success 推送过`（跨天/跨次不重推，
- *   常青高分事件一生只成功推一次）。
+ *   AND `该 event 从未被任何 push_date 以任一通道 success 推送过`（跨天/跨次不重推，
+ *   常青高分事件一生只成功推一次）。统一日报模型（Model B）：每日选一份 channel-agnostic Top N，
+ *   同份发放给所有已配置通道；候选窗口不按 channel 限定（见 selectTopN 注释）。
  * - 候选窗口「今天」必须复用 push-date.ts 的同一 Asia/Shanghai 时间源（getPushDate），
  *   禁止另起一套时区计算导致两处口径漂移（design D5/D6）。
  * - 组合分 `rank_score = 0.45*importance + 0.25*developer_relevance + 0.20*novelty
@@ -23,13 +24,10 @@ import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env } from '../config/env.js';
 import { startOfDayInTimeZone } from '../push/push-date.js';
-import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
+import { TARGET_TYPE } from '../push/targets.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
-
-/** 默认推送通道（向后兼容 P1：事件日报走 telegram）。 */
-const DEFAULT_CHANNEL: Channel = CHANNEL.telegram;
 
 /** 候选/入选事件的最小视图（供 dispatcher 拼消息 + 排序）。 */
 export interface SelectedEvent {
@@ -60,13 +58,6 @@ export interface SelectTopNOptions {
   windowDays?: number;
   /** 覆盖组合分权重（默认 env.RANK_WEIGHT_*）。 */
   weights?: RankWeights;
-  /**
-   * 目标分发通道（默认 `telegram`）。候选窗口「从未以该 channel success」**按目标通道分别判定**
-   * （P2 多通道关键修正）：同一事件可能在 Telegram 已 success（从 Telegram 候选排除）、却在飞书
-   * 从未 success（仍进入飞书候选）。禁止按事件维度跨 channel 合并去重候选——否则一通道已推会
-   * 错误抑制另一通道待发，违反「同事件不同通道独立幂等」。
-   */
-  channel?: Channel;
 }
 
 /** 组合分权重（hype 为减项的非负幅度）。 */
@@ -165,13 +156,13 @@ export function rankAndSelect(
  *   should_push = true
  *   AND first_seen_at >= 今天（上海）往前第 (windowDays−1) 个自然日的 00:00（上海，换算为 UTC）
  *   AND importance_score >= importanceFloor   ← 下限闸
- *   AND NOT EXISTS (push_records success for this event on the **target channel** on any push_date)
+ *   AND NOT EXISTS (push_records success for this event on **any channel** on any push_date)
  *
  * 排序与取前 N 在程序内完成（compareForTopN），保证确定性 tiebreaker。
- * 候选窗口「从未 success」按目标 channel 分别判定（options.channel，默认 telegram）——同一事件
- * 可分别进入 telegram 与 feishu 候选。
+ * 候选窗口「从未 success」**channel-agnostic**（统一日报模型 Model B）：每日只选一份 Top N、同份
+ * 发放给所有已配置通道，一旦投递成功（任一通道）即不再跨天重选。
  *
- * @param options 可注入 now / topN / 阈值 / 权重 / channel（默认读 env、channel 默认 telegram）。
+ * @param options 可注入 now / topN / 阈值 / 权重（默认读 env）。
  * @param dbh     可注入 db 或事务句柄（默认全局 db）。
  */
 export async function selectTopN(
@@ -183,15 +174,18 @@ export async function selectTopN(
   const importanceFloor = options.importanceFloor ?? env.IMPORTANCE_FLOOR;
   const windowDays = options.windowDays ?? env.FIRST_SEEN_WINDOW_DAYS;
   const weights = options.weights ?? defaultWeights();
-  const channel = options.channel ?? DEFAULT_CHANNEL;
 
   // 「今天」与 push_date 同源：windowLowerBound 经 startOfDayInTimeZone 复用 push-date 的
   // Asia/Shanghai 时区源，下界 = 今天往前第 (windowDays−1) 个上海自然日的 00:00（防口径漂移）。
   const lowerBound = windowLowerBound(now, windowDays);
 
-  // 「从未被任何 push_date 以**目标 channel** success 推送过」用相关子查询 NOT EXISTS 表达——
-  // 跨天/跨次不重推（design D5）。注意是「从未 success」而非「今天未 success」；且按目标 channel
-  // 限定——同一事件可分别进入 telegram 与 feishu 候选（P2 多通道，禁止跨 channel 合并去重）。
+  // 「从未被任何 push_date 以**任一通道** success 推送过」用相关子查询 NOT EXISTS 表达——
+  // 跨天/跨次不重推（design D5）。注意是「从未 success」而非「今天未 success」。
+  //
+  // **统一日报模型（Model B）**：每日只选一份 Top N（channel-agnostic 候选窗口），同一份发放给所有
+  // 已配置通道（见 run-daily-workflow 阶段 6）；「今日 Top N = 尚未投递过的高价值事件」，一旦投递成功
+  // （任一通道）即不再跨天重选。各通道的同日幂等由 dispatcher computePendingSet 兜底、单通道瞬时
+  // 失败由整 job 同日重试兜底。故此处候选窗口**不按 channel 限定**——不再「telegram 的名单泄漏给飞书」。
   const neverSuccessfullyPushed = notExists(
     dbh
       .select({ one: sql`1` })
@@ -200,7 +194,6 @@ export async function selectTopN(
         and(
           eq(pushRecords.targetType, TARGET_TYPE.event),
           eq(pushRecords.targetId, aiNewsEvents.eventId),
-          eq(pushRecords.channel, channel),
           eq(pushRecords.status, 'success'),
         ),
       ),

@@ -116,22 +116,23 @@ interface AlertCandidate {
 }
 
 /**
- * 查「评分后达阈值且从未以该 channel success 告警过」的候选事件（realtime-alerts 一生一次）。
+ * 查「评分后达阈值且从未以任一通道 success 告警过」的候选事件（realtime-alerts 一生一次）。
  *
  * 条件（全在 SQL 程序层，无 LLM）：
  *   importance_score IS NOT NULL AND importance_score >= 阈值   ← 判定必在评分后（NULL 不误判）
  *   AND NOT EXISTS (push_records WHERE target_type='alert' AND target_id=event_id
- *                     AND channel=该channel AND status='success')   ← 该 channel 从未 success 告警
+ *                     AND status='success')   ← 任一通道从未 success 告警（channel-agnostic）
  *
- * 跨天去重靠「从未 success」候选窗口；同日并发由 UNIQUE 兜底（dispatcher 状态机）。
+ * **统一模型（Model B）**：选题与通道解耦——channel-agnostic 选出「该告警的事件」，再由 runAlertScan
+ * 同份发放给所有已配置通道（通道只负责投递上游统一选好的信息）。跨天去重靠「从未 success（任一通道）」
+ * 候选窗口；同日并发由 `UNIQUE(alert,event_id,channel,push_date)` 兜底（dispatcher 状态机）。
  * canonical_url 经 representative_raw_item_id 回指 raw_items（供告警消息渲染原文链接）。
  */
 export async function selectAlertCandidates(
-  channel: Channel,
   threshold: number,
   dbh: DbLike = defaultDb,
 ): Promise<AlertCandidate[]> {
-  const neverAlertedOnChannel = notExists(
+  const neverAlerted = notExists(
     dbh
       .select({ one: sql`1` })
       .from(pushRecords)
@@ -139,7 +140,6 @@ export async function selectAlertCandidates(
         and(
           eq(pushRecords.targetType, TARGET_TYPE.alert),
           eq(pushRecords.targetId, aiNewsEvents.eventId),
-          eq(pushRecords.channel, channel),
           eq(pushRecords.status, 'success'),
         ),
       ),
@@ -159,7 +159,7 @@ export async function selectAlertCandidates(
         // 判定必在评分后：importance_score 非 NULL（评分前为 NULL，`NULL >= 阈值` 恒假，不误判）。
         isNotNull(aiNewsEvents.importanceScore),
         gte(aiNewsEvents.importanceScore, String(threshold)),
-        neverAlertedOnChannel,
+        neverAlerted,
       ),
     );
 
@@ -242,50 +242,59 @@ export async function runAlertScan(
   );
 
   // ── 阶段 4：评分**后**判阈值 + 推送告警（纯程序阈值，非 LLM 决定）。
+  // **统一模型（Model B）**：channel-agnostic 选一次告警事件，每个事件**同份发放给所有已配置通道**
+  // （通道只负责投递上游统一选好的信息，不参与选题）。
   const channelSenders = resolveChannelSenders(options);
   const dispatched: AlertDispatchOutcome[] = [];
-  const candidateEventIds = new Set<string>();
 
-  for (const { channel, sender } of channelSenders) {
-    const candidates = await selectAlertCandidates(channel, threshold, dbh);
-    for (const c of candidates) candidateEventIds.add(c.eventId);
-    log(`告警候选[${channel}]: ${candidates.length} 条达阈值(>=${threshold})且从未 success 告警`);
+  // channel-agnostic 候选：达阈值且从未以任一通道 success 告警过（一生一次、跨天去重）。
+  const candidates = await selectAlertCandidates(threshold, dbh);
+  log(
+    `告警候选: ${candidates.length} 条达阈值(>=${threshold})且从未 success 告警，` +
+      `发放给 ${channelSenders.length} 个通道（${channelSenders.map((c) => c.channel).join(', ')}）`,
+  );
 
-    for (const candidate of candidates) {
-      // 独立单例锁 `alert:{channel}:{event_id}`：防两并发实例对同一告警各发一条
-      // （UNIQUE 挡不住并发双读双发）。job 级短时持有 + TTL/finally 释放（锁键无时间，
-      // 释放不可省）。未抢到 → 另一实例在发，本实例跳过该告警（不重复）。
-      const lock = await acquireAlertLock(channel, candidate.eventId, options.lock);
-      if (lock === null) {
-        log(`告警跳过[${channel}][${candidate.eventId}]: 未抢到单例锁`);
+  for (const candidate of candidates) {
+    // 独立单例锁 `alert:{event_id}`（per-event，覆盖该事件的多通道分发）：防两并发 alert-scan
+    // 实例对同一告警事件重复分发（UNIQUE 挡不住并发双读双发）。job 级短时持有 + TTL/finally
+    // 释放（锁键无时间，释放不可省）。未抢到 → 另一实例在发该事件，本实例跳过（不重复）。
+    const lock = await acquireAlertLock(candidate.eventId, options.lock);
+    if (lock === null) {
+      log(`告警跳过[${candidate.eventId}]: 未抢到单例锁`);
+      for (const { channel } of channelSenders) {
         dispatched.push({ eventId: candidate.eventId, channel, outcome: 'skipped-locked' });
-        continue;
       }
-      try {
-        // 复用 dispatcher 同一状态机：target_type='alert'、按事件单独成名单（告警一事一推）。
-        // 渲染走 dispatcher → message.ts 的 headline 回退链（headline_zh → summary_zh 截断 →
-        // representative_title → 仅标题），告警事件无摘要时不报错、不漏告警。
-        const result = await dispatchDigest(
-          [toSelectedEvent(candidate)],
-          { now, sender, channel, targetType: TARGET_TYPE.alert },
-          dbh,
-        );
-        dispatched.push({
-          eventId: candidate.eventId,
-          channel,
-          outcome: result.outcome === 'sent' ? 'sent'
-            : result.outcome === 'failed' ? 'failed'
-            : 'skipped',
-        });
-        log(`告警[${channel}][${candidate.eventId}]: outcome=${result.outcome}`);
-      } catch (error) {
-        // dispatch 自身抛错（如渲染/DB 异常）：记为 failed（跨天可重试），隔离不拖垮其余告警。
-        const reason = error instanceof Error ? error.message : String(error);
-        log(`告警[${channel}][${candidate.eventId}]: 异常隔离 ${reason}`, error);
-        dispatched.push({ eventId: candidate.eventId, channel, outcome: 'failed' });
-      } finally {
-        await lock.release();
+      continue;
+    }
+    try {
+      // 同份发放给所有已配置通道：各通道复用 dispatcher 同一状态机（target_type='alert'、按事件
+      // 单独成名单），各通道 computePendingSet + UNIQUE 同日幂等独立；渲染走 message.ts 的 headline
+      // 回退链（headline_zh → summary_zh 截断 → representative_title → 仅标题），无摘要不报错/不漏告警。
+      // 单通道发送失败隔离（各自 try/catch），不拖垮该事件的其余通道。
+      for (const { channel, sender } of channelSenders) {
+        try {
+          const result = await dispatchDigest(
+            [toSelectedEvent(candidate)],
+            { now, sender, channel, targetType: TARGET_TYPE.alert },
+            dbh,
+          );
+          dispatched.push({
+            eventId: candidate.eventId,
+            channel,
+            outcome: result.outcome === 'sent' ? 'sent'
+              : result.outcome === 'failed' ? 'failed'
+              : 'skipped',
+          });
+          log(`告警[${channel}][${candidate.eventId}]: outcome=${result.outcome}`);
+        } catch (error) {
+          // dispatch 自身抛错（如渲染/DB 异常）：记为 failed（跨天可重试），隔离不拖垮其余通道。
+          const reason = error instanceof Error ? error.message : String(error);
+          log(`告警[${channel}][${candidate.eventId}]: 异常隔离 ${reason}`, error);
+          dispatched.push({ eventId: candidate.eventId, channel, outcome: 'failed' });
+        }
       }
+    } finally {
+      await lock.release();
     }
   }
 
@@ -293,7 +302,7 @@ export async function runAlertScan(
     pushDate,
     collectedCount,
     judged: judgeResult.judged,
-    alertCandidateCount: candidateEventIds.size,
+    alertCandidateCount: candidates.length,
     dispatched,
   };
 }

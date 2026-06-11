@@ -123,6 +123,26 @@ export async function claimEventForJudging(
 }
 
 /**
+ * 释放某事件的评分 claim（清 `judge_claimed_at`，仅当仍未评分时）——评分失败/降级后即时调用，
+ * 使下一轮可立即重判，而非等回收阈值 `T`（claim 的超时回收本为「崩溃/超时」兜底；**已处理的
+ * 评分失败应主动释放 claim**，否则该事件白白被锁 `T` 时长、也挡住并发链路评分，Bugbot #2）。
+ *
+ * `WHERE importance_score IS NULL` 守卫：只清「claim 了但没评成功」的，绝不误清已评分事件的痕迹。
+ * 释放尽力而为：调用方应吞掉其异常（事件仍会在 `T` 后被超时回收兜底，不致永久漏评）。
+ */
+export async function releaseJudgeClaim(
+  eventId: string,
+  dbh: DbLike = defaultDb,
+): Promise<void> {
+  await dbh
+    .update(aiNewsEvents)
+    .set({ judgeClaimedAt: null })
+    .where(
+      and(eq(aiNewsEvents.eventId, eventId), isNull(aiNewsEvents.importanceScore)),
+    );
+}
+
+/**
  * 对所有「尚未评分」的真实事件逐条评分并写分。
  *
  * 流程：
@@ -197,11 +217,20 @@ export async function scoreUnscoredEvents(
 
       scored += 1;
     } catch (error) {
+      // 评分失败（降级或写库异常）：**立即释放 claim**（清 judge_claimed_at），使下一轮可即时
+      // 重判，而非白等回收阈值 T（Bugbot #2）。释放尽力而为——失败不再拖垮整批（事件仍会在 T
+      // 后被超时回收兜底，不致永久漏评）。
+      await releaseJudgeClaim(event.eventId, dbh).catch((releaseErr: unknown) =>
+        logError(
+          `事件 ${event.eventId} 释放 judge claim 失败（将由超时回收 T 兜底）`,
+          releaseErr,
+        ),
+      );
       if (error instanceof ValueJudgeFailureError) {
         // 单条降级：跳过 + 记日志 + 计数，整批继续，不写未校验数据。
         degradedCount += 1;
         logError(
-          `事件 ${event.eventId} 价值判断降级（跳过，不写库）`,
+          `事件 ${event.eventId} 价值判断降级（跳过，不写库，已释放 claim）`,
           error,
         );
         continue;
@@ -209,7 +238,7 @@ export async function scoreUnscoredEvents(
       // 非降级类错误（如 DB 写入失败）不应被吞——同样计入降级并记录，但不中断整批，
       // 让编排组据 degradedCount 决定是否熔断。
       degradedCount += 1;
-      logError(`事件 ${event.eventId} 评分写库异常（跳过）`, error);
+      logError(`事件 ${event.eventId} 评分写库异常（跳过，已释放 claim）`, error);
     }
   }
 

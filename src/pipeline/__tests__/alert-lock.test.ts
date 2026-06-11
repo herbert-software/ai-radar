@@ -40,46 +40,43 @@ function memoryRedis(): RedisLike & { store: Map<string, string> } {
   };
 }
 
-describe('acquireAlertLock 告警单例锁', () => {
-  it('锁键为 alert:{channel}:{event_id}（不含时间）', () => {
-    expect(alertLockKey('telegram', 'evt-1')).toBe('alert:telegram:evt-1');
-    expect(alertLockKey('feishu', 'evt-2')).toBe('alert:feishu:evt-2');
+describe('acquireAlertLock 告警单例锁（per-event）', () => {
+  it('锁键为 alert:{event_id}（per-event，不含通道/时间）', () => {
+    expect(alertLockKey('evt-1')).toBe('alert:evt-1');
+    expect(alertLockKey('evt-2')).toBe('alert:evt-2');
   });
 
   it('首个实例获锁成功；并发第二实例 NX 失败返 null（防双发）', async () => {
     const redis = memoryRedis();
-    const lock1 = await acquireAlertLock('telegram', 'evt-A', { redis, ttlMs: 60_000 });
+    const lock1 = await acquireAlertLock('evt-A', { redis, ttlMs: 60_000 });
     expect(lock1).not.toBeNull();
-    expect(lock1!.key).toBe('alert:telegram:evt-A');
+    expect(lock1!.key).toBe('alert:evt-A');
 
-    // 同一 (channel,event_id) 第二实例并发获锁：NX 失败 → null（应跳过该告警，不重复发）。
-    const lock2 = await acquireAlertLock('telegram', 'evt-A', { redis, ttlMs: 60_000 });
+    // 同一 event_id 第二实例并发获锁：NX 失败 → null（应跳过该告警事件，不重复发）。
+    const lock2 = await acquireAlertLock('evt-A', { redis, ttlMs: 60_000 });
     expect(lock2).toBeNull();
 
     // 释放后可重新获取（failed 告警跨天重试的基础）。
     await lock1!.release();
-    const lock3 = await acquireAlertLock('telegram', 'evt-A', { redis, ttlMs: 60_000 });
+    const lock3 = await acquireAlertLock('evt-A', { redis, ttlMs: 60_000 });
     expect(lock3).not.toBeNull();
     await lock3!.release();
   });
 
-  it('不同 (channel,event_id) 互不挤占（各自独立锁键）', async () => {
+  it('不同 event_id 互不挤占（各自独立锁键）', async () => {
     const redis = memoryRedis();
-    const a = await acquireAlertLock('telegram', 'evt-X', { redis });
-    const b = await acquireAlertLock('feishu', 'evt-X', { redis }); // 不同 channel。
-    const c = await acquireAlertLock('telegram', 'evt-Y', { redis }); // 不同 event。
+    const a = await acquireAlertLock('evt-X', { redis });
+    const b = await acquireAlertLock('evt-Y', { redis }); // 不同 event。
     expect(a).not.toBeNull();
     expect(b).not.toBeNull();
-    expect(c).not.toBeNull();
     await a!.release();
     await b!.release();
-    await c!.release();
   });
 
   it('release 幂等：重复调用安全、不抛错', async () => {
     const redis = memoryRedis();
     const evalSpy = vi.spyOn(redis, 'eval');
-    const lock = await acquireAlertLock('telegram', 'evt-Z', { redis });
+    const lock = await acquireAlertLock('evt-Z', { redis });
     await lock!.release();
     await lock!.release(); // 第二次 release 应无操作（不再 eval）。
     expect(evalSpy).toHaveBeenCalledTimes(1);

@@ -24,6 +24,7 @@
  */
 import { env } from '../config/env.js';
 import { normalizeUrl } from '../dedup/normalize.js';
+import { startOfDayInTimeZone } from '../push/push-date.js';
 import {
   contentHash,
   defaultLogError,
@@ -165,13 +166,14 @@ function toDate(raw: string | null | undefined): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-/** 取「今日 0 点（UTC）」的 ISO，作 postedAfter 过滤当日上榜。 */
+/**
+ * 取「今日 0 点（**Asia/Shanghai**，env.PUSH_TIMEZONE）」的 ISO，作 postedAfter 过滤当日上榜。
+ *
+ * 必须与 push_date / 产品推送窗口同源时区（Asia/Shanghai）——用 UTC 午夜会在时区边界附近让 PH
+ * 的「今天」与上海「今天」错位（Bugbot #3）。复用 push-date 的 startOfDayInTimeZone（daysBack=0）。
+ */
 function startOfTodayIso(): string {
-  const now = new Date();
-  const start = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0),
-  );
-  return start.toISOString();
+  return startOfDayInTimeZone(new Date(), 0).toISOString();
 }
 
 /**

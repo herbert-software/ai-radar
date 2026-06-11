@@ -175,6 +175,30 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     expect(rows[0]!.status).toBe('success');
   });
 
+  it('Model B：channel-agnostic 选一次，同一告警事件发放给所有已配置通道（telegram + feishu）', async () => {
+    const tg = okSender();
+    const fs = okSender();
+    const result = await runAlertScan(
+      opts({
+        channels: ['telegram', 'feishu'] as const,
+        collect: { collectors: collectorsReturning([rssItem('Major release', 'https://x.com/major')]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        senders: { telegram: tg, feishu: fs },
+        threshold: 85,
+      }),
+    );
+
+    // 候选 channel-agnostic 选一次（按事件计 1 条），同份发放给两个通道：两通道各发一次。
+    expect(result.alertCandidateCount).toBe(1);
+    expect(tg.calls).toBe(1);
+    expect(fs.calls).toBe(1);
+    // 同一事件在两通道各一条 alert success 记录（per-channel 同日幂等四元组）。
+    const rows = await alertRecords();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.channel).sort()).toEqual(['feishu', 'telegram']);
+    expect(rows.every((r) => r.status === 'success')).toBe(true);
+  });
+
   it('低于阈值不触发；评分前不以 NULL 误判（未达阈值的已评分事件不告警）', async () => {
     const sender = okSender();
     const result = await runAlertScan(
@@ -225,8 +249,8 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     );
 
     // 关键断言：alert 候选不被 event 记录吞——event(success) 在不同 target_type 命名空间，
-    // 候选「从未以该 channel **alert** success」仍满足，该事件仍是 alert 候选。
-    const candidates = await selectAlertCandidates('telegram', 85, db!);
+    // 候选「从未以任一通道 **alert** success」仍满足，该事件仍是 alert 候选（channel-agnostic）。
+    const candidates = await selectAlertCandidates(85, db!);
     const found = candidates.find((c) => c.eventId === eventId);
     expect(found).toBeDefined();
 

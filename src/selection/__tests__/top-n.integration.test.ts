@@ -116,24 +116,22 @@ describe.skipIf(!databaseUrl)('Top N 候选窗口（DB 侧不变量）', () => {
     expect(ids).not.toContain(pushed);
   });
 
-  it('telegram 已 success 的事件仍进入 feishu 候选窗口（候选按 channel 分别判定，跨天维度）', async () => {
-    const ev = await seedEvent({ key: 'dual-chan', importance: 95 });
-    // 在 telegram 通道某 push_date 成功推过（跨天「从未 telegram success」不再成立）。
-    await markPushedSuccess(ev, '2099-01-31', 'telegram');
+  it('候选窗口 channel-agnostic（Model B）：在任一通道（含 feishu）success 过即不再入选', async () => {
+    // 统一日报模型：每日选一份 channel-agnostic Top N 发放给所有通道，一旦投递成功（任一通道）
+    // 即不再跨天重选。故在 feishu（非 telegram）成功推过的事件也必须被排除，证明候选不限 telegram。
+    const onFeishu = await seedEvent({ key: 'on-feishu', importance: 95 });
+    const onTelegram = await seedEvent({ key: 'on-tg', importance: 94 });
+    const fresh = await seedEvent({ key: 'fresh', importance: 90 });
+    await markPushedSuccess(onFeishu, '2099-01-31', 'feishu');
+    await markPushedSuccess(onTelegram, '2099-01-31', 'telegram');
 
-    // telegram 候选：已 success → 不入选。
-    const tg = await selectTopN(
-      { now: NOW, importanceFloor: 60, windowDays: 3, channel: 'telegram' },
-      db!,
-    );
-    expect(tg.map((e) => e.eventId)).not.toContain(ev);
-
-    // feishu 候选：从未以 feishu success → 仍入选（不被 telegram 已推抑制）。
-    const fs = await selectTopN(
-      { now: NOW, importanceFloor: 60, windowDays: 3, channel: 'feishu' },
-      db!,
-    );
-    expect(fs.map((e) => e.eventId)).toContain(ev);
+    const top = await selectTopN({ now: NOW, importanceFloor: 60, windowDays: 3 }, db!);
+    const ids = top.map((e) => e.eventId);
+    // feishu / telegram 任一通道成功过 → 均不再入选（channel-agnostic 跨天不重推）。
+    expect(ids).not.toContain(onFeishu);
+    expect(ids).not.toContain(onTelegram);
+    // 从未投递过的高价值事件仍入选。
+    expect(ids).toContain(fresh);
   });
 
   it('should_push=false 与不在近 N 天窗口的事件不入候选', async () => {
