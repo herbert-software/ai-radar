@@ -57,6 +57,30 @@ describe('acquireDigestLock 丢锁感知', () => {
     await lock!.release();
   });
 
+  it('续租命令持续报错（非 Lua 返 0）→ 原 TTL 到期后 isHeld() 转 false，杜绝双发', async () => {
+    // 续租命令一直抛错（如 Redis 半死 commandTimeout），从未成功续租：
+    // TTL 窗口内保守不判丢锁，但越过原 TTL 截止点后必须转 false
+    // （此刻 Redis 键已过期、他人可重获，自认持有即双发）。
+    const redis: RedisLike = {
+      set: () => Promise.resolve('OK'),
+      eval: () => Promise.reject(new Error('ETIMEDOUT')),
+    };
+    const lock = await acquireDigestLock('2099-01-13', {
+      redis,
+      ttlMs: 30_000,
+      renewIntervalMs: 10_000,
+    });
+    expect(lock!.isHeld()).toBe(true);
+
+    // 首次续租（10s）报错：仍在 TTL 内，保守保持持有。
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(lock!.isHeld()).toBe(true);
+
+    // 推进越过原 TTL（30s），期间续租始终报错、从未前推截止点 → 转 false。
+    await vi.advanceTimersByTimeAsync(20_001);
+    expect(lock!.isHeld()).toBe(false);
+  });
+
   it('release 后 isHeld() 为 false', async () => {
     const redis = makeRedis(1);
     const lock = await acquireDigestLock('2099-01-11', {

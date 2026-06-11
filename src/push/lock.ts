@@ -40,8 +40,11 @@ export interface DigestLock {
   readonly key: string;
   readonly token: string;
   /**
-   * 当前是否仍真正持有锁（租约未失且未释放）。
-   * 看门狗续租若发现令牌不匹配/键已不存在（锁被抢占或过期），会置租约已失 → 返 false。
+   * 当前是否仍真正持有锁（租约未失、未释放、且未越过租约截止点）。false 的三条触发：
+   * - 看门狗续租发现令牌不匹配/键已不存在（锁被抢占或过期），置租约已失；
+   * - 已 release()；
+   * - 续租命令持续报错、从未成功续租，直到原 TTL 到期（租约截止点已过）——此刻 Redis 键
+   *   也已过期、他人可重获，故必须自认失锁（不能寄望 Redis 端 TTL 回传进程内状态）。
    * 调用方（如 run-daily-workflow）在 dispatch 前应检查此值，false 时立即中止以避免双发。
    */
   isHeld(): boolean;
@@ -106,6 +109,11 @@ export async function acquireDigestLock(
     options.redis ??
     (new Redis(env.REDIS_URL, { commandTimeout: 5000 }) as unknown as RedisLike);
 
+  // 租约保障截止点（本地时钟）：获取/每次续租成功后前推一个 TTL。以「命令发起时刻」为基准
+  // （早于 Redis 服务端实际应用 PX 的时刻），故本地截止点保守地**早于** Redis 真实过期——
+  // 杜绝「本地仍自认持有、Redis 键却已过期被他人重获」的双发窗口。
+  const acquireSentAt = Date.now();
+
   let acquired: 'OK' | null;
   try {
     acquired = await redis.set(key, token, 'PX', ttlMs, 'NX');
@@ -123,14 +131,19 @@ export async function acquireDigestLock(
   // leaseLost：续租发现锁已不属于自己（Lua 返 0：令牌不匹配/键已不存在）即置真，
   // 供 isHeld() 暴露给调用方在 dispatch 前中止，避免「已丢锁仍发送 → 双发」。
   let leaseLost = false;
+  let leaseDeadlineMs = acquireSentAt + ttlMs;
   let timer: ReturnType<typeof setInterval> | undefined;
   if (renewIntervalMs > 0) {
     timer = setInterval(() => {
+      const renewSentAt = Date.now();
       void redis
         .eval(RENEW_SCRIPT, 1, key, token, ttlMs)
         .then((result) => {
           // Lua 返 1=续租成功；返 0=令牌不匹配或键已不存在 → 锁已被抢占/过期，租约已失。
-          if (result !== 1) {
+          if (result === 1) {
+            // 续租成功：把租约截止点前推一个 TTL（基准取发起时刻，保守早于 Redis 实际过期）。
+            leaseDeadlineMs = renewSentAt + ttlMs;
+          } else {
             leaseLost = true;
             if (timer) clearInterval(timer);
             console.error(
@@ -140,8 +153,11 @@ export async function acquireDigestLock(
         })
         .catch((error: unknown) => {
           // 续租命令抛错（如 Redis commandTimeout）可能仅瞬时抖动，不立刻判丢锁
-          // （误判会让正常长任务无谓中止）；仅告警，下次续租成功则自愈，
-          // 真正丢锁由 Lua 返 0 路径或 TTL 兜底。
+          // （误判会让正常长任务无谓中止）；仅告警，下次续租成功则自愈。
+          // **关键**：报错时绝不前推 leaseDeadlineMs——若续租持续失败直到原 TTL 到期，
+          // isHeld() 会据租约截止点自动转 false（此刻 Redis 键也已过期、他人可重获），
+          // 杜绝「续租一直报错却仍自认持有 → 双发」（不能依赖 Redis 端 TTL 兜底，
+          // 那不会回传到进程内的持有状态）。
           console.error(`[lock] 续租命令出错（瞬时，未判丢锁），${key}:`, error);
         });
     }, renewIntervalMs);
@@ -154,7 +170,9 @@ export async function acquireDigestLock(
     key,
     token,
     isHeld(): boolean {
-      return !leaseLost && !released;
+      // 持有 = 未被 Lua 判丢 && 未释放 && 仍在租约截止点之内。截止点防「续租持续报错
+      // 至 TTL 过期仍自认持有」：报错路径不前推截止点，过点即转 false（见看门狗 catch）。
+      return !leaseLost && !released && Date.now() < leaseDeadlineMs;
     },
     async release(): Promise<void> {
       if (released) return;
