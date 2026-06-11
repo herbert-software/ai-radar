@@ -173,11 +173,19 @@ export async function collapseRawItems(
 /**
  * 塌缩入口（编排层应调用此函数，取代「按本轮 insertedIds 塌缩」的脆弱依赖，Codex C1）。
  *
- * 扫出库内**所有** `unprocessable=false AND collapsed=false` 的 raw_items 逐条塌缩——
+ * 扫出库内**所有** `unprocessable=false AND collapsed=false` 且**新闻类**的 raw_items 逐条塌缩——
  * 不依赖外部传入的 id 列表，故：
  * - 全重复日（insertedIds=0）：若上轮已塌缩则这些行 collapsed=true 不再扫到，正常无新增、不误告警；
  * - 崩溃后补塌缩：INSERT 成功但塌缩前崩溃的 raw_item collapsed 仍为 false，下次必被扫到补塌缩
  *   （即便其 source_item_id 重复导致再次入库被 DO NOTHING 跳过、不在 insertedIds）。
+ *
+ * **类型路由（P2，dedup-and-normalization MODIFIED）**：查询层排除 `raw_type='product'`（PH）与
+ * `raw_type='paper'`（arXiv），防产品/论文条目污染新闻事件流或被双重消费。排除条件用
+ * **`raw_type IS DISTINCT FROM 'product' AND raw_type IS DISTINCT FROM 'paper'`**（而非 NOT IN）：
+ * `raw_type` 列可空，`NULL NOT IN (...)` 求值为 NULL 会**放行** NULL 行；`IS DISTINCT FROM` 使
+ * NULL 被当作新闻类纳入塌缩，保持 P1「news/repo/post/NULL 等其余值一律进事件流」行为不回退。
+ * 产品行由产品塌缩成功后置 collapsed=true；论文行入库即置 collapsed=true（仅沉淀、无下游消费），
+ * 故被排除的 product/paper 行不停在 collapsed=false 被每轮无界重扫。
  *
  * 每条塌缩后置 collapsed=true（见 collapseRawItem），故 source_count 贡献恰好一次（幂等）。
  * 顺序处理（塌缩依赖 dedup_key 唯一键冲突语义，顺序执行避免同批自冲突竞态）。
@@ -189,7 +197,8 @@ export async function collapseRawItems(
 export async function collapseUncollapsedRawItems(
   dbh: DbLike = defaultDb,
 ): Promise<CollapseOutcome[]> {
-  // 选出尚未塌缩、且未被前一轮标记 unprocessable 的 raw_items（id 升序，先到先建代表）。
+  // 选出尚未塌缩、未被前一轮标记 unprocessable、且为**新闻类**的 raw_items（id 升序，先到先建代表）。
+  // 类型路由（P2）：用 IS DISTINCT FROM 排除 product/paper，NULL raw_type 视作新闻纳入（保 P1 行为）。
   const pending = await dbh
     .select({
       id: rawItems.id,
@@ -199,7 +208,14 @@ export async function collapseUncollapsedRawItems(
       fetchedAt: rawItems.fetchedAt,
     })
     .from(rawItems)
-    .where(and(eq(rawItems.unprocessable, false), eq(rawItems.collapsed, false)))
+    .where(
+      and(
+        eq(rawItems.unprocessable, false),
+        eq(rawItems.collapsed, false),
+        sql`${rawItems.rawType} IS DISTINCT FROM 'product'`,
+        sql`${rawItems.rawType} IS DISTINCT FROM 'paper'`,
+      ),
+    )
     .orderBy(rawItems.id);
 
   const items: RawItemForCollapse[] = pending.map((r) => ({

@@ -11,9 +11,16 @@
  * - 某阶段分母 > 0 且其降级率**严格** `> DEGRADE_ABORT_RATIO` → 该阶段触发熔断。
  * - 分母为 0 时禁止按 0/0 计算（NaN > 阈值 恒假会掩盖问题），且**分母 0 不是错误、不中止**：
  *   shouldAbort 对分母 0 恒返回 false。「judge 分母 = 0」绝不可被误判为「今日无候选」而中止。
- * - 「系统级故障」告警以**采集/规范化层**为准（非 judge 分母）：①采集返回条数 = 0（三源全挂）
- *   或 ②采集返回 > 0 但可处理条目数 = 0（全 unprocessable）→ 告警。可处理数含「塌缩进既有
- *   事件」者，故全命中既有事件的正常无新闻日不告警。
+ * - 「系统级故障」告警以**采集/规范化层**为准（非 judge 分母）：①采集返回条数 = 0
+ *   （**registry 全部源**失败，P2 由 P1「三源」扩为 registry 注册的全部源）或 ②采集返回 > 0
+ *   但**新闻类可处理条目数 = 0**（全部新闻条目 unprocessable）→ 告警。
+ * - **分母只统计新闻类**（P2，daily-intel-pipeline MODIFIED）：`raw_type IN ('product','paper')`
+ *   的产品/论文条目**不计入**新闻类可处理数（它们不进事件塌缩）——否则某轮仅 arXiv 返回 paper、
+ *   新闻源全空时 paper 会掩盖新闻真空使告警失灵。新闻类可处理数含「塌缩进既有新闻事件」者，
+ *   故全命中既有新闻事件的正常无新闻日不告警；唯有「全部新闻条目 unprocessable 或无新闻条目」才告警。
+ * - **本告警仅适用于日报工作流（runDailyWorkflow）**：实时告警高频链（全源 0 是常态）不套用本判定
+ *   （由其调用点决定不调 classifySystemFailure，避免每天数十次误告警刷屏，design D6）。
+ * - **分发失败不计入本判定，也不计入 judge/摘要熔断分母**：分发失败由「单通道隔离 + failed 重试」承载。
  */
 
 /** 单阶段降级统计：分母（processed）与其中降级条数（degraded）。 */
@@ -49,13 +56,18 @@ export function stageDegradeRate(stage: StageDegrade): number | null {
 
 /** 采集/规范化层统计，用于系统级故障告警判定。 */
 export interface CollectStats {
-  /** 本轮 collector 返回的条目总数（非「新插入 raw_items 行数」）。 */
+  /** 本轮 collector 返回的条目总数（**registry 全部源**汇总，非「新插入 raw_items 行数」）。 */
   collectedCount: number;
   /**
-   * 可处理条目数：能构造 dedup_key、塌缩进 event（含进既有事件）的条目数。
-   * = 本轮塌缩中 unprocessable=false 的条数。全命中既有事件时此数 > 0。
+   * **新闻类**可处理条目数：能构造 dedup_key、塌缩进**新闻事件**（含进既有新闻事件）的条目数。
+   * = 本轮新闻类塌缩中 unprocessable=false 的条数（塌缩查询已排除 raw_type product/paper）。
+   *
+   * **与 store.processableCount 的语义区分（必须分清）**：store 的 processableCount 统计**全部**
+   * 采集条目（含 product/paper）中能构造 canonical_url/title_hash 者，是通用「可入库」口径；
+   * 本字段只数**新闻类**（用于「新闻真空」告警分母）。二者不可混用——若用 store 的全量口径，
+   * 「仅 arXiv 返回 paper、新闻源全空」时 paper 会被计入而掩盖新闻真空、使告警失灵。
    */
-  processableCount: number;
+  newsProcessableCount: number;
 }
 
 /** 系统级故障告警判定结果。 */
@@ -69,12 +81,12 @@ export interface SystemFailureVerdict {
 }
 
 /**
- * 系统级故障告警判定（以采集/规范化层为准，非 judge 分母）。
+ * 系统级故障告警判定（以采集/规范化层为准，非 judge 分母；**仅日报链调用**）。
  *
- * - 采集返回条数 = 0（三源全挂）→ alert，kind='no-collection'。
- * - 采集返回 > 0 但可处理条目数 = 0（全 unprocessable，采集器采空/归一函数故障）→
- *   alert，kind='all-unprocessable'。
- * - 采集 > 0 且可处理数 > 0（含全命中既有事件的正常无新闻日）→ 不告警，kind='none'。
+ * - 采集返回条数 = 0（**registry 全部源**失败）→ alert，kind='no-collection'。
+ * - 采集返回 > 0 但**新闻类可处理条目数 = 0**（全部新闻条目 unprocessable，或仅有 product/paper
+ *   非新闻条目）→ alert，kind='all-unprocessable'。
+ * - 采集 > 0 且新闻类可处理数 > 0（含全命中既有新闻事件的正常无新闻日）→ 不告警，kind='none'。
  */
 export function classifySystemFailure(
   stats: CollectStats,
@@ -83,15 +95,16 @@ export function classifySystemFailure(
     return {
       alert: true,
       kind: 'no-collection',
-      reason: '本轮采集返回条数为 0（三源全部失败），不静默空跑。',
+      reason: '本轮采集返回条数为 0（registry 全部源失败），不静默空跑。',
     };
   }
-  if (stats.processableCount === 0) {
+  if (stats.newsProcessableCount === 0) {
     return {
       alert: true,
       kind: 'all-unprocessable',
       reason:
-        '本轮采集返回 > 0 但可处理条目数为 0（全部 unprocessable），提示采集器采空或归一函数故障。',
+        '本轮采集返回 > 0 但新闻类可处理条目数为 0（全部新闻条目 unprocessable，' +
+        '或仅有 product/paper 非新闻条目），提示采集器采空或归一函数故障。',
     };
   }
   return { alert: false, kind: 'none', reason: null };

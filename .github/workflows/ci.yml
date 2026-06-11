@@ -72,4 +72,7 @@ jobs:
           LLM_BASE_URL: https://example.invalid/v1
           TELEGRAM_BOT_TOKEN: ci-placeholder-token
           TELEGRAM_CHAT_ID: ci-placeholder-chat
+          # Product Hunt Developer Token（必填占位）：PH 采集器单测注入桩、不触网，
+          # 仅用于满足 env 启动校验；真实拉取由 11.3 一次性勘验，不在 CI 实跑。
+          PRODUCT_HUNT_TOKEN: ci-placeholder-ph-token
         run: npm run test

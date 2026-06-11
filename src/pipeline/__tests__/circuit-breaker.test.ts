@@ -42,23 +42,31 @@ describe('stageDegradeRate', () => {
   });
 });
 
-describe('classifySystemFailure（告警以采集/规范化层为准）', () => {
-  it('采集返回 0（三源全挂）→ 告警 no-collection', () => {
-    const v = classifySystemFailure({ collectedCount: 0, processableCount: 0 });
+describe('classifySystemFailure（告警以采集/规范化层为准，新闻类分母）', () => {
+  it('采集返回 0（registry 全部源失败）→ 告警 no-collection', () => {
+    const v = classifySystemFailure({ collectedCount: 0, newsProcessableCount: 0 });
     expect(v.alert).toBe(true);
     expect(v.kind).toBe('no-collection');
   });
 
-  it('采集 > 0 但可处理数 0（全 unprocessable）→ 告警 all-unprocessable', () => {
-    const v = classifySystemFailure({ collectedCount: 10, processableCount: 0 });
+  it('采集 > 0 但新闻类可处理数 0（全 unprocessable）→ 告警 all-unprocessable', () => {
+    const v = classifySystemFailure({ collectedCount: 10, newsProcessableCount: 0 });
     expect(v.alert).toBe(true);
     expect(v.kind).toBe('all-unprocessable');
   });
 
-  it('采集 > 0 且可处理数 > 0（含全命中既有事件的正常无新闻日）→ 不告警', () => {
-    // 全命中既有事件：collected 5、可处理 5（都塌缩进既有 event），无新 event 仍不告警。
-    const v = classifySystemFailure({ collectedCount: 5, processableCount: 5 });
+  it('采集 > 0 且新闻类可处理数 > 0（含全命中既有新闻事件的正常无新闻日）→ 不告警', () => {
+    // 全命中既有事件：collected 5、新闻类可处理 5（都塌缩进既有 event），无新 event 仍不告警。
+    const v = classifySystemFailure({ collectedCount: 5, newsProcessableCount: 5 });
     expect(v.alert).toBe(false);
     expect(v.kind).toBe('none');
+  });
+
+  it('仅 arXiv 返回 paper、新闻源全空（collected>0 但新闻类可处理=0）→ 仍按新闻真空告警', () => {
+    // paper/product 不计入新闻类分母；某轮仅 arXiv 返回 paper（collectedCount>0）、
+    // 新闻源全空（newsProcessableCount=0）→ 必须照常告警，不被 paper 掩盖。
+    const v = classifySystemFailure({ collectedCount: 7, newsProcessableCount: 0 });
+    expect(v.alert).toBe(true);
+    expect(v.kind).toBe('all-unprocessable');
   });
 });

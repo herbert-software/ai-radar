@@ -76,16 +76,20 @@ function item(args: {
   };
 }
 
-/** 注入 collector：rss 返回给定条目，hn/github 返回空（或全挂）。 */
+/** 注入 collector：rss 返回给定条目，hn/github/arxiv/product_hunt 返回空（或全挂）。 */
 function collectorsReturning(items: CollectedItem[]) {
   return {
     rss: async () => items,
     hackerNews: async () => [],
     github: async () => [],
+    // arXiv / Product Hunt 自 P2 起进 registry；测试用空桩，避免落到真实
+    // OAI-PMH / PH GraphQL 网络调用（带真实 token 时会拉到真数据污染断言）。
+    arxiv: async () => [],
+    productHunt: async () => [],
   };
 }
 
-/** 注入 collector：三源全挂（reject）→ 采集返回 0。 */
+/** 注入 collector：全部源全挂（reject）→ 采集返回 0。 */
 function collectorsAllFail() {
   return {
     rss: async () => {
@@ -96,6 +100,12 @@ function collectorsAllFail() {
     },
     github: async () => {
       throw new Error('gh down');
+    },
+    arxiv: async () => {
+      throw new Error('arxiv down');
+    },
+    productHunt: async () => {
+      throw new Error('ph down');
     },
   };
 }
@@ -145,6 +155,29 @@ function okSender(): MessageSender & { calls: number } {
     },
   };
   return s;
+}
+
+/** 失败发送器：抛错（dispatcher 据此该通道整批 failed）。 */
+function failSender(message = 'channel boom'): MessageSender & { calls: number } {
+  const s = {
+    calls: 0,
+    async send(): Promise<void> {
+      s.calls += 1;
+      throw new Error(message);
+    },
+  };
+  return s;
+}
+
+/** 注入 collector：arxiv 返回 paper 条目（collapsed=true、rawType=paper），新闻三源全空。 */
+function collectorsArxivPaperOnly(papers: CollectedItem[]) {
+  return {
+    rss: async () => [],
+    hackerNews: async () => [],
+    github: async () => [],
+    arxiv: async () => papers,
+    productHunt: async () => [],
+  };
 }
 
 async function cleanup() {
@@ -338,7 +371,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       alert,
     });
     expect(result.collectedCount).toBe(2);
-    expect(result.processableCount).toBe(0);
+    expect(result.newsProcessableCount).toBe(0);
     expect(result.alerted).toBe(true);
     expect(sender.calls).toBe(0);
   });
@@ -419,12 +452,140 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       alert,
     });
 
-    // 可处理数 > 0（塌缩进既有事件），不告警。
-    expect(second.processableCount).toBe(2);
+    // 新闻类可处理数 > 0（塌缩进既有事件），不告警。
+    expect(second.newsProcessableCount).toBe(2);
     expect(second.alerted).toBe(false);
     expect(alert).not.toHaveBeenCalled();
     // 既有事件本日已 success（第一次推过）→ 待发集合为空 → 不重发。
     expect(sender.calls).toBe(0);
     expect(second.outcome).toBe('skipped-no-candidates');
+  });
+
+  it('多通道并发分发：向 telegram + feishu 各发一份（5.3/5.4）', async () => {
+    const items = [
+      item({ id: 'mc1', url: 'https://ex.com/mc1', title: 'Multi channel one' }),
+      item({ id: 'mc2', url: 'https://ex.com/mc2', title: 'Multi channel two' }),
+    ];
+    const tg = okSender();
+    const fs = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 显式两通道 + 各自 mock sender（无需真实 FEISHU env）。
+      channels: ['telegram', 'feishu'],
+      senders: { telegram: tg, feishu: fs },
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+    expect(result.outcome).toBe('pushed');
+    expect(tg.calls).toBe(1);
+    expect(fs.calls).toBe(1); // 飞书各发一份。
+
+    // 两通道各自一组 success 记录（channel 独立幂等）。
+    const { rows } = await pool!.query<{ channel: string; n: string }>(
+      `SELECT channel, count(*) AS n FROM push_records
+        WHERE target_type='event' AND status='success' GROUP BY channel ORDER BY channel`,
+    );
+    expect(rows.map((r) => r.channel)).toEqual(['feishu', 'telegram']);
+    for (const r of rows) expect(Number(r.n)).toBe(2);
+  });
+
+  it('单通道失败隔离：飞书失败不拖垮 telegram；整 job 抛错触发重试（5.3/5.4）', async () => {
+    const items = [
+      item({ id: 'iso1', url: 'https://ex.com/iso1', title: 'Isolation one' }),
+    ];
+    const tg = okSender();
+    const fs = failSender('feishu webhook down');
+    // 飞书发送失败 → 该通道 failed 隔离；telegram 仍 success；整 job 抛错（触发 BullMQ 重试失败通道）。
+    await expect(
+      runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        channels: ['telegram', 'feishu'],
+        senders: { telegram: tg, feishu: fs },
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      }),
+    ).rejects.toThrow(/dispatch failed/);
+    // telegram 照常完成（不被飞书失败拖垮）。
+    expect(tg.calls).toBe(1);
+    expect(fs.calls).toBe(1);
+
+    const { rows } = await pool!.query<{ channel: string; status: string }>(
+      `SELECT channel, status FROM push_records
+        WHERE target_type='event' ORDER BY channel`,
+    );
+    const byChannel = Object.fromEntries(rows.map((r) => [r.channel, r.status]));
+    expect(byChannel.telegram).toBe('success'); // 隔离：telegram 成功。
+    expect(byChannel.feishu).toBe('failed'); // 飞书该批 failed（下次重试）。
+  });
+
+  it('纯 Telegram 部署（未配/未启用飞书）→ 只向 telegram 分发，照常启动推送（向后兼容）', async () => {
+    const items = [
+      item({ id: 'tgonly', url: 'https://ex.com/tgonly', title: 'Telegram only' }),
+    ];
+    const tg = okSender();
+    // 显式注入 channels=['telegram'] 模拟「飞书未配置」解析结果——确定性、不依赖测试进程的
+    // ambient FEISHU env（开发者本地 .env 可能配了飞书）。env→通道集解析（isFeishuEnabled
+    // 真/假）由 env.test.ts 单测覆盖；本集成测试验证「通道集仅 telegram → 只发 telegram、
+    // push_records 无 feishu 行」的向后兼容分发路径。
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender: tg,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+    expect(result.outcome).toBe('pushed');
+    expect(tg.calls).toBe(1);
+    // 只有 telegram channel 的记录，无 feishu 行。
+    const { rows } = await pool!.query<{ channel: string }>(
+      `SELECT DISTINCT channel FROM push_records WHERE target_type='event'`,
+    );
+    expect(rows.map((r) => r.channel)).toEqual(['telegram']);
+  });
+
+  it('仅 arXiv 返回 paper、新闻源全空 → 仍按新闻真空告警（5.7）', async () => {
+    // arXiv 论文 rawType='paper'、collapsed=true：不进新闻事件塌缩、不计入新闻类可处理数。
+    // 新闻三源全空 → newsProcessableCount=0、collectedCount>0 → 必须照常「新闻真空」告警。
+    const papers: CollectedItem[] = [
+      {
+        source: 'arxiv',
+        sourceItemId: `${SOURCE}-paper-1`,
+        url: 'https://arxiv.org/abs/2401.00001',
+        title: `${TITLE_MARKER} A paper`,
+        content: null,
+        publishedAt: null,
+        rawType: 'paper',
+        collapsed: true,
+      },
+    ];
+    const sender = okSender();
+    const alert = vi.fn();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsArxivPaperOnly(papers) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender,
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(result.collectedCount).toBe(1); // paper 计入采集返回数。
+    expect(result.newsProcessableCount).toBe(0); // paper 不计入新闻类可处理数。
+    expect(result.alerted).toBe(true); // 新闻真空告警照常触发，不被 paper 掩盖。
+    expect(alert).toHaveBeenCalled();
+    expect(sender.calls).toBe(0); // 无新闻候选 → 不推。
   });
 });

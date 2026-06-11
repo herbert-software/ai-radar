@@ -15,6 +15,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 // 本套件只测纯函数 parseEnv，注入占位让 import 期单例校验通过后再动态取 parseEnv，
 // 使套件在不完整 shell env 下也能干净运行（占位绝不影响 parseEnv 的入参——它收显式 source）。
 let parseEnv: typeof import('../env.js').parseEnv;
+let isFeishuEnabled: typeof import('../env.js').isFeishuEnabled;
 
 beforeAll(async () => {
   process.env.DATABASE_URL ||= 'postgres://u:p@localhost:5432/test';
@@ -24,7 +25,7 @@ beforeAll(async () => {
   process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
   process.env.TELEGRAM_BOT_TOKEN ||= 'test-bot-token';
   process.env.TELEGRAM_CHAT_ID ||= 'test-chat-id';
-  ({ parseEnv } = await import('../env.js'));
+  ({ parseEnv, isFeishuEnabled } = await import('../env.js'));
 });
 
 /** 一份能通过校验的最小合法 env。各用例在其上做删除/改写。 */
@@ -36,6 +37,7 @@ function validEnv(): NodeJS.ProcessEnv {
     LLM_MODEL: 'openai/gpt-4o-mini',
     TELEGRAM_BOT_TOKEN: 'bot-token',
     TELEGRAM_CHAT_ID: '123456',
+    PRODUCT_HUNT_TOKEN: 'ph-dev-token',
   } as NodeJS.ProcessEnv;
 }
 
@@ -62,6 +64,7 @@ describe('parseEnv —— 关键变量缺失快速失败', () => {
     'LLM_MODEL',
     'TELEGRAM_BOT_TOKEN',
     'TELEGRAM_CHAT_ID',
+    'PRODUCT_HUNT_TOKEN',
   ])('缺失 %s 时抛错', (key) => {
     const source = validEnv();
     delete source[key];
@@ -113,16 +116,113 @@ describe('parseEnv —— P1 数值/比率配置校验', () => {
   });
 });
 
-describe('parseEnv —— RSS_FEEDS 列表解析', () => {
-  it('逗号分隔解析为去空白的非空数组', () => {
+describe('parseEnv —— 飞书可选通道（feishu-push 5.1）', () => {
+  it('两者均缺 → 飞书 disabled，纯 Telegram 部署照常启动（向后兼容）', () => {
+    const env = parseEnv(validEnv()); // validEnv 不含 FEISHU_*。
+    expect(env.FEISHU_WEBHOOK_URL).toBeUndefined();
+    expect(env.FEISHU_SIGN_SECRET).toBeUndefined();
+    expect(isFeishuEnabled(env)).toBe(false);
+  });
+
+  it('两者全配 → enabled', () => {
     const source = {
       ...validEnv(),
-      RSS_FEEDS: ' https://a.example/feed.xml , https://b.example/rss ,, ',
+      FEISHU_WEBHOOK_URL: 'https://open.feishu.cn/hook/abc',
+      FEISHU_SIGN_SECRET: 'secret',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(isFeishuEnabled(env)).toBe(true);
+  });
+
+  it('仅配 webhook（缺 secret）→ 快速失败', () => {
+    const source = {
+      ...validEnv(),
+      FEISHU_WEBHOOK_URL: 'https://open.feishu.cn/hook/abc',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/FEISHU_SIGN_SECRET/);
+  });
+
+  it('仅配 secret（缺 webhook）→ 快速失败', () => {
+    const source = {
+      ...validEnv(),
+      FEISHU_SIGN_SECRET: 'secret',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/FEISHU_WEBHOOK_URL/);
+  });
+
+  it('webhook 非法 URL → 报错', () => {
+    const source = {
+      ...validEnv(),
+      FEISHU_WEBHOOK_URL: 'not-a-url',
+      FEISHU_SIGN_SECRET: 'secret',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+});
+
+describe('parseEnv —— 每日 cron 默认避整点/半点（feishu-push 5.5）', () => {
+  it('DAILY_DIGEST_CRON 默认分钟字段 ∉ {0, 30}', () => {
+    const env = parseEnv(validEnv());
+    const minuteField = env.DAILY_DIGEST_CRON.trim().split(/\s+/)[0]!;
+    expect(['0', '30']).not.toContain(minuteField);
+  });
+});
+
+describe('parseEnv —— RSS_FEEDS 带 vendor 的 feed 配置解析（design D2）', () => {
+  it('逗号分隔的 url|vendor 解析为 {url, vendor}[]，去空白', () => {
+    const source = {
+      ...validEnv(),
+      RSS_FEEDS:
+        ' https://a.example/feed.xml|openai , https://b.example/rss|deepmind ,, ',
     } as NodeJS.ProcessEnv;
     const env = parseEnv(source);
     expect(env.RSS_FEEDS).toEqual([
-      'https://a.example/feed.xml',
-      'https://b.example/rss',
+      { url: 'https://a.example/feed.xml', vendor: 'openai' },
+      { url: 'https://b.example/rss', vendor: 'deepmind' },
     ]);
+  });
+
+  it('空 RSS_FEEDS → 空数组', () => {
+    const env = parseEnv({ ...validEnv(), RSS_FEEDS: '' } as NodeJS.ProcessEnv);
+    expect(env.RSS_FEEDS).toEqual([]);
+  });
+
+  it('url|（尾随空 vendor）→ vendor 取 null，不报错、不阻塞', () => {
+    const source = {
+      ...validEnv(),
+      RSS_FEEDS: 'https://blog.example/feed|',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.RSS_FEEDS).toEqual([
+      { url: 'https://blog.example/feed', vendor: null },
+    ]);
+  });
+
+  it('旧裸 URL 格式（无 |）启动即报错并提示新格式', () => {
+    const source = {
+      ...validEnv(),
+      RSS_FEEDS: 'https://legacy.example/feed.xml',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/url\|vendor/);
+  });
+
+  it('混入一条旧裸 URL（其余合法）整体报错', () => {
+    const source = {
+      ...validEnv(),
+      RSS_FEEDS: 'https://a.example/feed|openai,https://legacy.example/feed',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('URL 含 | 字符（条目含多于一个 |）→ 配置错误报错', () => {
+    const source = {
+      ...validEnv(),
+      RSS_FEEDS: 'https://a.example/feed?x=1|2|openai',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/多于一个/);
   });
 });

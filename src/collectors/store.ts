@@ -122,6 +122,9 @@ export async function storeCollectedItems(
         titleHash,
         content: item.content,
         publishedAt: item.publishedAt,
+        // collapsed 透传（默认 false）：arXiv 论文置 true，入库即标「已按 raw_type 路由/沉淀」，
+        // 使事件塌缩入口不每轮重扫（与新闻行「塌缩后置 true」对称，见 dedup/collapse.ts 查询层过滤）。
+        collapsed: item.collapsed ?? false,
         metadata: sql`${metadata}::jsonb`,
       })
       // 源内幂等：UNIQUE(source, source_item_id) 冲突即跳过（不更新，保留首条）。

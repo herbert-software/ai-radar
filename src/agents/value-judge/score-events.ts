@@ -18,9 +18,10 @@
  * 熔断（降级率阈值判断）本身归编排组（G7）：本模块只产出 degraded_count 与逐条容错，
  * 不在此处中止整批。
  */
-import { eq, isNull } from 'drizzle-orm';
+import { and, eq, isNull, or, lt, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../../db/index.js';
 import { aiNewsEvents } from '../../db/schema.js';
+import { env } from '../../config/env.js';
 import { mapOutputToEventScores } from './mapping.js';
 import {
   judgeRawItem,
@@ -37,14 +38,23 @@ interface UnscoredEvent {
   representativeTitle: string | null;
 }
 
-/** 批量评分结果（供编排组做阶段熔断：分母 = scored + degraded = 本轮送判数）。 */
+/** 批量评分结果（供编排组做阶段熔断：分母 = scored + degraded = 本轮**实际送判**数）。 */
 export interface ScoreEventsResult {
-  /** 本轮实际送判（未评分）的事件数 = 阶段熔断分母。 */
+  /**
+   * 本轮**实际送判**（claim 成功、送 LLM）的事件数 = 阶段熔断分母。
+   * **不含** claim 被他人抢走/未过期而跳过者（claimSkipped）——那些事件由对方链路评分，
+   * 不属于本链路的「送判」，计入分母会污染降级率（claim 跳过非降级）。
+   */
   judged: number;
   /** 成功写分的事件数。 */
   scored: number;
   /** 单条降级（judge 失败）被跳过、未写库的事件数。 */
   degradedCount: number;
+  /**
+   * 因并发 claim 未抢到（已被另一链路 claim 且未过 T）而跳过的事件数（非降级、不计入熔断分母）。
+   * 供可观测：两链路并发时本链路跳过对方正在评分的事件。
+   */
+  claimSkipped: number;
 }
 
 export interface ScoreEventsOptions {
@@ -52,6 +62,84 @@ export interface ScoreEventsOptions {
   judge?: JudgeOptions;
   /** 错误日志 sink，默认 console.error；便于测试断言降级被记录（非静默）。 */
   logError?: (message: string, detail: unknown) => void;
+  /**
+   * 并发评分原子 claim 的回收阈值 T（毫秒，默认 env.JUDGE_CLAIM_RECLAIM_MS）。
+   * 一个被 claim 但 *_score 仍 NULL 的事件，停留超过 T 即视为僵尸 claim（崩溃/超时遗留），
+   * 可被本链路重新 claim 重评。env 已校验 `T > L + W`（见 config/env.ts superRefine）；
+   * 测试可注入小值快速验证「claim 后崩溃经 T 重评」。
+   */
+  reclaimMs?: number;
+}
+
+/** 一次 claim 尝试的结果。 */
+export type ClaimResult = 'claimed' | 'skipped';
+
+/**
+ * 对单个事件做并发评分原子 claim（送 LLM 前的确定性闸，design D6 / daily-intel「降级逐条容错」）。
+ *
+ * `UPDATE ai_news_events SET judge_claimed_at = now()
+ *    WHERE event_id = ?
+ *      AND importance_score IS NULL                                  -- 只 claim 未评分者
+ *      AND (judge_claimed_at IS NULL OR judge_claimed_at < now() - interval 'T ms')  -- 含超时回收
+ *  RETURNING event_id`
+ *
+ * 语义（绝不可违背）：
+ * - **只有 RETURNING 返回该行的链路（claim 成功）才送 LLM 评分**；另一并发链路的同一 UPDATE
+ *   不满足 `judge_claimed_at IS NULL OR ... < now()-T`（已被对方写过且未过期）→ 0 行返回 → 跳过。
+ *   保证「一事件只被评一次分」跨日报/告警两链路成立。
+ * - **超时回收**：claim 条件含 `OR judge_claimed_at < now()-T`——claim 后崩溃（judge_claimed_at
+ *   非空但 *_score 仍 NULL）的僵尸 claim 经 T 后被重新 claim，不致永久漏评。
+ * - `importance_score IS NULL` 与塌缩首建无分态一致（各 *_score 同生同灭），评分成功写分后该事件
+ *   不再满足 claim 条件（已有分）——claim 随写分自然失效，无需显式释放。
+ *
+ * 回收阈值 `T` 由 env 校验满足 `T > L + W`（L=LLM_TIMEOUT_MS、W=JUDGE_WRITE_BUDGET_MS）——使
+ * 正在合法评分/写分（停留 < L+W）的事件恒不会存活到 `now()-T`、不被另一链路误回收双评分。
+ *
+ * @returns 'claimed'（本链路抢到、应送 LLM）/ 'skipped'（已被他人 claim 且未过期、或已评分）。
+ */
+export async function claimEventForJudging(
+  eventId: string,
+  reclaimMs: number,
+  dbh: DbLike = defaultDb,
+): Promise<ClaimResult> {
+  // now() - interval 'N milliseconds'：用参数化毫秒数，避免拼接；DB 端时钟统一口径（防进程钟漂）。
+  const reclaimCutoff = sql`now() - (${reclaimMs}::double precision * interval '1 millisecond')`;
+  const claimed = await dbh
+    .update(aiNewsEvents)
+    .set({ judgeClaimedAt: sql`now()` })
+    .where(
+      and(
+        eq(aiNewsEvents.eventId, eventId),
+        isNull(aiNewsEvents.importanceScore),
+        or(
+          isNull(aiNewsEvents.judgeClaimedAt),
+          lt(aiNewsEvents.judgeClaimedAt, reclaimCutoff),
+        ),
+      ),
+    )
+    .returning({ eventId: aiNewsEvents.eventId });
+
+  return claimed.length > 0 ? 'claimed' : 'skipped';
+}
+
+/**
+ * 释放某事件的评分 claim（清 `judge_claimed_at`，仅当仍未评分时）——评分失败/降级后即时调用，
+ * 使下一轮可立即重判，而非等回收阈值 `T`（claim 的超时回收本为「崩溃/超时」兜底；**已处理的
+ * 评分失败应主动释放 claim**，否则该事件白白被锁 `T` 时长、也挡住并发链路评分，Bugbot #2）。
+ *
+ * `WHERE importance_score IS NULL` 守卫：只清「claim 了但没评成功」的，绝不误清已评分事件的痕迹。
+ * 释放尽力而为：调用方应吞掉其异常（事件仍会在 `T` 后被超时回收兜底，不致永久漏评）。
+ */
+export async function releaseJudgeClaim(
+  eventId: string,
+  dbh: DbLike = defaultDb,
+): Promise<void> {
+  await dbh
+    .update(aiNewsEvents)
+    .set({ judgeClaimedAt: null })
+    .where(
+      and(eq(aiNewsEvents.eventId, eventId), isNull(aiNewsEvents.importanceScore)),
+    );
 }
 
 /**
@@ -72,9 +160,12 @@ export async function scoreUnscoredEvents(
   const logError =
     options.logError ??
     ((message, detail) => console.error(`[value-judge] ${message}`, detail));
+  const reclaimMs = options.reclaimMs ?? env.JUDGE_CLAIM_RECLAIM_MS;
 
-  // 只送判尚未评分的事件：importance_score IS NULL 即「未被本 Agent 写过分」。
-  // 其余 *_score 列与 importance_score 同生同灭（同一次 UPDATE 一并写），故以它为准即可。
+  // 候选集：尚未评分的事件（importance_score IS NULL 即「未被本 Agent 写过分」）。
+  // 这是**候选**而非「已 claim 必送判」——每条送 LLM 前还要逐条原子 claim（claimEventForJudging）；
+  // 仅 claim 成功者送判，未抢到（被另一链路 claim 且未过 T）的跳过（claimSkipped++、不计入熔断分母）。
+  // 防并发双评分：日报链与告警高频链可能同时 SELECT 到同一未评分事件，靠 claim 而非 SELECT 去重。
   const events: UnscoredEvent[] = await dbh
     .select({
       eventId: aiNewsEvents.eventId,
@@ -85,8 +176,17 @@ export async function scoreUnscoredEvents(
 
   let scored = 0;
   let degradedCount = 0;
+  let judged = 0;
+  let claimSkipped = 0;
 
   for (const [index, event] of events.entries()) {
+    // 送 LLM 前原子 claim：仅抢到者送判。未抢到 → 该事件正被另一链路评分（或刚被评完），跳过。
+    const claim = await claimEventForJudging(event.eventId, reclaimMs, dbh);
+    if (claim === 'skipped') {
+      claimSkipped += 1;
+      continue;
+    }
+    judged += 1;
     // 逐条评分进度（轻量，一条一行）：N 次 LLM 调用中间无日志看不出进度。
     console.error(
       `[value-judge] 评分 ${index + 1}/${events.length}（event=${event.eventId.slice(0, 8)}）`,
@@ -117,11 +217,20 @@ export async function scoreUnscoredEvents(
 
       scored += 1;
     } catch (error) {
+      // 评分失败（降级或写库异常）：**立即释放 claim**（清 judge_claimed_at），使下一轮可即时
+      // 重判，而非白等回收阈值 T（Bugbot #2）。释放尽力而为——失败不再拖垮整批（事件仍会在 T
+      // 后被超时回收兜底，不致永久漏评）。
+      await releaseJudgeClaim(event.eventId, dbh).catch((releaseErr: unknown) =>
+        logError(
+          `事件 ${event.eventId} 释放 judge claim 失败（将由超时回收 T 兜底）`,
+          releaseErr,
+        ),
+      );
       if (error instanceof ValueJudgeFailureError) {
         // 单条降级：跳过 + 记日志 + 计数，整批继续，不写未校验数据。
         degradedCount += 1;
         logError(
-          `事件 ${event.eventId} 价值判断降级（跳过，不写库）`,
+          `事件 ${event.eventId} 价值判断降级（跳过，不写库，已释放 claim）`,
           error,
         );
         continue;
@@ -129,9 +238,10 @@ export async function scoreUnscoredEvents(
       // 非降级类错误（如 DB 写入失败）不应被吞——同样计入降级并记录，但不中断整批，
       // 让编排组据 degradedCount 决定是否熔断。
       degradedCount += 1;
-      logError(`事件 ${event.eventId} 评分写库异常（跳过）`, error);
+      logError(`事件 ${event.eventId} 评分写库异常（跳过，已释放 claim）`, error);
     }
   }
 
-  return { judged: events.length, scored, degradedCount };
+  // judged = 本链路实际 claim 成功并送判的数（熔断分母）；claimSkipped 不计入分母（非降级）。
+  return { judged, scored, degradedCount, claimSkipped };
 }

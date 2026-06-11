@@ -63,11 +63,15 @@ async function seedEvent(args: {
   return rows[0]!.event_id;
 }
 
-async function markPushedSuccess(eventId: string, pushDate: string) {
+async function markPushedSuccess(
+  eventId: string,
+  pushDate: string,
+  channel = 'telegram',
+) {
   await pool!.query(
     `INSERT INTO push_records (target_type, target_id, channel, push_date, status, pushed_at)
-     VALUES ('event', $1, 'telegram', $2, 'success', now())`,
-    [eventId, pushDate],
+     VALUES ('event', $1, $2, $3, 'success', now())`,
+    [eventId, channel, pushDate],
   );
 }
 
@@ -110,6 +114,49 @@ describe.skipIf(!databaseUrl)('Top N 候选窗口（DB 侧不变量）', () => {
     const ids = top.map((e) => e.eventId);
     expect(ids).toContain(fresh);
     expect(ids).not.toContain(pushed);
+  });
+
+  it('Model B + 各通道可靠补发：候选 = 「尚未投递给所有已配置通道」，缺任一通道仍入选', async () => {
+    // 统一日报模型：选一份 channel-blind Top N；候选窗口排除「已投递给**所有**已配置通道」者，
+    // 只要还差任一通道未 success 就留在名单（由 dispatcher per-channel 跨天补发该通道）。
+    const onlyFeishu = await seedEvent({ key: 'only-feishu', importance: 95 });
+    const onlyTelegram = await seedEvent({ key: 'only-tg', importance: 94 });
+    const fresh = await seedEvent({ key: 'fresh', importance: 90 });
+    await markPushedSuccess(onlyFeishu, '2099-01-31', 'feishu');
+    await markPushedSuccess(onlyTelegram, '2099-01-31', 'telegram');
+
+    // 默认已配置通道 = [telegram]：仅当 telegram 已 success 才算「投递给所有通道」→ 排除。
+    const tgOnly = await selectTopN({ now: NOW, importanceFloor: 60, windowDays: 3 }, db!);
+    const tgIds = tgOnly.map((e) => e.eventId);
+    expect(tgIds).not.toContain(onlyTelegram); // telegram 已投递 → 移出
+    expect(tgIds).toContain(onlyFeishu); // telegram 仍缺（只 feishu 推过）→ 仍入选，待 telegram 补发
+    expect(tgIds).toContain(fresh);
+
+    // 已配置 [telegram, feishu]：success 须覆盖两通道才算「全部投递」→ 单通道 success 仍入选。
+    const both = await selectTopN(
+      { now: NOW, importanceFloor: 60, windowDays: 3, channels: ['telegram', 'feishu'] },
+      db!,
+    );
+    const bothIds = both.map((e) => e.eventId);
+    expect(bothIds).toContain(onlyFeishu); // telegram 缺 → 仍入选
+    expect(bothIds).toContain(onlyTelegram); // feishu 缺 → 仍入选
+    expect(bothIds).toContain(fresh);
+  });
+
+  it('Model B：已投递给所有已配置通道的事件移出统一名单（不再跨天重选）', async () => {
+    const delivered = await seedEvent({ key: 'all-done', importance: 95 });
+    const fresh = await seedEvent({ key: 'fresh2', importance: 90 });
+    // 两通道都 alert... 这里是 event：两通道都 success → 视为全部投递。
+    await markPushedSuccess(delivered, '2099-01-31', 'telegram');
+    await markPushedSuccess(delivered, '2099-01-31', 'feishu');
+
+    const top = await selectTopN(
+      { now: NOW, importanceFloor: 60, windowDays: 3, channels: ['telegram', 'feishu'] },
+      db!,
+    );
+    const ids = top.map((e) => e.eventId);
+    expect(ids).not.toContain(delivered); // 两通道都投递完毕 → 移出
+    expect(ids).toContain(fresh);
   });
 
   it('should_push=false 与不在近 N 天窗口的事件不入候选', async () => {

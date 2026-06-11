@@ -261,6 +261,127 @@ describe.skipIf(!canRun)('推送状态机与待发集合（pushIdempotency）', 
   });
 });
 
+describe.skipIf(!canRun)('channel 参数化幂等（同事件不同通道各自独立）', () => {
+  /** 查某 (channel) 下某批 target 的记录（targetType 固定 event）。 */
+  async function fetchByChannel(eventIds: string[], channel: string) {
+    const { rows } = await pool!.query<{ target_id: string; status: string }>(
+      `SELECT target_id, status FROM push_records
+        WHERE target_type=$1 AND channel=$2 AND push_date=$3 AND target_id = ANY($4)
+        ORDER BY target_id`,
+      [TARGET_TYPE, channel, TEST_PUSH_DATE, eventIds],
+    );
+    return rows;
+  }
+
+  it('telegram 已 success 不抑制 feishu 待发：feishu 仍属待发集合', async () => {
+    const events = [ev('chan-a1'), ev('chan-a2')];
+    const ids = events.map((e) => e.eventId);
+
+    // 先在 telegram 通道整批 success。
+    const r1 = await dispatchDigest(
+      events,
+      { now: NOW, sender: okSender(), channel: 'telegram' },
+      db!,
+    );
+    expect(r1.outcome).toBe('sent');
+
+    // telegram 待发集合应为空（已 success）。
+    const tgPending = await computePendingSet(
+      events,
+      TEST_PUSH_DATE,
+      db!,
+      'event',
+      'telegram',
+    );
+    expect(tgPending).toHaveLength(0);
+
+    // feishu 待发集合不被 telegram 的 success 抑制：仍含全部事件。
+    const fsPending = await computePendingSet(
+      events,
+      TEST_PUSH_DATE,
+      db!,
+      'event',
+      'feishu',
+    );
+    expect(fsPending.map((e) => e.eventId).sort()).toEqual([...ids].sort());
+
+    // telegram 行存在且 success；feishu 行此刻尚不存在（待发但未 dispatch）。
+    const tgRows = await fetchByChannel(ids, 'telegram');
+    expect(tgRows).toHaveLength(2);
+    for (const r of tgRows) expect(r.status).toBe('success');
+    const fsRows = await fetchByChannel(ids, 'feishu');
+    expect(fsRows).toHaveLength(0);
+
+    // 清理本用例。
+    await pool!.query(`DELETE FROM push_records WHERE target_id LIKE $1`, [
+      `${EVENT_PREFIX}chan-%`,
+    ]);
+  });
+
+  it('同四元组按 channel 分裂为两个命名空间：telegram 与 feishu 各自一行（各自 dispatch）', async () => {
+    // 飞书渲染已接入（组5）：用 mock sender 实跑 channel='feishu' dispatch，验四元组按 channel
+    // 分裂、互不覆盖。telegram dispatch 建 telegram(success)，feishu dispatch 建 feishu(success)。
+    const event = ev('chan-split', 'T', null);
+    await dispatchDigest(
+      [event],
+      { now: NOW, sender: okSender(), channel: 'telegram' },
+      db!,
+    );
+    const fsSender = okSender();
+    const fsResult = await dispatchDigest(
+      [event],
+      { now: NOW, sender: fsSender, channel: 'feishu' },
+      db!,
+    );
+    expect(fsResult.outcome).toBe('sent');
+    expect(fsSender.calls).toBe(1);
+
+    const { rows } = await pool!.query<{ channel: string; status: string }>(
+      `SELECT channel, status FROM push_records
+        WHERE target_type='event' AND target_id=$1 AND push_date=$2
+        ORDER BY channel`,
+      [event.eventId, TEST_PUSH_DATE],
+    );
+    // 两行：feishu(success) + telegram(success)，四元组按 channel 分裂、不互相覆盖。
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.channel)).toEqual(['feishu', 'telegram']);
+    for (const r of rows) expect(r.status).toBe('success');
+
+    await pool!.query(`DELETE FROM push_records WHERE target_id LIKE $1`, [
+      `${EVENT_PREFIX}chan-%`,
+    ]);
+  });
+
+  it("飞书 channel 幂等（channel='feishu'）：当天重跑待发为空不重发", async () => {
+    const events = [ev('fs-rerun-1', 'T', null), ev('fs-rerun-2', 'T', null)];
+    // 首发飞书：整批 success。
+    const s1 = okSender();
+    const r1 = await dispatchDigest(
+      events,
+      { now: NOW, sender: s1, channel: 'feishu' },
+      db!,
+    );
+    expect(r1.outcome).toBe('sent');
+    expect(s1.calls).toBe(1);
+
+    // 当天重跑同 channel='feishu'：已 success → 待发集合为空 → 不重发。
+    const fsPending = await computePendingSet(events, TEST_PUSH_DATE, db!, 'event', 'feishu');
+    expect(fsPending).toHaveLength(0);
+    const s2 = okSender();
+    const r2 = await dispatchDigest(
+      events,
+      { now: NOW, sender: s2, channel: 'feishu' },
+      db!,
+    );
+    expect(r2.outcome).toBe('skipped');
+    expect(s2.calls).toBe(0);
+
+    await pool!.query(`DELETE FROM push_records WHERE target_id LIKE $1`, [
+      `${EVENT_PREFIX}fs-rerun-%`,
+    ]);
+  });
+});
+
 describe.skipIf(!canRun)('日报全局单例锁', () => {
   it('并发两实例仅一获锁：另一被挡下，只一份送达', async () => {
     const lockDate = '2099-01-02';

@@ -22,19 +22,74 @@ import { z } from 'zod';
  * 不静默退化。
  */
 
+/** 带 vendor 标记的单个 RSS feed 配置（vendor 可空，普通博客无映射时为 null）。 */
+export interface RssFeedConfig {
+  url: string;
+  vendor: string | null;
+}
+
 /**
- * 把逗号分隔串解析为去空白的非空字符串数组（RSS 源清单用）。
- * 空串或仅空白 → 空数组。
+ * 把 `RSS_FEEDS` 由「URL 逗号列表」升级为「带 vendor 标记的 feed 配置」（design D2 / spec）。
+ *
+ * 格式：逗号分隔多个条目，每个条目形如 `url|vendor`。
+ * 解析每个条目的确定性顺序（消除「以是否含 `|` 区分新旧」与「URL 不得含 `|`」的环形依赖）：
+ *   ① 按**首个** `|` split 成两段；
+ *   ② split 后第二段再含 `|`（即原 URL 含 `|`、条目含多于一个 `|`）→ 配置错误、启动报错；
+ *   ③ 条目不含 `|`（split 仅 1 段）→ 旧裸 URL 格式、启动快速失败并提示新格式；
+ *   ④ vendor 段（第二段）可空：`url|`（尾随空 vendor）→ vendor=null、不报错、不阻塞采集。
+ *
+ * 这是破坏性 env 变更：禁止静默把所有 feed 的 vendor 置空入库。
  */
-const csvList = z
+const rssFeedList = z
   .string()
   .default('')
-  .transform((raw) =>
-    raw
+  .transform((raw, ctx) => {
+    const entries = raw
       .split(',')
       .map((s) => s.trim())
-      .filter((s) => s.length > 0),
-  );
+      .filter((s) => s.length > 0);
+
+    const feeds: RssFeedConfig[] = [];
+    for (const entry of entries) {
+      const sepIdx = entry.indexOf('|');
+      if (sepIdx === -1) {
+        // 旧裸 URL 格式（无 |）：机械判为旧格式，快速失败提示新格式。
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'RSS_FEEDS 条目「' +
+            entry +
+            '」缺少 vendor 分隔符 |（旧裸 URL 格式已废弃）。' +
+            '请改用新格式 url|vendor（vendor 可空，如 https://example.com/feed| 表示无厂商标记），' +
+            '多个 feed 用逗号分隔。',
+        });
+        continue;
+      }
+      const url = entry.slice(0, sepIdx).trim();
+      const rest = entry.slice(sepIdx + 1);
+      if (rest.includes('|')) {
+        // 第二段再含 |（即原 URL 含 |、条目含多于一个 |）：配置错误，启动报错。
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'RSS_FEEDS 条目「' +
+            entry +
+            '」含多于一个 | 分隔符（URL 不得含 |）。每个条目须恰好形如 url|vendor。',
+        });
+        continue;
+      }
+      if (url.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'RSS_FEEDS 条目「' + entry + '」的 URL 段为空。',
+        });
+        continue;
+      }
+      const vendorRaw = rest.trim();
+      feeds.push({ url, vendor: vendorRaw.length > 0 ? vendorRaw : null });
+    }
+    return feeds;
+  });
 
 const envSchema = z.object({
   DATABASE_URL: z
@@ -67,6 +122,17 @@ const envSchema = z.object({
     .string()
     .min(1, 'TELEGRAM_CHAT_ID 缺失：需提供目标 chat id（推送日报的目标会话）'),
 
+  // --- 飞书自定义机器人推送（可选，feishu-push 5.1，design D5）---
+  // **飞书可选**：两者均缺 → 飞书 disabled、不纳入「已配置通道」集、纯 Telegram 部署照常启动；
+  // 仅配其一（不完整）→ 由下方 superRefine 快速失败；两者全配 → enabled。
+  // 这里两个字段各自 optional（不无条件必填，否则破坏纯 Telegram 向后兼容）；
+  // 「配其一即报错」的完整性约束在 schema 级 superRefine 里跨字段判定。
+  FEISHU_WEBHOOK_URL: z
+    .string()
+    .url('FEISHU_WEBHOOK_URL 必须是合法 URL（飞书自定义机器人 webhook 地址）')
+    .optional(),
+  FEISHU_SIGN_SECRET: z.string().min(1).optional(),
+
   // --- 推送时区（daily-intel-pipeline / telegram-push）---
   // push_date 与候选窗口「今天」同源此时区，钉死防跨 UTC 零点重复推送（design D6）。
   PUSH_TIMEZONE: z.string().min(1).default('Asia/Shanghai'),
@@ -89,23 +155,99 @@ const envSchema = z.object({
   // first_seen_at 在近 N 天的事件才进候选。
   FIRST_SEEN_WINDOW_DAYS: z.coerce.number().int().positive().default(3),
 
-  // --- BullMQ 每日定时触发（daily-intel-pipeline D7）---
-  // cron 表达式（BullMQ repeat.pattern）触发 daily-digest 任务，默认每日 08:00。
+  // --- BullMQ 每日定时触发（daily-intel-pipeline D7 / feishu-push 5.5）---
+  // cron 表达式（BullMQ repeat.pattern）触发 daily-digest 任务，默认每日 08:03。
+  // **分钟字段默认避整点/半点（∉ {0, 30}）**：飞书自定义机器人单租户限流（11232），
+  // 整点/半点是多机器人/多服务集中推送的高压时刻，08:03 错峰降低限流概率（feishu-push 5.5）。
   // cron 时区由 DAILY_DIGEST_CRON_TZ 指定（默认与 push 同源 Asia/Shanghai），
   // 防触发时区与 push_date 口径漂移。
-  DAILY_DIGEST_CRON: z.string().min(1).default('0 8 * * *'),
+  DAILY_DIGEST_CRON: z.string().min(1).default('3 8 * * *'),
   DAILY_DIGEST_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
   // 整 job 重试次数（BullMQ 作整 job 重试外壳，不拆阶段队列，design D7）。
   DAILY_DIGEST_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
 
+  // 周报调度开关：默认 'false'（暂禁用，待打磨后改 'true' 启用）。
+  // 关闭时 worker 不注册/启动 weekly-report 调度链；周报实现与测试保留、随时可开。
+  WEEKLY_REPORT_ENABLED: z.enum(['true', 'false']).default('false'),
+
   // --- Collector 源清单（source-collectors）---
-  // 逗号分隔的 RSS feed URL 列表，可为空（空则该源不采）。
-  RSS_FEEDS: csvList,
+  // 带 vendor 标记的 RSS feed 配置：逗号分隔多个 `url|vendor` 条目（vendor 可空），
+  // 解析为 {url, vendor}[]；旧裸 URL 格式（无 `|`）启动即报错（design D2）。可为空（空则该源不采）。
+  RSS_FEEDS: rssFeedList,
   // GitHub API token，用于提额（带 token 提速率上限）；可空，空则匿名调用受更严限流。
   GITHUB_TOKEN: z.string().default(''),
+  // Product Hunt Developer Token（只读，无需交互 OAuth）：产品发现采集器用它调 GraphQL。
+  // 必填且非空：缺失则产品发现无法采集，按既有 env 校验快速失败，禁止匿名静默继续（spec product-discovery）。
+  PRODUCT_HUNT_TOKEN: z
+    .string()
+    .min(1, 'PRODUCT_HUNT_TOKEN 缺失：需提供 Product Hunt Developer Token（只读，用于产品发现采集）'),
   // 单次源网络调用（fetch / RSS parseURL）超时毫秒数；防实网挂起无限期卡死整个采集。
   COLLECTOR_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
-});
+
+  // --- 实时重大发布告警（realtime-alerts，design D6）---
+  // 「重大发布」实时告警阈值：评分**后**判 `importance_score IS NOT NULL AND >= 此值` 才告警。
+  // 默认 85，严于日报候选 should_push 的 importance>=75 与 Top N 下限闸>=60（实时门槛更高防刷屏）。
+  // 判定纯程序阈值，禁止 LLM 决定是否告警。
+  ALERT_IMPORTANCE_THRESHOLD: z.coerce.number().min(0).max(100).default(85),
+  // 实时告警高频轮询 cron（BullMQ repeat.pattern）。默认每 20 分钟（保守，靠真实数据调，design 待解决问题）。
+  // 高频链路全源 0/空轮是常态、不告警；只采实时新闻源 {rss,hacker_news,github}，不碰 arXiv/PH。
+  ALERT_SCAN_CRON: z.string().min(1).default('*/20 * * * *'),
+  ALERT_SCAN_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
+  ALERT_SCAN_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  // 告警单例锁 `alert:{channel}:{event_id}` TTL（毫秒）：job 级短时持有，覆盖「单事件渲染+单通道送达」
+  // 最坏时长；崩溃后经 TTL 自动释放（锁键不含时间，无 TTL 会永久死锁该事件告警，故释放语义不可省）。
+  ALERT_LOCK_TTL_MS: z.coerce.number().int().positive().default(60000),
+
+  // --- 并发评分原子 claim 回收阈值 T（daily-intel-pipeline「降级逐条容错」/ realtime-alerts，design D6）---
+  // 日报链与告警高频链可能并发对同一未评分事件评分；送 LLM 前原子 claim（写 judge_claimed_at），
+  // 仅 claim 成功者评分。一个被 claim 的事件停在「score NULL + 已 claim」的总时长 = L（单条 LLM 硬超时
+  // LLM_TIMEOUT_MS）+ W（LLM 返回后写分/事务提交延迟上界）。回收阈值 T 必须 **> L + W**——否则
+  // 慢评分会被另一链路误回收双写；过短则误回收，过长则僵尸 claim 回收慢。
+  // 默认 = LLM_TIMEOUT_MS(60s) + 写分裕量 W(60s) 后再留余量，取 180000（180s > 60 + 60）。
+  // 启动期跨字段校验 T > LLM_TIMEOUT_MS + JUDGE_WRITE_BUDGET_MS（见 superRefine）。
+  JUDGE_CLAIM_RECLAIM_MS: z.coerce.number().int().positive().default(180000),
+  // 写分提交延迟上界 W（毫秒）：LLM 返回后写 *_score / 事务提交的延迟上界（含 DB 写排队与进程暂停容限）。
+  // 仅用于启动期校验 T > L + W；默认 60000。
+  JUDGE_WRITE_BUDGET_MS: z.coerce.number().int().positive().default(60000),
+})
+  // 飞书配置完整性跨字段校验（feishu-push 5.1）：
+  // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；
+  // - 两者全配 → enabled，放行；
+  // - 仅配其一（不完整）→ 快速失败，禁止用空值发送或静默半启用。
+  .superRefine((data, ctx) => {
+    const hasUrl = Boolean(data.FEISHU_WEBHOOK_URL);
+    const hasSecret = Boolean(data.FEISHU_SIGN_SECRET);
+    if (hasUrl !== hasSecret) {
+      const missing = hasUrl ? 'FEISHU_SIGN_SECRET' : 'FEISHU_WEBHOOK_URL';
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [missing],
+        message:
+          `飞书通道配置不完整：FEISHU_WEBHOOK_URL 与 FEISHU_SIGN_SECRET 必须同时配置或同时缺省。` +
+          `检测到仅配置了其中之一，缺少 ${missing}。` +
+          `（飞书是可选通道：两者均不配则飞书 disabled、纯 Telegram 部署照常启动；` +
+          `若要启用飞书须两者都填，禁止半启用用空值发送。）`,
+      });
+    }
+  })
+  // 并发评分原子 claim 回收阈值不变量（realtime-alerts / daily-intel-pipeline「降级逐条容错」）：
+  // 回收阈值 T 必须 **严格 > L + W**（L=LLM_TIMEOUT_MS 单条 LLM 硬超时，W=JUDGE_WRITE_BUDGET_MS
+  // 写分提交延迟上界）。否则正在合法评分/写分（总时长 < L+W）的事件可能被另一链路误回收 → 双评分覆写。
+  // 启动期快速失败，禁止配出「会误回收慢评分」的危险阈值。
+  .superRefine((data, ctx) => {
+    const minReclaim = data.LLM_TIMEOUT_MS + data.JUDGE_WRITE_BUDGET_MS;
+    if (data.JUDGE_CLAIM_RECLAIM_MS <= minReclaim) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['JUDGE_CLAIM_RECLAIM_MS'],
+        message:
+          `并发评分 claim 回收阈值 T（JUDGE_CLAIM_RECLAIM_MS=${data.JUDGE_CLAIM_RECLAIM_MS}ms）` +
+          `必须严格大于 L + W = LLM_TIMEOUT_MS(${data.LLM_TIMEOUT_MS}) + JUDGE_WRITE_BUDGET_MS(${data.JUDGE_WRITE_BUDGET_MS}) = ${minReclaim}ms。` +
+          `否则正在合法评分/写分（总时长 < L+W）的事件会被另一链路误回收 → 双评分覆写。` +
+          `请上调 JUDGE_CLAIM_RECLAIM_MS 到 > ${minReclaim}。`,
+      });
+    }
+  });
 
 export type Env = z.infer<typeof envSchema>;
 
@@ -131,3 +273,23 @@ export function parseEnv(source: NodeJS.ProcessEnv): Env {
  * 模块首次被 import 时即执行校验——缺关键变量则在启动阶段立即 throw。
  */
 export const env: Env = parseEnv(process.env);
+
+/**
+ * 飞书通道是否已配置（enabled）。已校验完整性（superRefine 保证不会半配），
+ * 故只需判其一非空即等价于「两者全配」。供「已配置通道集」计算（feishu-push 5.1 / 5.3）：
+ * 飞书未配置 → 不纳入分发通道集、纯 Telegram 部署照常启动；禁止用空值发送。
+ *
+ * @param e 已校验 env（默认全局 env；测试可注入解析后的局部 env）。
+ */
+export function isFeishuEnabled(e: Env = env): boolean {
+  return Boolean(e.FEISHU_WEBHOOK_URL && e.FEISHU_SIGN_SECRET);
+}
+
+/**
+ * 周报调度是否启用。默认禁用（暂缓打磨）；启用时 worker 才注册/启动 weekly-report 调度链。
+ *
+ * @param e 已校验 env（默认全局 env；测试可注入局部 env）。
+ */
+export function isWeeklyReportEnabled(e: Env = env): boolean {
+  return e.WEEKLY_REPORT_ENABLED === 'true';
+}

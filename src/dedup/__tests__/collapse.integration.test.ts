@@ -62,6 +62,21 @@ async function seedRawItem(args: {
   return BigInt(rows[0]!.id);
 }
 
+/** 插入一条带显式 raw_type 的 raw_item（用于类型路由测试），返回 id。 */
+async function seedTypedRawItem(args: {
+  sourceItemId: string;
+  url: string | null;
+  title: string;
+  rawType: string;
+}): Promise<bigint> {
+  const { rows } = await pool!.query<{ id: string }>(
+    `INSERT INTO raw_items (source, source_item_id, url, title, raw_type)
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    [SOURCE, args.sourceItemId, args.url, args.title, args.rawType],
+  );
+  return BigInt(rows[0]!.id);
+}
+
 async function fetchEventByDedupKey(dedupKey: string) {
   const { rows } = await pool!.query<{
     event_id: string;
@@ -456,5 +471,86 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     expect(rows[0]!.first_seen_at?.toISOString()).toBe(oldFetchedAt.toISOString());
 
     await db!.delete(schema.aiNewsEvents).where(sql`dedup_key = ${dedupKey}`);
+  });
+
+  it('类型路由：product/paper 条目不被塌缩入口扫到（不产生 ai_news_events）', async () => {
+    const ts = Date.now();
+    // product（PH）与 paper（arXiv）行：均有可归一化的 url/title，若未排除会塌缩成 event。
+    const productId = await seedTypedRawItem({
+      sourceItemId: `route-product-${ts}`,
+      url: `https://producthunt.com/posts/x-${ts}`,
+      title: 'Some product',
+      rawType: 'product',
+    });
+    const paperId = await seedTypedRawItem({
+      sourceItemId: `route-paper-${ts}`,
+      url: `https://arxiv.org/abs/2406.${ts}`,
+      title: 'Some paper',
+      rawType: 'paper',
+    });
+    // 对照：一条 news 行（应正常进事件流）。
+    const newsId = await seedTypedRawItem({
+      sourceItemId: `route-news-${ts}`,
+      url: `https://example.com/news-${ts}`,
+      title: 'Some news',
+      rawType: 'news',
+    });
+
+    const outcomes = await collapseUncollapsedRawItems(db!);
+    const scanned = new Set(outcomes.map((o) => o.rawItemId));
+    // product/paper 被查询层排除 → 不在本轮塌缩结果里。
+    expect(scanned.has(productId)).toBe(false);
+    expect(scanned.has(paperId)).toBe(false);
+    // news 行正常被扫到塌缩。
+    expect(scanned.has(newsId)).toBe(true);
+
+    // 不为 product/paper 产生任何 ai_news_events 行。
+    const { rows: evRows } = await pool!.query(
+      `SELECT 1 FROM ai_news_events WHERE representative_raw_item_id IN ($1, $2)`,
+      [productId.toString(), paperId.toString()],
+    );
+    expect(evRows).toHaveLength(0);
+
+    // 清理 news 行产生的 event。
+    const newsOutcome = outcomes.find((o) => o.rawItemId === newsId)!;
+    if (newsOutcome.dedupKey) {
+      await db!.delete(schema.aiNewsEvents).where(sql`dedup_key = ${newsOutcome.dedupKey}`);
+    }
+  });
+
+  it('NULL raw_type 视作新闻类纳入塌缩（IS DISTINCT FROM，保 P1 行为）', async () => {
+    const ts = Date.now();
+    // 不设 raw_type（NULL）：必须仍被当作新闻塌缩成 event。
+    const id = await seedRawItem({
+      sourceItemId: `route-nulltype-${ts}`,
+      url: `https://example.com/nulltype-${ts}`,
+      title: 'Null type news',
+      publishedAt: null,
+    });
+    const outcomes = await collapseUncollapsedRawItems(db!);
+    const mine = outcomes.find((o) => o.rawItemId === id);
+    expect(mine).toBeDefined();
+    expect(mine!.unprocessable).toBe(false);
+    expect(mine!.dedupKey).not.toBeNull();
+    await db!.delete(schema.aiNewsEvents).where(sql`dedup_key = ${mine!.dedupKey}`);
+  });
+
+  it('paper 行入库即 collapsed=true 时不被塌缩入口重扫（仅沉淀、不每轮重扫）', async () => {
+    const ts = Date.now();
+    // arXiv 论文入库即 collapsed=true：塌缩入口（只扫 collapsed=false）不应扫到它。
+    const { rows } = await pool!.query<{ id: string }>(
+      `INSERT INTO raw_items (source, source_item_id, url, title, raw_type, collapsed)
+       VALUES ($1, $2, $3, $4, 'paper', true) RETURNING id`,
+      [
+        SOURCE,
+        `route-paper-collapsed-${ts}`,
+        `https://arxiv.org/abs/2407.${ts}`,
+        'Sunk paper',
+      ],
+    );
+    const paperId = BigInt(rows[0]!.id);
+
+    const outcomes = await collapseUncollapsedRawItems(db!);
+    expect(outcomes.some((o) => o.rawItemId === paperId)).toBe(false);
   });
 });

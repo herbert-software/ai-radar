@@ -7,8 +7,10 @@
  * 关键不变量（绝不可违背）：
  * - 候选窗口三条件齐：`should_push=true`
  *   AND `first_seen_at 在近 N 天`
- *   AND `该 event 从未被任何 push_date 以该 channel success 推送过`（跨天/跨次不重推，
- *   常青高分事件一生只成功推一次）。
+ *   AND `该 event 尚未投递给所有已配置通道`（success 覆盖的 distinct 已配置通道数 < 配置通道数；
+ *   跨天/跨次不重推，常青高分事件一生只成功推一次）。统一日报模型（Model B）：每日选**一份**
+ *   channel-blind Top N，同份发放给所有已配置通道；候选只在「全部投递完毕？」层面聚合判定（不按
+ *   通道分别选题），缺任一通道则留在名单、由 dispatcher per-channel 跨天可靠补发（见 selectTopN 注释）。
  * - 候选窗口「今天」必须复用 push-date.ts 的同一 Asia/Shanghai 时间源（getPushDate），
  *   禁止另起一套时区计算导致两处口径漂移（design D5/D6）。
  * - 组合分 `rank_score = 0.45*importance + 0.25*developer_relevance + 0.20*novelty
@@ -18,17 +20,15 @@
  * - importance 下限闸（env.IMPORTANCE_FLOOR）：低于阈值不入选，宁可少于 N 条也不凑数。
  * - 排序与名单由程序定，**不交给 LLM**。
  */
-import { and, eq, gte, notExists, sql } from 'drizzle-orm';
+import { and, eq, gte, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env } from '../config/env.js';
 import { startOfDayInTimeZone } from '../push/push-date.js';
+import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
-
-/** 推送通道（本期仅 telegram 单通道）。 */
-const CHANNEL = 'telegram';
 
 /** 候选/入选事件的最小视图（供 dispatcher 拼消息 + 排序）。 */
 export interface SelectedEvent {
@@ -59,6 +59,12 @@ export interface SelectTopNOptions {
   windowDays?: number;
   /** 覆盖组合分权重（默认 env.RANK_WEIGHT_*）。 */
   weights?: RankWeights;
+  /**
+   * **已配置通道集**（默认 `[telegram]`）。统一日报模型 Model B：候选窗口排除「已投递给**所有**
+   * 已配置通道」的事件——只要还差任一通道未 success，事件就留在统一名单（dispatcher 按 per-channel
+   * 跨天补发该通道）。这是「已配置通道集合」（决定何时算「全部投递完毕」），**不是**「按通道分别选题」。
+   */
+  channels?: readonly Channel[];
 }
 
 /** 组合分权重（hype 为减项的非负幅度）。 */
@@ -157,11 +163,15 @@ export function rankAndSelect(
  *   should_push = true
  *   AND first_seen_at >= 今天（上海）往前第 (windowDays−1) 个自然日的 00:00（上海，换算为 UTC）
  *   AND importance_score >= importanceFloor   ← 下限闸
- *   AND NOT EXISTS (push_records success for this event/channel on any push_date)
+ *   AND (success-覆盖的 distinct 已配置通道数 < 配置通道数)   ← 尚未投递给所有已配置通道
  *
  * 排序与取前 N 在程序内完成（compareForTopN），保证确定性 tiebreaker。
+ * **统一日报模型（Model B）+ 各通道可靠补发**：每日只选**一份** channel-blind Top N、同份发放给所有
+ * 已配置通道；候选只排除「已投递给全部已配置通道」者（缺任一通道仍留名单，由 dispatcher 的
+ * computePendingSet 按 per-channel 跨天「该通道从未 success」补发该通道），一旦全部通道都 success
+ * 即移出名单。`options.channels` = 已配置通道集（默认 [telegram]），决定「全部投递完毕」的口径。
  *
- * @param options 可注入 now / topN / 阈值 / 权重（默认读 env）。
+ * @param options 可注入 now / topN / 阈值 / 权重 / channels（已配置通道集，默认 [telegram]）。
  * @param dbh     可注入 db 或事务句柄（默认全局 db）。
  */
 export async function selectTopN(
@@ -173,26 +183,33 @@ export async function selectTopN(
   const importanceFloor = options.importanceFloor ?? env.IMPORTANCE_FLOOR;
   const windowDays = options.windowDays ?? env.FIRST_SEEN_WINDOW_DAYS;
   const weights = options.weights ?? defaultWeights();
+  const channels =
+    options.channels && options.channels.length > 0
+      ? options.channels
+      : [CHANNEL.telegram];
 
   // 「今天」与 push_date 同源：windowLowerBound 经 startOfDayInTimeZone 复用 push-date 的
   // Asia/Shanghai 时区源，下界 = 今天往前第 (windowDays−1) 个上海自然日的 00:00（防口径漂移）。
   const lowerBound = windowLowerBound(now, windowDays);
 
-  // 「从未被任何 push_date 以该 channel success 推送过」用相关子查询 NOT EXISTS 表达——
-  // 跨天/跨次不重推（design D5）。注意是「从未 success」而非「今天未 success」。
-  const neverSuccessfullyPushed = notExists(
-    dbh
-      .select({ one: sql`1` })
-      .from(pushRecords)
-      .where(
-        and(
-          eq(pushRecords.targetType, 'event'),
-          eq(pushRecords.targetId, aiNewsEvents.eventId),
-          eq(pushRecords.channel, CHANNEL),
-          eq(pushRecords.status, 'success'),
-        ),
-      ),
-  );
+  // **统一日报模型（Model B）——选题与通道解耦、各通道可靠补发**：每日只选**一份** channel-blind 的
+  // Top N，同一份发放给所有已配置通道。候选窗口排除「已投递给**所有**已配置通道」的事件——即在已配置
+  // 通道里，已 success 的 distinct 通道数 **< 配置通道数**（还差至少一个通道未投递）。如此：
+  // - 某通道失败/未达 → 事件留在统一名单 → dispatcher 按 per-channel 跨天补发该通道（不丢）；
+  // - 一旦所有已配置通道都 success → 移出名单（不再跨天重选、不重推）。
+  // 这是「全部投递完毕？」的聚合判定（产出仍是一份 channel-blind 名单），**不是按通道分别选题**。
+  const deliveredChannelCount = sql<number>`(
+    select count(distinct ${pushRecords.channel})
+    from ${pushRecords}
+    where ${pushRecords.targetType} = ${TARGET_TYPE.event}
+      and ${pushRecords.targetId} = ${aiNewsEvents.eventId}
+      and ${pushRecords.status} = 'success'
+      and ${pushRecords.channel} in (${sql.join(
+        channels.map((c) => sql`${c}`),
+        sql`, `,
+      )})
+  )`;
+  const notDeliveredToAllChannels = sql`${deliveredChannelCount} < ${channels.length}`;
 
   const rows = await dbh
     .select({
@@ -214,7 +231,7 @@ export async function selectTopN(
         gte(aiNewsEvents.firstSeenAt, lowerBound),
         // importance 下限闸：低于阈值不入选（宁缺勿凑）。NULL importance 被 gte 自然排除。
         gte(aiNewsEvents.importanceScore, String(importanceFloor)),
-        neverSuccessfullyPushed,
+        notDeliveredToAllChannels,
       ),
     );
 

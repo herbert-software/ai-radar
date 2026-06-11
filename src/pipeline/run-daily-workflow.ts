@@ -7,7 +7,7 @@
  *   → Value Judge 逐条（G3）
  *   → Top N 选择（G4）
  *   → 中文摘要（G5）
- *   → Telegram 推送（G6）
+ *   → 多通道推送（向所有已配置通道并发分发：Telegram 必配 + 飞书可选，G6）
  *
  * BullMQ 只在外层当「定时触发器 + 整 job 重试外壳」（见 ./queue.ts / ./worker.ts），
  * **本函数内不拆阶段队列、不投递消息**——阶段间靠普通 await 顺序衔接。
@@ -32,6 +32,7 @@ import {
   collectAndStore,
   type CollectAllOptions,
 } from '../collectors/index.js';
+import { createLookbackArxivCursorStore } from '../collectors/arxiv-cursor.js';
 import { collapseUncollapsedRawItems } from '../dedup/collapse.js';
 import {
   scoreUnscoredEvents,
@@ -43,8 +44,15 @@ import {
   type EventForDigest,
 } from '../agents/digest/persistence.js';
 import type { SummarizeOptions } from '../agents/digest/index.js';
-import { dispatchDigest, type MessageSender } from '../push/dispatcher.js';
+import {
+  dispatchDigest,
+  type DispatchResult,
+  type MessageSender,
+} from '../push/dispatcher.js';
 import { createTelegramSender } from '../push/telegram.js';
+import { createFeishuSender } from '../push/feishu.js';
+import { CHANNEL, type Channel } from '../push/targets.js';
+import { isFeishuEnabled } from '../config/env.js';
 import {
   acquireDigestLock,
   type AcquireLockOptions,
@@ -58,6 +66,14 @@ import {
 } from './circuit-breaker.js';
 
 type DbLike = typeof defaultDb;
+
+/**
+ * 日报单例锁默认 TTL（毫秒）：30 分钟。覆盖含**多通道并发分发**的最坏 runDailyWorkflow 时长
+ * （采集多源 + 数百条逐条 LLM 判断 + 逐条摘要 + Telegram/飞书并发分发，feishu-push 5.4）。
+ * 相比 lock.ts 的 15min 默认上调一倍，给 P2 多通道留足余量；配合看门狗按 TTL/3 续租，
+ * 长任务不会中途失锁致第二实例双发。崩溃时该 TTL 是「同日重新获取锁」的恢复上界。
+ */
+const DEFAULT_DIGEST_LOCK_TTL_MS = 30 * 60 * 1000;
 
 /**
  * 告警 sink：把「系统级故障」与「降级率熔断」以可观测方式上报。
@@ -95,8 +111,22 @@ export interface RunDailyWorkflowOptions {
   judge?: ScoreEventsOptions;
   /** 中文摘要阶段选项（注入 mock generateObject 等）。 */
   digest?: SummarizeOptions;
-  /** 推送发送器（默认 grammY 真实发送；测试注入 mock）。 */
+  /**
+   * Telegram 推送发送器（默认 grammY 真实发送；测试注入 mock）。
+   * 向后兼容字段：等价于 `senders.telegram`。同时传 `senders.telegram` 时以 `senders` 为准。
+   */
   sender?: MessageSender;
+  /**
+   * 各通道发送器显式注入（多通道分发）。键为 channel；提供则覆盖该通道默认 sender。
+   * 未提供某已配置通道的 sender 时按 env 构造真实 sender（telegram→grammY、feishu→webhook）。
+   * 测试可注入飞书 mock sender 在不配真实 FEISHU env 时验证多通道分发 / 单通道失败隔离。
+   */
+  senders?: Partial<Record<Channel, MessageSender>>;
+  /**
+   * 覆盖「已配置通道集」（测试用：无需真实 FEISHU env 即可让 feishu 参与分发）。
+   * 默认按 env 计算：恒含 telegram；isFeishuEnabled() 为真时加 feishu。
+   */
+  channels?: readonly Channel[];
   /** 单例锁选项（注入 mock Redis / TTL 等）。 */
   lock?: AcquireLockOptions;
   /** 告警 sink（默认 console.error）。 */
@@ -115,10 +145,13 @@ export type WorkflowOutcome =
 export interface RunDailyWorkflowResult {
   outcome: WorkflowOutcome;
   pushDate: string;
-  /** 采集返回条数（非新插入行数）。 */
+  /** 采集返回条数（registry 全部源汇总，非新插入行数）。 */
   collectedCount: number;
-  /** 可处理条目数（含塌缩进既有事件者）。 */
-  processableCount: number;
+  /**
+   * **新闻类**可处理条目数（含塌缩进既有新闻事件者；排除 product/paper）。
+   * 系统级「新闻真空」告警的分母（feishu-push 5.7）；与 store.processableCount 的全量口径不同。
+   */
+  newsProcessableCount: number;
   /** Value Judge 阶段降级统计。 */
   judge: StageDegrade;
   /** 中文摘要阶段降级统计。 */
@@ -182,15 +215,22 @@ export async function runDailyWorkflow(
   const abortRatio = options.abortRatio ?? env.DEGRADE_ABORT_RATIO;
   const pushDate = getPushDate(now);
 
-  // 全局单例锁：某 push_date 只允许一个实例跑（崩溃靠 TTL + finally 释放，design D6）。
-  const lock = await acquireDigestLock(pushDate, options.lock);
+  // 全局单例锁：某 push_date 只允许一个实例跑（崩溃靠 TTL + finally 释放，design D5/D6）。
+  // **TTL 须覆盖含多通道并发分发的最坏时长**（feishu-push 5.4 / telegram-push「日报任务全局单例」）：
+  // 采集多源 + 逐条 LLM 判断 + 逐条摘要 + 向 Telegram 与飞书**并发**分发。并发分发使两通道增量
+  // 有界（非串行叠加），相比 P1 单通道只增有限量；配合看门狗按 TTL/3 续租，长任务不会中途失锁。
+  // 未注入 lock 选项（生产）时显式给一个覆盖该最坏时长的 TTL（取代 lock.ts 的 15min 默认）；
+  // 注入 lock 选项（测试）时按注入值，保持用例对 TTL 的精确控制。
+  const lockOptions: AcquireLockOptions =
+    options.lock ?? { ttlMs: DEFAULT_DIGEST_LOCK_TTL_MS };
+  const lock = await acquireDigestLock(pushDate, lockOptions);
   if (lock === null) {
     console.error(`[pipeline] 锁: push_date=${pushDate} 未抢到单例锁，本实例放弃`);
     return {
       outcome: 'skipped-locked',
       pushDate,
       collectedCount: 0,
-      processableCount: 0,
+      newsProcessableCount: 0,
       judge: { processed: 0, degraded: 0 },
       digest: { processed: 0, degraded: 0 },
       topNCount: 0,
@@ -200,8 +240,14 @@ export async function runDailyWorkflow(
 
   try {
     console.error(`[pipeline] 锁: push_date=${pushDate} 已获取单例锁`);
-    // ── 阶段 1：采集（三源 Promise.allSettled 并发）+ 入库（源内幂等）。
-    const collected = await collectAndStore({ ...options.collect, dbh });
+    // ── 阶段 1：采集（多源 Promise.allSettled 并发）+ 入库（源内幂等）。
+    //    arXiv 增量游标接线（at-least-once，source-collectors / design D3）：arXiv **只在日报链采**
+    //    （非实时，不在告警链）。注入固定回溯窗口游标（now − 7d 作 OAI-PMH `from`）使日报每轮按
+    //    回溯窗口增量采集而非每轮全量或固定一点；无漏窗 + crash-safe 由「固定窗口重叠 + store 层
+    //    UNIQUE(source, source_item_id) 幂等」共同保障（见 arxiv-cursor.ts）。仅当调用方未自带 arxiv
+    //    采集选项（测试可注入桩/自带游标）时注入默认游标，不覆盖测试注入。
+    const collectOptions = withDefaultArxivCursor(options.collect);
+    const collected = await collectAndStore({ ...collectOptions, dbh });
     const collectedCount = collected.items.length;
     console.error(`[pipeline] 采集: 返回 ${collectedCount} 条`);
 
@@ -209,23 +255,31 @@ export async function runDailyWorkflow(
     //    按 collapsed 标记驱动、幂等）：每条塌缩后置 collapsed=true，source_count 恰好贡献一次，
     //    崩溃补塌缩安全；不再依赖脆弱的 store.insertedIds（Wave2a / Codex C1）。
     const outcomes = await collapseUncollapsedRawItems(dbh);
+    // **新闻类可处理条目数**（feishu-push 5.7 / daily-intel-pipeline MODIFIED）：
+    // collapseUncollapsedRawItems 的查询层已排除 raw_type product/paper，故其 outcomes 只含
+    // **新闻类** raw_items；其中 unprocessable=false 即「能塌缩进新闻事件」（含塌缩进既有新闻事件）。
+    // 这与 store.processableCount（统计全部条目含 product/paper 的通用「可入库」口径）语义不同——
+    // 系统级「新闻真空」告警必须用**新闻类**分母，否则「仅 arXiv 返回 paper、新闻源全空」时
+    // paper 会被 store 口径计入而掩盖新闻真空使告警失灵。
+    const newsProcessableCount = outcomes.filter((o) => !o.unprocessable).length;
     console.error(
-      `[pipeline] 塌缩: 处理 ${outcomes.length} 条未塌缩 raw_items → 可处理 ${outcomes.filter((o) => !o.unprocessable).length} 条`,
+      `[pipeline] 塌缩: 处理 ${outcomes.length} 条未塌缩新闻类 raw_items → 新闻类可处理 ${newsProcessableCount} 条`,
     );
 
-    // 系统级故障告警以采集/规范化层为准（非 judge 分母，design D8）：
-    // 判定用 store.processableCount——本轮采集**返回**条目中能构造 dedup_key 的数量
-    // （含塌缩进既有事件的源内重复项）。全命中既有事件的正常无新闻日 processableCount>0、不告警；
-    // 三源全挂（采集返回 0）或采集 > 0 但全 unprocessable（processableCount===0）才告警。
-    const processableCount = collected.store.processableCount;
-    const sysFailure = classifySystemFailure({ collectedCount, processableCount });
+    // 系统级故障告警以采集/规范化层为准（非 judge 分母，design D8），**仅日报链套用**：
+    // ①采集返回 0（registry 全部源失败）或 ②采集 > 0 但新闻类可处理数 = 0（全部新闻条目 unprocessable，
+    // 或仅有 product/paper 非新闻条目）→ 告警。全命中既有新闻事件的正常无新闻日 newsProcessableCount>0、不告警。
+    const sysFailure = classifySystemFailure({
+      collectedCount,
+      newsProcessableCount,
+    });
     let alerted = false;
     if (sysFailure.alert) {
       console.error(`[pipeline] 告警: 系统级故障 kind=${sysFailure.kind}`);
       alert(`系统级故障：${sysFailure.reason}`, {
         kind: sysFailure.kind,
         collectedCount,
-        processableCount,
+        newsProcessableCount,
       });
       alerted = true;
     }
@@ -254,9 +308,19 @@ export async function runDailyWorkflow(
     // 注意：judge 分母 = 0 时 stageShouldAbort 返回 false——**不中止**，直接进 Top N，
     // 已评分的常青事件仍可入选并推送（禁止误判「今日无候选」）。
 
-    // ── 阶段 4：Top N 选择（程序确定性，不交给 LLM）。
-    const topN = await selectTopN({ now }, dbh);
-    console.error(`[pipeline] Top N: 入选 ${topN.length} 条`);
+    // ── 阶段 4：Top N 选择（程序确定性，不交给 LLM）。统一日报模型 Model B：选一份 channel-blind
+    // Top N，候选窗口排除「已投递给所有已配置通道」者（还差任一通道就留在名单、由各通道 per-channel
+    // 跨天补发）。故先解析「已配置通道集」传入 selectTopN（同一份 channelSenders 在阶段 6 复用分发）。
+    const channelSenders = resolveChannelSenders(options);
+    const topN = await selectTopN(
+      { now, channels: channelSenders.map((c) => c.channel) },
+      dbh,
+    );
+    console.error(
+      `[pipeline] Top N: 入选 ${topN.length} 条（已配置通道：${channelSenders
+        .map((c) => c.channel)
+        .join(', ')}）`,
+    );
 
     // ── 阶段 5：中文摘要逐条。分母 = Top N。单条降级回退/剔除（G5 内已处理），绝不推半截。
     const canonicalUrls = await loadCanonicalUrls(
@@ -351,7 +415,7 @@ export async function runDailyWorkflow(
       throw new WorkflowAbortError('digest', rate);
     }
 
-    // ── 阶段 6：Telegram 推送（单消息原子 + push_records 幂等，G6）。
+    // ── 阶段 6：多通道推送（向所有已配置通道并发分发，单消息原子 + push_records 幂等，G6）。
     if (pushable.length === 0) {
       // Top N 为空（摘要分母 = 0，正常不推）或全被剔除 → 无可推，正常结束（不告警、不中止）。
       console.error(`[pipeline] 推送: 待发 0 条 → skipped-no-candidates`);
@@ -359,7 +423,7 @@ export async function runDailyWorkflow(
         outcome: 'skipped-no-candidates',
         pushDate,
         collectedCount,
-        processableCount,
+        newsProcessableCount,
         judge: judgeStage,
         digest: digestStage,
         topNCount: topN.length,
@@ -385,30 +449,62 @@ export async function runDailyWorkflow(
       );
     }
 
-    const sender = options.sender ?? createTelegramSender();
-    const dispatch = await dispatchDigest(pushable, { now, sender }, dbh);
+    // 向**所有已配置通道并发分发**（daily-intel-pipeline / feishu-push）。channelSenders 已在阶段 4
+    // 解析（与 selectTopN 候选共用同一通道集）。各通道走 dispatcher 同一套「待发集合→pending→原子
+    // 送达→success/failed」状态机（仅 channel 参数不同）；待发集合按 per-channel 跨天「从未 success」
+    // 判定——失败通道跨天可靠补发、成功通道不重发（统一名单 + 各通道可靠投递）。
     console.error(
-      `[pipeline] 推送: 待发 ${pushable.length} 条 → outcome=${dispatch.outcome}`,
+      `[pipeline] 推送: 待发 ${pushable.length} 条，向 ${channelSenders.length} 个通道并发分发：` +
+        channelSenders.map((c) => c.channel).join(', '),
     );
 
-    // C2：dispatch 发送失败（记录已置 failed）必须让整 job 失败 → BullMQ 同 push_date 重试，
-    // 重试时这些 failed 条目重新纳入待发集合重发（对齐 telegram-push spec「failed 下次重试」+ D6）。
-    // push_records 的 failed 状态已由 dispatcher 落库，锁在 finally 释放，故重试安全。
-    // outcome==='skipped'（待发空 / 单条超长）不算失败、不抛。
-    if (dispatch.outcome === 'failed') {
+    // **并发分发 + 单通道失败隔离**（Promise.allSettled）：某通道发送失败（dispatch.outcome
+    // ='failed' 或 dispatch 自身抛错）只记录该 channel 的 failed、绝不拖垮另一通道——另一通道
+    // 照常完成推送。全部 settle 后再统一汇总（成功通道已写 success，失败通道已写 failed）。
+    const settled = await Promise.allSettled(
+      channelSenders.map(({ channel, sender }) =>
+        dispatchDigest(pushable, { now, sender, channel }, dbh).then(
+          (dispatch): ChannelDispatch => ({ channel, dispatch }),
+        ),
+      ),
+    );
+
+    const failedChannels: string[] = [];
+    let anySent = false;
+    settled.forEach((res, idx) => {
+      const channel = channelSenders[idx]!.channel;
+      if (res.status === 'fulfilled') {
+        const { dispatch } = res.value;
+        console.error(`[pipeline] 推送[${channel}]: outcome=${dispatch.outcome}`);
+        if (dispatch.outcome === 'failed') failedChannels.push(channel);
+        if (dispatch.outcome === 'sent') anySent = true;
+      } else {
+        // dispatch 抛错（如渲染/DB 异常）：该通道视为失败、隔离，不拖垮另一通道。
+        const reason =
+          res.reason instanceof Error ? res.reason.message : String(res.reason);
+        console.error(`[pipeline] 推送[${channel}]: 异常隔离 ${reason}`);
+        failedChannels.push(channel);
+      }
+    });
+
+    // 任一通道失败 → 整 job 失败（抛错）使 BullMQ 同 push_date 重试。重试时：成功通道的待发
+    // 集合 = 今日 Top N MINUS 该 channel 今日已 success（已发不重发，幂等安全）；失败通道的
+    // failed 条目重新纳入该 channel 待发集合重发（对齐 telegram-push「failed 下次重试」+ D5/D6）。
+    // **分发失败由「单通道隔离 + failed 重试」承载，不计入 judge/摘要熔断分母**（已在前面分别熔断）。
+    if (failedChannels.length > 0) {
       throw new Error(
-        `digest dispatch failed: push_date=${pushDate} 发送失败（${dispatch.eventIds.length} 条已置 failed），抛错使 BullMQ 同日重试。`,
+        `digest dispatch failed: push_date=${pushDate} 通道 [${failedChannels.join(', ')}] ` +
+          `发送失败（已置 failed），其余通道已完成；抛错使 BullMQ 同日重试失败通道。`,
       );
     }
 
     return {
-      outcome:
-        dispatch.outcome === 'skipped'
-          ? 'skipped-no-candidates'
-          : 'pushed',
+      // 所有通道均非 failed：有任一 'sent' → pushed；否则（全 skipped，如各通道今日已 success）
+      // → skipped-no-candidates。
+      outcome: anySent ? 'pushed' : 'skipped-no-candidates',
       pushDate,
       collectedCount,
-      processableCount,
+      newsProcessableCount,
       judge: judgeStage,
       digest: digestStage,
       topNCount: topN.length,
@@ -417,4 +513,57 @@ export async function runDailyWorkflow(
   } finally {
     await lock.release();
   }
+}
+
+/**
+ * 给日报采集选项注入默认 arXiv 增量游标（at-least-once 接线，source-collectors / design D3）。
+ *
+ * 仅当调用方**未**自带 arxiv 采集选项时注入固定回溯窗口游标（`createLookbackArxivCursorStore`，
+ * 见 arxiv-cursor.ts）——使日报每轮按「近 7 天回溯窗口」增量采集 arXiv（非每轮全量、非固定一点），
+ * 无漏窗 + crash-safe 由「窗口重叠 + UNIQUE(source, source_item_id) 幂等」保障，无需持久化游标。
+ *
+ * 不覆盖调用方注入：测试注入 `collect.arxiv`（自带游标/桩）或 `collect.collectors.arxiv`（mock
+ * collector）时原样保留，保证用例对采集行为的精确控制。arXiv 只在日报链注入（实时告警链不采 arXiv）。
+ */
+function withDefaultArxivCursor(
+  collect: CollectAllOptions | undefined,
+): CollectAllOptions {
+  const base = collect ?? {};
+  // 调用方已注入 arxiv 采集选项（含其自带 cursor）→ 原样保留，不覆盖。
+  if (base.arxiv !== undefined) return base;
+  return { ...base, arxiv: { cursor: createLookbackArxivCursorStore() } };
+}
+
+/** 单通道分发结果（供 Promise.allSettled 汇总）。 */
+interface ChannelDispatch {
+  channel: Channel;
+  dispatch: DispatchResult;
+}
+
+/**
+ * 解析「已配置通道集 + 各通道 sender」（feishu-push 5.3 / daily-intel-pipeline）。
+ *
+ * 通道集：默认按 env 计算——恒含 telegram（必配）；isFeishuEnabled() 为真时加 feishu。
+ * 可由 options.channels 覆盖（测试用，无需真实 FEISHU env）。
+ * 各通道 sender：优先 options.senders[channel]；telegram 兼容 options.sender；
+ * 否则按 env 构造真实 sender（telegram→grammY、feishu→webhook）。
+ */
+function resolveChannelSenders(
+  options: RunDailyWorkflowOptions,
+): Array<{ channel: Channel; sender: MessageSender }> {
+  const channels: Channel[] = options.channels
+    ? [...options.channels]
+    : isFeishuEnabled()
+      ? [CHANNEL.telegram, CHANNEL.feishu]
+      : [CHANNEL.telegram];
+
+  return channels.map((channel) => {
+    const injected = options.senders?.[channel];
+    if (injected) return { channel, sender: injected };
+    if (channel === CHANNEL.telegram) {
+      return { channel, sender: options.sender ?? createTelegramSender() };
+    }
+    // channel === 'feishu'：按 env 构造真实 webhook sender（仅在 enabled 时才会走到此处）。
+    return { channel, sender: createFeishuSender() };
+  });
 }

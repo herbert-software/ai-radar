@@ -8,10 +8,11 @@
  * 零向量不变量（design / spec「PostgreSQL 使用 pgvector 镜像但不启用向量能力」）：
  * 本文件禁止任何 vector 列、禁止 pgvector 相关 import / CREATE EXTENSION。
  *
- * 仅三表不变量（spec「数据库 Schema 可迁移」）：
- * P1 仍禁止定义其余六张表（item_event_relations / item_product_relations /
- * ai_products / kb_ingestion_records / ai_tools / task_patterns），P1 用 1:1 模型，
- * 关系表留待 P3 语义合并时提案再加。
+ * 受限表集不变量（spec「数据库 Schema 可迁移」/「ai_products 产品表可迁移」）：
+ * P2 解禁并新建 `ai_products`（产品发现硬规则合并所需）；仍禁止定义其余五张表
+ * （item_event_relations / item_product_relations / kb_ingestion_records /
+ * ai_tools / task_patterns）——事件-产品关系表留待 P3 语义合并、工具/任务模式表
+ * 留待 P5 顾问期提案再加。
  */
 import { sql } from 'drizzle-orm';
 import {
@@ -116,6 +117,12 @@ export const aiNewsEvents = pgTable('ai_news_events', {
   }),
   hypeRiskScore: numeric('hype_risk_score', { precision: 5, scale: 2 }),
   shouldPush: boolean('should_push').default(false),
+  // 并发评分原子 claim（design D6 / spec「judge_claimed_at」）：日报链与实时告警高频链
+  // 可能并发对同一未评分事件评分。送 LLM 前 `UPDATE ... SET judge_claimed_at WHERE
+  // *_score IS NULL AND (judge_claimed_at IS NULL OR judge_claimed_at < now()-interval 'T')
+  // RETURNING` 原子 claim，仅 claim 成功者评分——防双评分覆写。超时回收阈值 T>L+W 使
+  // claim 后崩溃的事件可被后续运行重新 claim（僵尸 claim 回收）。本组只建列，claim 逻辑后续组。
+  judgeClaimedAt: timestamp('judge_claimed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 }, (table) => [
@@ -149,5 +156,57 @@ export const pushRecords = pgTable(
       table.channel,
       table.pushDate,
     ),
+  ],
+);
+
+/**
+ * 产品表（QA.md §8.3，P2 新增）。
+ * 承载产品发现的硬规则合并：Product Hunt 等源先落 `raw_items(raw_type='product')`，
+ * 再由确定性产品塌缩步骤读 raw_items 写本表（镜像 raw_items → ai_news_events 塌缩模式）。
+ *
+ * product_id 不变量（design D4 / spec「ai_products 产品表可迁移」）：与 event_id 同口径——
+ * 不透明 surrogate key，VARCHAR(128)（与 push_records.target_id 一致，使 target_id=product_id
+ * 互引类型相容），数据库默认 `gen_random_uuid()::text`，禁止内容派生。
+ *
+ * 硬合并唯一约束：UNIQUE(canonical_domain) / UNIQUE(github_repo) / UNIQUE(product_hunt_slug)
+ * 三者各自独立，作为塌缩 `ON CONFLICT` 冲突目标；NULL 键不参与约束（PG UNIQUE 放行多 NULL 行）。
+ * 合并由 DB 唯一约束 + 确定性程序保障，绝不交 LLM。
+ *
+ * 零向量不变量：本表禁止任何 vector 列、禁止 CREATE EXTENSION vector（语义能力留 P3）。
+ *
+ * 本期富化列（QA §8.3 的 vendor/category/score 等）留 P5 顾问期 forward-only 追加，
+ * 本期仅建硬合并/推送所需列。representative_raw_item_id 为 P2 新增过渡列（QA §8.3 DDL 未列，
+ * 有意偏离），在不建 item_product_relations（P3）前提下保留 raw_item↔product 回指。
+ */
+export const aiProducts = pgTable(
+  'ai_products',
+  {
+    // 不透明 surrogate key：DB 默认 gen_random_uuid()::text 生成，禁止内容派生（design D4）。
+    productId: varchar('product_id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    // QA §8.3 唯一 NOT NULL 业务列：塌缩 INSERT 必填（取 raw_item.title，缺失兜底 slug/domain）。
+    name: varchar('name', { length: 255 }).notNull(),
+    // 硬规则合并冲突键（各自 UNIQUE，作 ON CONFLICT 目标）；NULL 不参与约束。
+    canonicalDomain: varchar('canonical_domain', { length: 255 }),
+    githubRepo: varchar('github_repo', { length: 255 }),
+    productHuntSlug: varchar('product_hunt_slug', { length: 255 }),
+    // last_seen 类可累加列：硬合并 UPDATE 分支累加/更新（本期必建，UPDATE 累加目标）。
+    firstSeenAt: timestamp('first_seen_at', { withTimezone: true }),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+    lastPushedAt: timestamp('last_pushed_at', { withTimezone: true }),
+    // 多键命中多行冲突态以 metadata.merge_conflict 标记落点（本期必建，推送排除规则依赖）。
+    metadata: jsonb('metadata'),
+    // P2 过渡列：回指 raw_items.id（类型与 ai_news_events.representative_raw_item_id 一致）。
+    representativeRawItemId: bigint('representative_raw_item_id', {
+      mode: 'bigint',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    unique('ai_products_canonical_domain_key').on(table.canonicalDomain),
+    unique('ai_products_github_repo_key').on(table.githubRepo),
+    unique('ai_products_product_hunt_slug_key').on(table.productHuntSlug),
   ],
 );

@@ -9,7 +9,13 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { SelectedEvent } from '../../selection/top-n.js';
-import { buildDigestMessage, escapeMarkdownV2Url } from '../message.js';
+import {
+  buildDigestMessage,
+  buildFeishuCard,
+  escapeMarkdownV2Url,
+  renderDigest,
+  type FeishuCard,
+} from '../message.js';
 
 function ev(id: string, overrides: Partial<SelectedEvent> = {}): SelectedEvent {
   return {
@@ -198,5 +204,102 @@ describe('buildDigestMessage 长度预算与标题截断（4.3）', () => {
     expect(text).not.toContain('🚀'.repeat(150));
     // 但应保留前缀若干 🚀（未被 .slice 截半成乱码）。
     expect(text).toContain('🚀'.repeat(50));
+  });
+});
+
+describe('renderDigest 按 channel 分派（两层渲染，4.4）', () => {
+  it("channel='telegram' 复用 buildDigestMessage、MarkdownV2 渲染与 includedIds 不变", () => {
+    const events = [ev('e1'), ev('e2'), ev('e3')];
+    const rendered = renderDigest(events, 'telegram');
+    const direct = buildDigestMessage(events);
+
+    expect(rendered.channel).toBe('telegram');
+    expect(rendered.parseMode).toBe('MarkdownV2');
+    // 与直接调 buildDigestMessage 完全等价（既有 Telegram 渲染/截断不变量原样保留）。
+    expect(rendered.text).toBe(direct.text);
+    expect(rendered.includedIds).toEqual(direct.includedIds);
+  });
+
+  it("channel='feishu' 渲染为飞书 JSON 卡片（含 includedIds，与 buildFeishuCard 等价）", () => {
+    const events = [ev('e1'), ev('e2')];
+    const rendered = renderDigest(events, 'feishu');
+    expect(rendered.channel).toBe('feishu');
+    if (rendered.channel !== 'feishu') throw new Error('unreachable');
+    const direct = buildFeishuCard(events);
+    expect(rendered.text).toBe(direct.text);
+    expect(rendered.includedIds).toEqual(direct.includedIds);
+    // text 是卡片 payload 的 JSON 序列化串，可解析回 { card }。
+    const parsed = JSON.parse(rendered.text) as { card: FeishuCard };
+    expect(parsed.card.elements.length).toBe(2);
+  });
+});
+
+describe('buildFeishuCard 飞书 JSON 卡片渲染（5.2 / 5.6）', () => {
+  it('每条事件渲染为一个 div(lark_md)：标题 + 要点 + 文字链跳转（不依赖回调）', () => {
+    const events = [
+      ev('e1', {
+        representativeTitle: '飞书标题',
+        headlineZh: '一句话要点',
+        canonicalUrl: 'https://example.com/article/1?id=1',
+      }),
+    ];
+    const { card, includedIds } = buildFeishuCard(events);
+    expect(includedIds).toEqual(['e1']);
+    expect(card.header.title.content).toContain('AI Radar 每日情报');
+    expect(card.header.title.content).toContain('(1)');
+    expect(card.elements).toHaveLength(1);
+    const el = card.elements[0] as { tag: string; text: { tag: string; content: string } };
+    expect(el.tag).toBe('div');
+    expect(el.text.tag).toBe('lark_md');
+    expect(el.text.content).toContain('飞书标题');
+    expect(el.text.content).toContain('一句话要点');
+    // 文字链跳转：lark_md 内联链接 [原文](url)，不含任何回调/action 字段。
+    expect(el.text.content).toContain('[原文](https://example.com/article/1?id=1)');
+    // 整张卡片序列化里不出现任何回调相关字段（card_link/action callback 等）。
+    const json = JSON.stringify(card);
+    expect(json).not.toContain('callback');
+  });
+
+  it('headline 缺失走回退链（summary 截断）；canonical_url 缺失则不渲染链接行', () => {
+    const summary = '甲'.repeat(200);
+    const events = [
+      ev('e1', { headlineZh: null, summaryZh: summary, canonicalUrl: null }),
+    ];
+    const { card } = buildFeishuCard(events);
+    const el = card.elements[0] as { text: { content: string } };
+    // summary 截断（含省略号），无 200 连续甲。
+    expect(el.text.content).toContain('…');
+    expect(el.text.content).not.toContain('甲'.repeat(200));
+    // 无链接行。
+    expect(el.text.content).not.toContain('[原文]');
+  });
+
+  it('标题含 markdown 语法字符被转义（不误当链接语法破坏卡片）', () => {
+    const events = [
+      ev('e1', { representativeTitle: 'a[b](c)d', headlineZh: null, summaryZh: null, canonicalUrl: null }),
+    ];
+    const { card } = buildFeishuCard(events);
+    const el = card.elements[0] as { text: { content: string } };
+    // [ ] ( ) 被加反斜杠转义。
+    expect(el.text.content).toContain('a\\[b\\]\\(c\\)d');
+  });
+
+  it('超长标题按 code point 截断（不截半 emoji），整卡片仍可发', () => {
+    const longTitle = '🚀'.repeat(150) + '超长'.repeat(50);
+    const events = [ev('e1', { representativeTitle: longTitle, headlineZh: '要点', canonicalUrl: null })];
+    const { card } = buildFeishuCard(events);
+    const el = card.elements[0] as { text: { content: string } };
+    expect(el.text.content).toContain('…');
+    expect(el.text.content).not.toContain('🚀'.repeat(150));
+    expect(el.text.content).toContain('🚀'.repeat(50));
+  });
+
+  it('canonical_url 超长（>2000）→ 丢弃链接仅标题+要点（不撑爆卡片）', () => {
+    const hugeUrl = 'https://ex.com/' + 'a'.repeat(3000);
+    const events = [ev('e1', { representativeTitle: 'T', headlineZh: '要点', canonicalUrl: hugeUrl })];
+    const { card, includedIds } = buildFeishuCard(events);
+    expect(includedIds).toEqual(['e1']);
+    const el = card.elements[0] as { text: { content: string } };
+    expect(el.text.content).not.toContain('[原文]');
   });
 });

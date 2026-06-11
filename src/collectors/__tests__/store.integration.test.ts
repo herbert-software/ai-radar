@@ -120,6 +120,40 @@ describe.skipIf(!databaseUrl)('统一入库（源内幂等不变量）', () => {
     expect(Number(rows[0]!.n)).toBe(0);
   });
 
+  it('collapsed 透传：默认 false；arXiv 论文置 true（入库即标已沉淀）', async () => {
+    const ts = Date.now();
+    const newsItem = {
+      source: SOURCE as 'rss',
+      sourceItemId: `collapsed-default-${ts}`,
+      url: `https://example.com/n-${ts}`,
+      title: 'default collapsed',
+      content: null,
+      publishedAt: null,
+      rawType: 'news',
+    };
+    const paperItem = {
+      source: SOURCE as 'arxiv',
+      sourceItemId: `collapsed-paper-${ts}`,
+      url: `https://arxiv.org/abs/2406.${ts}`,
+      title: 'sunk paper',
+      content: 'abstract',
+      publishedAt: null,
+      rawType: 'paper',
+      collapsed: true,
+    };
+    await storeCollectedItems([newsItem, paperItem], { dbh: db! });
+
+    const { rows } = await pool!.query<{ source_item_id: string; collapsed: boolean }>(
+      `SELECT source_item_id, collapsed FROM raw_items
+       WHERE source = $1 AND source_item_id IN ($2, $3)`,
+      [SOURCE, newsItem.sourceItemId, paperItem.sourceItemId],
+    );
+    const byId = Object.fromEntries(rows.map((r) => [r.source_item_id, r.collapsed]));
+    // 新闻行默认 collapsed=false（待塌缩）；arXiv 论文行 collapsed=true（仅沉淀、不重扫）。
+    expect(byId[newsItem.sourceItemId]).toBe(false);
+    expect(byId[paperItem.sourceItemId]).toBe(true);
+  });
+
   it('内容哈希 fallback 作 source_item_id 时仍源内幂等', async () => {
     const sid = contentHash('hash-title', 'hash-body');
     const item = {
