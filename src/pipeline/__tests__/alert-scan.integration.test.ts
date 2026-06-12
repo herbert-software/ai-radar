@@ -149,6 +149,10 @@ const opts = (over: Record<string, unknown> = {}) => ({
   channels: ['telegram'] as const,
   lock: { redis: memoryRedis(), ttlMs: 60_000 },
   log: () => {},
+  // 测试用 NOW 是 2098 年，事件 first_seen_at 是当前时间（~2026），禁用时间窗口防测试被挡。
+  windowDays: 0,
+  // 测试每用例 TRUNCATE 全表后只有本用例 seed 的数据，上限不影响断言；给足空间即可。
+  maxPerScan: 100,
   ...over,
 });
 

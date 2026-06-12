@@ -197,6 +197,12 @@ const envSchema = z.object({
   // 告警单例锁 `alert:{channel}:{event_id}` TTL（毫秒）：job 级短时持有，覆盖「单事件渲染+单通道送达」
   // 最坏时长；崩溃后经 TTL 自动释放（锁键不含时间，无 TTL 会永久死锁该事件告警，故释放语义不可省）。
   ALERT_LOCK_TTL_MS: z.coerce.number().int().positive().default(60000),
+  // 告警候选时间窗口（天数）：仅对 first_seen_at 在近 N 天内的事件发告警（防冷启动积压刷屏）。
+  // 默认 3（同日报候选窗口量级）；0 表示不限窗口（不推荐）。
+  ALERT_FIRST_SEEN_WINDOW_DAYS: z.coerce.number().int().nonnegative().default(3),
+  // 单次 alert-scan 最多发送的告警条数（防 Telegram rate limit 刷屏）。
+  // 默认 5；超出的候选按 first_seen_at DESC 保留最新，其余待下轮（20min 后）补发。
+  ALERT_MAX_PER_SCAN: z.coerce.number().int().positive().default(5),
 
   // --- 并发评分原子 claim 回收阈值 T（daily-intel-pipeline「降级逐条容错」/ realtime-alerts，design D6）---
   // 日报链与告警高频链可能并发对同一未评分事件评分；送 LLM 前原子 claim（写 judge_claimed_at），

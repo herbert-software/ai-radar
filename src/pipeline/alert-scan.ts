@@ -26,7 +26,7 @@
  * - **状态机复用**：告警推送复用 dispatcher 同一「待发→pending→原子送达→success/failed」状态机
  *   （含 headline 缺失回退链——告警事件可能尚无中文摘要），仅 target_type/channel 口径不同。
  */
-import { and, gte, isNotNull, sql } from 'drizzle-orm';
+import { and, desc, gte, isNotNull, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env, isFeishuEnabled } from '../config/env.js';
@@ -49,7 +49,7 @@ import { createTelegramSender } from '../push/telegram.js';
 import { createFeishuSender } from '../push/feishu.js';
 import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 import type { SelectedEvent } from '../selection/top-n.js';
-import { getPushDate } from '../push/push-date.js';
+import { getPushDate, startOfDayInTimeZone } from '../push/push-date.js';
 import { acquireAlertLock, type AcquireAlertLockOptions } from './alert-lock.js';
 
 type DbLike = typeof defaultDb;
@@ -71,6 +71,10 @@ export interface RunAlertScanOptions {
   judge?: ScoreEventsOptions;
   /** 告警阈值覆盖（默认 env.ALERT_IMPORTANCE_THRESHOLD）。 */
   threshold?: number;
+  /** 候选时间窗口（天数，默认 env.ALERT_FIRST_SEEN_WINDOW_DAYS=3）。0 表示不限。 */
+  windowDays?: number;
+  /** 单次 scan 最多发送条数（默认 env.ALERT_MAX_PER_SCAN=5），防 Telegram rate limit。 */
+  maxPerScan?: number;
   /**
    * 覆盖「已配置通道集」（测试用）。默认按 env：恒含 telegram，isFeishuEnabled() 为真加 feishu。
    */
@@ -132,6 +136,9 @@ export async function selectAlertCandidates(
   threshold: number,
   dbh: DbLike = defaultDb,
   channels: readonly Channel[] = [CHANNEL.telegram],
+  now: Date = new Date(),
+  windowDays: number = env.ALERT_FIRST_SEEN_WINDOW_DAYS,
+  maxCandidates: number = env.ALERT_MAX_PER_SCAN,
 ): Promise<AlertCandidate[]> {
   const cfgChannels = channels.length > 0 ? channels : [CHANNEL.telegram];
   // Model B + 各通道可靠补发：候选 = 「尚未 alert-success 投递给**所有**已配置通道」——已 alert-success
@@ -150,6 +157,10 @@ export async function selectAlertCandidates(
   )`;
   const notAlertedToAllChannels = sql`${alertedChannelCount} < ${cfgChannels.length}`;
 
+  // 时间窗口下界：与日报候选窗口同源（startOfDayInTimeZone），防冷启动积压刷屏。
+  // windowDays=0 表示不限窗口（向后兼容旧行为，不推荐）；>0 时仅选近 N 天内首次出现的事件。
+  const lowerBound = windowDays > 0 ? startOfDayInTimeZone(now, windowDays - 1) : null;
+
   const rows = await dbh
     .select({
       eventId: aiNewsEvents.eventId,
@@ -165,8 +176,13 @@ export async function selectAlertCandidates(
         isNotNull(aiNewsEvents.importanceScore),
         gte(aiNewsEvents.importanceScore, String(threshold)),
         notAlertedToAllChannels,
+        // 时间窗口：仅对近 windowDays 天内首次出现的事件告警（防积压刷屏）。
+        lowerBound !== null ? gte(aiNewsEvents.firstSeenAt, lowerBound) : undefined,
       ),
-    );
+    )
+    // 单次扫描上限：优先最新事件（first_seen_at DESC），超出 maxCandidates 的下轮补发。
+    .orderBy(desc(aiNewsEvents.firstSeenAt))
+    .limit(maxCandidates);
 
   return rows.map((r) => ({
     eventId: r.eventId,
@@ -225,6 +241,8 @@ export async function runAlertScan(
   const dbh = options.dbh ?? defaultDb;
   const log = options.log ?? defaultLog;
   const threshold = options.threshold ?? env.ALERT_IMPORTANCE_THRESHOLD;
+  const windowDays = options.windowDays ?? env.ALERT_FIRST_SEEN_WINDOW_DAYS;
+  const maxPerScan = options.maxPerScan ?? env.ALERT_MAX_PER_SCAN;
   const pushDate = getPushDate(now);
 
   // ── 阶段 1：采集（**只跑实时新闻源 {rss, hacker_news, github}**，排除 arXiv/PH）+ 入库。
@@ -252,18 +270,26 @@ export async function runAlertScan(
   const channelSenders = resolveChannelSenders(options);
   const dispatched: AlertDispatchOutcome[] = [];
 
-  // channel-agnostic 候选：达阈值且从未以任一通道 success 告警过（一生一次、跨天去重）。
+  // channel-agnostic 候选：达阈值 + 近 windowDays 天内首见 + 未全通道 success（一生一次、跨天去重）。
+  // maxPerScan 限单次条数（first_seen_at DESC 取最新），超出者下轮补发，防 Telegram rate limit 刷屏。
   const candidates = await selectAlertCandidates(
     threshold,
     dbh,
     channelSenders.map((c) => c.channel),
+    now,
+    windowDays,
+    maxPerScan,
   );
   log(
     `告警候选: ${candidates.length} 条达阈值(>=${threshold})且从未 success 告警，` +
-      `发放给 ${channelSenders.length} 个通道（${channelSenders.map((c) => c.channel).join(', ')}）`,
+      `发放给 ${channelSenders.length} 个通道（${channelSenders.map((c) => c.channel).join(', ')}）` +
+      `（窗口 ${windowDays}天，单次上限 ${maxPerScan} 条）`,
   );
 
-  for (const candidate of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i]!;
+    // 逐条间隔 1s：Telegram 对单聊天约 1msg/s 限速，避免连续快速发送被 rate limit → failed → 重试刷屏。
+    if (i > 0) await new Promise((res) => setTimeout(res, 1000));
     // 独立单例锁 `alert:{event_id}`（per-event，覆盖该事件的多通道分发）：防两并发 alert-scan
     // 实例对同一告警事件重复分发（UNIQUE 挡不住并发双读双发）。job 级短时持有 + TTL/finally
     // 释放（锁键无时间，释放不可省）。未抢到 → 另一实例在发该事件，本实例跳过（不重复）。
