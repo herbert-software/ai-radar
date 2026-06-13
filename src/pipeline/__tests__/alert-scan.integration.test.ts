@@ -100,7 +100,15 @@ function judgeMock(importance: number) {
 }
 
 let seq = 0;
-function rssItem(title: string, url: string | null): CollectedItem {
+// 默认 publishedAt = NOW（在窗口内、不超未来上界）：候选时效闸键于 published_at，且 windowDays=0
+// 旁路仍排除 NULL/未来（须显式 isNotNull + lte(now)）。故 dispatch/幂等类用例的 rss 事件必须带
+// 一个「过去/现在」的 published_at 才能过时效闸——否则被 NULL 排除（那是时效闸用例的关注点，
+// 在独立 describe 块用 seedScoredEvent 覆盖）。
+function rssItem(
+  title: string,
+  url: string | null,
+  publishedAt: Date | null = NOW,
+): CollectedItem {
   seq += 1;
   return {
     source: 'rss',
@@ -108,7 +116,7 @@ function rssItem(title: string, url: string | null): CollectedItem {
     url,
     title,
     content: null,
-    publishedAt: null,
+    publishedAt,
     rawType: 'news',
   };
 }
@@ -122,6 +130,32 @@ async function cleanup() {
   await pool.query(
     `TRUNCATE TABLE push_records, ai_news_events, raw_items RESTART IDENTITY`,
   );
+}
+
+/**
+ * 直接 seed 一个已评分（importance_score >= 阈值）事件，控制 published_at / first_seen_at
+ * 以隔离「时效闸」变量（importance 固定达阈值 → 唯一变化的是 published_at 是否在窗口内）。
+ * @returns 生成的 event_id（DB gen_random_uuid()::text）。
+ */
+async function seedScoredEvent(args: {
+  title: string;
+  importance?: number;
+  publishedAt: Date | null;
+  firstSeenAt?: Date;
+}): Promise<string> {
+  const { rows } = await pool!.query<{ event_id: string }>(
+    `INSERT INTO ai_news_events
+       (representative_title, importance_score, published_at, first_seen_at)
+     VALUES ($1, $2, $3, $4)
+     RETURNING event_id`,
+    [
+      args.title,
+      String(args.importance ?? 90),
+      args.publishedAt,
+      args.firstSeenAt ?? new Date(),
+    ],
+  );
+  return rows[0]!.event_id;
 }
 
 async function alertRecords() {
@@ -231,8 +265,10 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     );
     const rawId = BigInt(rir.rows[0]!.id);
     const { collapseRawItem } = await import('../../dedup/collapse.js');
+    // published_at=NOW（在窗口内、不超未来上界）：候选时效闸键于 published_at，windowDays=0 旁路仍
+    // 排除 NULL；本用例关注「日报已推不吞 alert」，须让事件过时效闸才进候选。
     const out = await collapseRawItem(
-      { id: rawId, url, title: 'Dual push event', publishedAt: null, fetchedAt: new Date() },
+      { id: rawId, url, title: 'Dual push event', publishedAt: NOW, fetchedAt: new Date() },
       db!,
     );
     const evRow = await pool!.query<{ event_id: string }>(
@@ -254,7 +290,8 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
 
     // 关键断言：alert 候选不被 event 记录吞——event(success) 在不同 target_type 命名空间，
     // 候选「从未以任一通道 **alert** success」仍满足，该事件仍是 alert 候选（channel-agnostic）。
-    const candidates = await selectAlertCandidates(85, db!);
+    // 传 now=NOW + windowDays=0：published_at=NOW 须以同一参考时刻判时效闸（否则被未来上界误排）。
+    const candidates = await selectAlertCandidates(85, db!, ['telegram'], NOW, 0, 100);
     const found = candidates.find((c) => c.eventId === eventId);
     expect(found).toBeDefined();
 
@@ -357,5 +394,278 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     expect(r1.alertCandidateCount).toBe(0);
     expect(s1.calls).toBe(0);
     expect(await alertRecords()).toHaveLength(1);
+  });
+});
+
+/**
+ * 任务 3.4 / 3.5（realtime-alerts）：告警候选时效闸键于 published_at 的行为固化。
+ *
+ * 全部用 seedScoredEvent 直接 seed 已评分（importance>=阈值）事件 + 直接调 selectAlertCandidates
+ * 断言候选与否——固定 importance 达阈值 → 隔离「时效闸」为唯一变化变量。NOW=2098-03-04（远未来），
+ * published_at 围绕它构造「窗口内 / 过旧 / NULL / 未来」。
+ */
+describe.skipIf(!databaseUrl)('selectAlertCandidates 时效闸键于 published_at', () => {
+  const WINDOW_DAYS = 3;
+  // 上海今天 00:00（windowDays=1 即今天）对应 UTC，作为「窗口内 / 过旧」分界参照。
+  const dayInWindow = new Date(NOW.getTime() - 1 * 24 * 60 * 60 * 1000); // 昨天，必在近 3 天窗口内。
+  const dayTooOld = new Date(NOW.getTime() - 30 * 24 * 60 * 60 * 1000); // 30 天前，必出窗。
+  const dayFuture = new Date(NOW.getTime() + 24 * 60 * 60 * 1000); // 明天，未来。
+
+  it('windowDays>0：published_at 在窗口内且达阈值 → 候选', async () => {
+    const id = await seedScoredEvent({ title: 'In window', publishedAt: dayInWindow });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100);
+    expect(cands.map((c) => c.eventId)).toContain(id);
+  });
+
+  it('windowDays>0：达阈值但 published_at 过旧（first_seen=今天）→ 不告警', async () => {
+    // 历史老文场景：published_at 30 天前，但 first_seen_at 为今天（新增源今日首次抓到）。
+    await seedScoredEvent({
+      title: 'Old article seen today',
+      publishedAt: dayTooOld,
+      firstSeenAt: new Date(),
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100);
+    expect(cands).toHaveLength(0); // 键于 published_at（旧）→ 出窗，不被 first_seen=今天误纳。
+  });
+
+  it('windowDays>0：published_at 为 NULL（AI 也判不出）→ 不候选', async () => {
+    await seedScoredEvent({ title: 'No published date', publishedAt: null });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100);
+    expect(cands).toHaveLength(0); // gte 对 NULL 返回假 → NULL 即排除。
+  });
+
+  it('windowDays>0：published_at 为未来 → 不告警（上界 lte(published_at, now) 排除）', async () => {
+    await seedScoredEvent({ title: 'Future dated', publishedAt: dayFuture });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100);
+    expect(cands).toHaveLength(0); // 未来值 >= 下界恒真，但被上界排除。
+  });
+
+  it('windowDays=0（不限窗口）：NULL 与未来 published_at 仍被排除，仅过去/现在入候选', async () => {
+    const past = await seedScoredEvent({ title: 'w0 past', publishedAt: dayTooOld }); // 旁路免下界 → 入候选。
+    await seedScoredEvent({ title: 'w0 null', publishedAt: null }); // isNotNull 排除。
+    await seedScoredEvent({ title: 'w0 future', publishedAt: dayFuture }); // lte(now) 上界排除。
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, 0, 100);
+    const ids = cands.map((c) => c.eventId);
+    expect(ids).toContain(past); // windowDays=0 只免下界，过旧的过去事件入候选。
+    expect(ids).toHaveLength(1); // NULL 与未来均被排除（旁路不免 NULL 排除与未来上界）。
+    expect(cands[0]!.eventId).toBe(past);
+  });
+
+  it('上界含等于（边界）：published_at = now 入候选，now + 1ms 出候选', async () => {
+    const atNow = await seedScoredEvent({ title: 'eq now', publishedAt: new Date(NOW.getTime()) });
+    await seedScoredEvent({ title: 'just future', publishedAt: new Date(NOW.getTime() + 1) });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100);
+    const ids = cands.map((c) => c.eventId);
+    expect(ids).toContain(atNow); // <= now 含等于。
+    expect(ids).toHaveLength(1); // now+1ms 未来排除。
+  });
+
+  it('单次上限取序按 published_at DESC（取最新发布）', async () => {
+    const older = await seedScoredEvent({ title: 'older', publishedAt: new Date(NOW.getTime() - 2 * 24 * 3600 * 1000) });
+    const newer = await seedScoredEvent({ title: 'newer', publishedAt: new Date(NOW.getTime() - 1 * 24 * 3600 * 1000) });
+    // maxCandidates=1 → 取 published_at 最新者（newer），不是 first_seen 最新者。
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 1);
+    expect(cands).toHaveLength(1);
+    expect(cands[0]!.eventId).toBe(newer);
+    expect(cands[0]!.eventId).not.toBe(older);
+  });
+
+  // ── 3.5：告警幂等不依赖时效字段——改字段后语义零变化。
+  it('幂等四元组与 distinct-channel-count 子查询不依赖时效字段（改 published_at 后语义零变化）', async () => {
+    // 一事件 published_at 在窗口内、达阈值、未告警 → 候选。
+    const id = await seedScoredEvent({ title: 'idem candidate', publishedAt: dayInWindow });
+    expect((await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100)).map((c) => c.eventId)).toContain(id);
+
+    // 写入一条 alert(telegram, success)：distinct-channel-count 子查询命中（与 published_at 无关）→ 移出候选。
+    await pool!.query(
+      `INSERT INTO push_records (target_type, target_id, channel, push_date, status)
+       VALUES ('alert', $1, 'telegram', $2, 'success')`,
+      [id, ALERT_PUSH_DATE],
+    );
+    // 一生一次：已对所有已配置通道(telegram) success → 不再候选（候选窗口靠四元组/子查询、非时效字段）。
+    expect((await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100)).map((c) => c.eventId)).not.toContain(id);
+
+    // failed 不算 success：手插 failed 行不影响候选资格（仍以 published_at 在窗口为候选）。
+    const id2 = await seedScoredEvent({ title: 'failed retry', publishedAt: dayInWindow });
+    await pool!.query(
+      `INSERT INTO push_records (target_type, target_id, channel, push_date, status)
+       VALUES ('alert', $1, 'telegram', $2, 'failed')`,
+      [id2, ALERT_PUSH_DATE],
+    );
+    // failed 不满足 distinct success 子查询 → 仍候选（failed 跨天可重试，不被时效字段改动影响）。
+    expect((await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100)).map((c) => c.eventId)).toContain(id2);
+
+    // 多通道：telegram success 但 feishu 未 success → 对 [telegram,feishu] 配置仍候选（distinct count 1 < 2）。
+    expect(
+      (await selectAlertCandidates(85, db!, ['telegram', 'feishu'], NOW, WINDOW_DAYS, 100)).map((c) => c.eventId),
+    ).toContain(id);
+  });
+});
+
+/**
+ * 任务 4.4（fix-push-recency-by-published-at）：告警链发布时间回填阶段编排集成测试。
+ *
+ * runAlertScan 在 selectAlertCandidates 之前对「评分后达阈值且 published_at IS NULL」的事件调
+ * published-at-inference 回填（mock 注入 generateObjectFn 控制推断结果）。断言：
+ * - NULL published_at 达阈值事件经回填（推断窗口内日期）后入候选并被告警。
+ * - AI 判不出（推断 null）→ 保持 NULL → 被时效闸排除（不告警）。
+ * - 回填失败（推断抛错）不阻塞后续阶段（其余正常告警照常完成）。
+ * - 回填只作用于「评分后达阈值」的 NULL 事件（在 selectAlertCandidates 之前）。
+ *
+ * **NOW 用真实 new Date()（不用上面套件的 2098 远未来锚点）**：回填 CAS 的 `WHERE 推断日期 <= now()`
+ * 用 **DB 真实时钟**（双层防御的 SQL 层未来兜底，不可注入）。若用 2098 锚点，推断日期须落在 2098 窗口内
+ * 却又须 <= DB 真实 now(≈当前)，二者矛盾 → CAS 恒不命中、回填永远失败。故本块用真实 now：窗口下界、
+ * 候选时效闸、schema 范围上界、CAS now() 全部对齐真实时钟。afterEach TRUNCATE 隔离，不查 push_date，
+ * 故落在真实今日的 alert 记录不影响断言。WINDOW_DAYS=3 + seedNullDateScoredEvent 直接 seed 已评分
+ * （达阈值）+ published_at NULL + first_seen 近 now 的事件（带代表 raw_item，回填 innerJoin rawItems 需之），
+ * 不注入采集条目（empty collectors）。回填锁注入内存 Redis（不依赖真实 Redis）。
+ */
+describe.skipIf(!databaseUrl)('runAlertScan 发布时间回填阶段（4.4）', () => {
+  const WINDOW_DAYS = 3;
+  // 真实 now：使窗口/schema 范围/CAS now() 全部对齐 DB 真实时钟（见块头）。
+  const REAL_NOW = new Date();
+  // 推断目标日期：昨天（落在 windowDays=3 窗口内，且 <= DB 真实 now()）。
+  const IN_WINDOW_ISO = new Date(REAL_NOW.getTime() - 24 * 60 * 60 * 1000).toISOString();
+
+  /**
+   * Seed 一个已评分（达阈值）+ published_at NULL + first_seen_at 近 now 的事件，并建代表 raw_item
+   * 关联 representative_raw_item_id（回填查询 innerJoin rawItems 经此回指线索，无之则不进回填域）。
+   * @returns event_id。
+   */
+  async function seedNullDateScoredEvent(args: {
+    title: string;
+    importance?: number;
+  }): Promise<string> {
+    const ts = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    // collapsed=true：使 runAlertScan 的 collapseUncollapsedRawItems 不再把该 raw_item 重塌缩成
+    // 新事件（否则每个 seed 会多出一个被重新评分的 NULL-published 事件污染候选断言）。
+    // representative_raw_item_id 仍可经 id 回指此行（回填 innerJoin rawItems 不看 collapsed 标记）。
+    const rir = await pool!.query<{ id: string }>(
+      `INSERT INTO raw_items (source, source_item_id, url, title, collapsed) VALUES ('rss', $1, $2, $3, true) RETURNING id`,
+      [`${SOURCE}-${ts}`, `https://x.com/bf/${ts}`, args.title],
+    );
+    const rawId = rir.rows[0]!.id;
+    const { rows } = await pool!.query<{ event_id: string }>(
+      `INSERT INTO ai_news_events
+         (representative_title, representative_raw_item_id, importance_score, published_at, first_seen_at)
+       VALUES ($1, $2, $3, NULL, $4)
+       RETURNING event_id`,
+      // first_seen_at = REAL_NOW（落在 windowDays=3 窗口内，不被回填超窗剪枝排除）。
+      [args.title, rawId, String(args.importance ?? 90), REAL_NOW],
+    );
+    return rows[0]!.event_id;
+  }
+
+  /** 告警 scan opts（真实 now，不用上面套件的 2098 锚点；其余沿用 opts 默认结构）。 */
+  const bfOpts = (over: Record<string, unknown> = {}) => ({
+    now: REAL_NOW,
+    dbh: db!,
+    channels: ['telegram'] as const,
+    lock: { redis: memoryRedis(), ttlMs: 60_000 },
+    log: () => {},
+    windowDays: WINDOW_DAYS,
+    maxPerScan: 100,
+    collect: { collectors: collectorsReturning([]) }, // 不采新条目，只回填 + 选既有 seed。
+    judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+    threshold: 85,
+    publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+    ...over,
+  });
+
+  it('NULL published_at 达阈值事件经回填后进入候选并被告警', async () => {
+    const id = await seedNullDateScoredEvent({ title: 'Backfill alert candidate' });
+    const sender = okSender();
+    const result = await runAlertScan(
+      bfOpts({
+        senders: { telegram: sender },
+        publishedAtInfer: { generateObjectFn: async () => ({ object: { publishedAt: IN_WINDOW_ISO } }), maxAttempts: 1 },
+      }),
+    );
+
+    expect(result.alertCandidateCount).toBe(1); // 回填后入候选。
+    expect(sender.calls).toBe(1); // 被告警。
+
+    // 库内确认该事件 published_at 已回填为窗口内日期（非 NULL）。
+    const { rows } = await pool!.query<{ published_at: Date | null }>(
+      `SELECT published_at FROM ai_news_events WHERE event_id = $1`,
+      [id],
+    );
+    expect(rows[0]!.published_at).not.toBeNull();
+  });
+
+  it('AI 判不出（推断 null）→ 保持 NULL → 被时效闸排除（不告警）', async () => {
+    const id = await seedNullDateScoredEvent({ title: 'Undeterminable alert' });
+    const sender = okSender();
+    const result = await runAlertScan(
+      bfOpts({
+        senders: { telegram: sender },
+        publishedAtInfer: { generateObjectFn: async () => ({ object: { publishedAt: null } }), maxAttempts: 1 },
+      }),
+    );
+
+    expect(result.alertCandidateCount).toBe(0); // NULL → 时效闸排除。
+    expect(sender.calls).toBe(0); // 不告警。
+    // 库内确认 published_at 仍为 NULL（未臆造回填）。
+    const { rows } = await pool!.query<{ published_at: Date | null }>(
+      `SELECT published_at FROM ai_news_events WHERE event_id = $1`,
+      [id],
+    );
+    expect(rows[0]!.published_at).toBeNull();
+  });
+
+  it('回填失败（推断抛错）不阻塞后续阶段：其余正常告警照常完成', async () => {
+    // 一条 NULL published_at（回填抛错降级为 NULL → 排除）；
+    // 一条 published_at 在窗口内的正常达阈值事件（不进回填域、照常告警）。
+    await seedNullDateScoredEvent({ title: 'Backfill failing alert' });
+    const okId = await seedScoredEvent({
+      title: 'Healthy alert',
+      publishedAt: new Date(REAL_NOW.getTime() - 24 * 60 * 60 * 1000), // 窗口内。
+      firstSeenAt: REAL_NOW,
+    });
+    const sender = okSender();
+    const result = await runAlertScan(
+      bfOpts({
+        senders: { telegram: sender },
+        // 推断抛错 → inferPublishedAt 内部降级 null → 该 NULL 事件保持 NULL；不抛断流水线。
+        publishedAtInfer: { generateObjectFn: async () => { throw new Error('infer boom'); }, maxAttempts: 1, logError: () => {} },
+      }),
+    );
+
+    // 流水线未被回填失败阻塞：正常事件照常告警（候选 = 1，即 okId）。
+    expect(result.alertCandidateCount).toBe(1);
+    expect(sender.calls).toBe(1);
+    // 确认被告警的是健康事件 okId（回填失败的 NULL 事件被排除、未阻塞 okId）。
+    expect(result.dispatched.some((d) => d.eventId === okId && d.outcome === 'sent')).toBe(true);
+    // okId 已落 alert(success) 记录（healthy 事件全程未被回填失败阻塞）。
+    const { rows } = await pool!.query<{ status: string }>(
+      `SELECT status FROM push_records WHERE target_type='alert' AND target_id=$1`,
+      [okId],
+    );
+    expect(rows.map((r) => r.status)).toEqual(['success']);
+  });
+
+  it('回填只作用于达阈值的 NULL 事件（未达阈值的 NULL 不进回填域）', async () => {
+    // 达阈值（90）的 NULL 事件 → 进回填域、被回填、告警；
+    // 未达阈值（80<85）的 NULL 事件 → 不进回填域（回填谓词 importance>=threshold）→ 保持 NULL。
+    const aboveId = await seedNullDateScoredEvent({ title: 'Above threshold null', importance: 90 });
+    const belowId = await seedNullDateScoredEvent({ title: 'Below threshold null', importance: 80 });
+    const sender = okSender();
+    const result = await runAlertScan(
+      bfOpts({
+        senders: { telegram: sender },
+        publishedAtInfer: { generateObjectFn: async () => ({ object: { publishedAt: IN_WINDOW_ISO } }), maxAttempts: 1 },
+      }),
+    );
+
+    // 只有达阈值的那条被回填 + 告警。
+    expect(result.alertCandidateCount).toBe(1);
+    expect(sender.calls).toBe(1);
+    // 达阈值的被回填（非 NULL）；未达阈值的不进回填域（仍 NULL）。
+    const above = await pool!.query<{ published_at: Date | null }>(
+      `SELECT published_at FROM ai_news_events WHERE event_id = $1`, [aboveId]);
+    const below = await pool!.query<{ published_at: Date | null }>(
+      `SELECT published_at FROM ai_news_events WHERE event_id = $1`, [belowId]);
+    expect(above.rows[0]!.published_at).not.toBeNull();
+    expect(below.rows[0]!.published_at).toBeNull();
   });
 });

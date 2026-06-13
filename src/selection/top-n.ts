@@ -6,9 +6,18 @@
  *
  * 关键不变量（绝不可违背）：
  * - 候选窗口三条件齐：`should_push=true`
- *   AND `first_seen_at 在近 N 天`
+ *   AND `published_at 在近 N 天（闭区间 lowerBound <= published_at <= now）`
  *   AND `该 event 尚未投递给所有已配置通道`（success 覆盖的 distinct 已配置通道数 < 配置通道数；
- *   跨天/跨次不重推，常青高分事件一生只成功推一次）。统一日报模型（Model B）：每日选**一份**
+ *   跨天/跨次不重推，常青高分事件一生只成功推一次）。
+ * - **时效闸键于 `published_at`（发布时间），非 `first_seen_at`（抓取时间）**：first_seen_at 在
+ *   塌缩建事件时被赋为 raw_item 入库时刻，与文章真实发布时间无关；以它过滤会在冷启动/新增源时把
+ *   历史老文（first_seen_at 恰为「今天」）误当近 N 天新消息推送。故时效以 published_at 衡量。
+ *   闭区间下界 = 今天往前第 (windowDays−1) 个上海自然日 00:00（换算 UTC）；上界 = now（同一参考
+ *   时刻），绝不可省——gte 对未来日期恒真，必须显式上界拦确定性来源（RSS pubDate / GitHub
+ *   pushed_at）与 AI 的错误未来值。published_at 为 NULL 者先经 AI 推断（published-at-inference）
+ *   回填，仍 NULL（AI 也判不出）则排除（Drizzle gte/lte 对 NULL 返假，过滤层天然排 NULL）。
+ *   first_seen_at 语义不变（仍记首次抓取，供调试/僵尸 claim 回收），仅不再用于时效过滤。
+ *   统一日报模型（Model B）：每日选**一份**
  *   channel-blind Top N，同份发放给所有已配置通道；候选只在「全部投递完毕？」层面聚合判定（不按
  *   通道分别选题），缺任一通道则留在名单、由 dispatcher per-channel 跨天可靠补发（见 selectTopN 注释）。
  * - 候选窗口「今天」必须复用 push-date.ts 的同一 Asia/Shanghai 时间源（getPushDate），
@@ -20,7 +29,7 @@
  * - importance 下限闸（env.IMPORTANCE_FLOOR）：低于阈值不入选，宁可少于 N 条也不凑数。
  * - 排序与名单由程序定，**不交给 LLM**。
  */
-import { and, eq, gte, sql } from 'drizzle-orm';
+import { and, eq, gte, lte, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env } from '../config/env.js';
@@ -161,9 +170,13 @@ export function rankAndSelect(
  *
  * 候选窗口（全在 SQL 层用程序条件表达，无 LLM 参与）：
  *   should_push = true
- *   AND first_seen_at >= 今天（上海）往前第 (windowDays−1) 个自然日的 00:00（上海，换算为 UTC）
+ *   AND published_at >= 今天（上海）往前第 (windowDays−1) 个自然日的 00:00（上海，换算为 UTC）   ← 时效下界
+ *   AND published_at <= now（同一参考时刻）   ← 未来日期上界（绝不可省，拦确定性来源/AI 的未来值）
  *   AND importance_score >= importanceFloor   ← 下限闸
  *   AND (success-覆盖的 distinct 已配置通道数 < 配置通道数)   ← 尚未投递给所有已配置通道
+ *
+ * 时效闸键于 published_at（发布时间）而非 first_seen_at（抓取时间）；published_at 为 NULL 者
+ * （AI 推断后仍判不出）被 Drizzle gte/lte 自然排除（「NULL 即排除」）。
  *
  * 排序与取前 N 在程序内完成（compareForTopN），保证确定性 tiebreaker。
  * **统一日报模型（Model B）+ 各通道可靠补发**：每日只选**一份** channel-blind Top N、同份发放给所有
@@ -227,8 +240,12 @@ export async function selectTopN(
     .where(
       and(
         eq(aiNewsEvents.shouldPush, true),
-        // first_seen_at 非空且在近 N 天内（恒 NULL 的 first_seen_at 不入候选）。
-        gte(aiNewsEvents.firstSeenAt, lowerBound),
+        // 时效闸：闭区间 lowerBound <= published_at <= now（上下界共用同一 now 参考时刻）。
+        // 下界排「超窗老文」，上界排「未来日期」（gte 对未来恒真，必须显式上界拦确定性来源
+        // RSS/GitHub 与 AI 的错误未来值）。Drizzle gte/lte 对 NULL 返假 → published_at 为
+        // NULL（AI 也判不出）的行被自然排除（「NULL 即排除」）。详见文件顶部不变量注释。
+        gte(aiNewsEvents.publishedAt, lowerBound),
+        lte(aiNewsEvents.publishedAt, now),
         // importance 下限闸：低于阈值不入选（宁缺勿凑）。NULL importance 被 gte 自然排除。
         gte(aiNewsEvents.importanceScore, String(importanceFloor)),
         notDeliveredToAllChannels,

@@ -43,10 +43,11 @@ const SOURCE = 'pipeline-itest';
 // NOW 用**固定的过去锚点**而非真实今日：
 // - 锁 key = `daily-digest:2000-01-01`（getPushDate(NOW) 的上海日期），永不与真实今日 workflow
 //   的 `daily-digest:{真实今日}` 锁冲突 → 不再被并发真实 workflow 持锁挤成 skipped-locked。
-// - 为何用「过去」而非「远未来 2099」：塌缩写入的 first_seen_at 由产品代码硬编码为真实 now()
-//   （collapse.ts，不可注入、不许动产品代码），候选窗口是 `first_seen_at >= NOW − N 天`（无上界）。
-//   过去锚点使窗口下界落在真实今日之前 → 真实今日塌缩事件仍在窗口内、Top N 不空；
-//   而 2099 会把窗口下界推到 2099，真实今日（2026）塌缩事件落窗口外 → Top N 永远空 → 断言挂。
+// - 候选窗口已由 first_seen_at 改键于 published_at（闭区间 lowerBound <= published_at <= NOW）：
+//   下界 ≈ NOW − (FIRST_SEEN_WINDOW_DAYS-1) 个上海自然日 00:00，上界 = NOW（拦未来日期）。
+//   故 fixture 的 published_at 必须落在该闭区间内（见 item() 的 2000-01-01T00:00Z），且 NOW 必须
+//   ≥ fixture published_at（否则被未来上界 lte(published_at, NOW) 排除）。NOW=2000-01-01T03:00Z 配
+//   item() published_at=2000-01-01T00:00Z 满足闭区间 → 「应被推送」fixture 入候选、Top N 不空。
 // - cleanup 的 Redis key 模式同步为 `daily-digest:2000-*`，确保能命中本锚点的锁残留。
 const NOW = new Date('2000-01-01T03:00:00Z');
 
@@ -71,8 +72,45 @@ function item(args: {
     url: args.url,
     title: `${TITLE_MARKER} ${args.title}`,
     content: null,
-    publishedAt: new Date('2099-02-28T00:00:00Z'),
+    // published_at 须落在候选窗口闭区间 [startOfDayInTimeZone(NOW, FIRST_SEEN_WINDOW_DAYS-1), NOW] 内：
+    // 候选窗口键已由 first_seen_at 改为 published_at（含未来上界 lte(published_at, NOW)）。NOW=2000-01-01T03:00Z
+    // → 下界 ≈ 1999-12-29T16:00Z、上界 = NOW。取 NOW 当天 00:00Z（在窗口内、不越未来上界），使「应被推送」
+    // 的 fixture 恢复入候选。旧值 2099-02-28 相对 NOW(2000) 是未来日期，被新上界排除。
+    publishedAt: new Date('2000-01-01T00:00:00Z'),
     rawType: 'news',
+  };
+}
+
+/**
+ * 构造一个 published_at 为 NULL 的 CollectedItem（rss 源）——用于发布时间回填用例：
+ * 采集阶段无发布时间 → 塌缩后事件 published_at 为 NULL → 须经回填阶段 AI 推断补值才能入候选。
+ */
+function nullDateItem(args: {
+  id: string;
+  url: string | null;
+  title: string;
+}): CollectedItem {
+  return {
+    source: 'rss',
+    sourceItemId: `${SOURCE}-${args.id}`,
+    url: args.url,
+    title: `${TITLE_MARKER} ${args.title}`,
+    content: null,
+    publishedAt: null,
+    rawType: 'news',
+  };
+}
+
+/**
+ * published-at-inference 的 generateObject mock：返回固定 publishedAt（ISO 串或 null）。
+ * - 返回窗口内 ISO 串 → 回填成功 → 事件入候选。
+ * - 返回 null → AI 判不出 → 事件保持 NULL → 被时效闸排除。
+ * - throwOn=true → 抛错（模拟 LLM 调用失败，inferPublishedAt 内部降级为 null，不阻塞流水线）。
+ */
+function inferMock(opts: { publishedAt: string | null; throwError?: boolean }) {
+  return async () => {
+    if (opts.throwError) throw new Error('infer llm boom');
+    return { object: { publishedAt: opts.publishedAt } };
   };
 }
 
@@ -587,5 +625,324 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
     expect(result.alerted).toBe(true); // 新闻真空告警照常触发，不被 paper 掩盖。
     expect(alert).toHaveBeenCalled();
     expect(sender.calls).toBe(0); // 无新闻候选 → 不推。
+  });
+});
+
+/** 内存 Redis 桩：SET NX PX + 「核对令牌再删」eval，供回填 per-event 锁注入（不依赖真实 Redis）。 */
+function memoryRedis(): import('../../push/lock.js').RedisLike {
+  const store = new Map<string, string>();
+  return {
+    set(key, value) {
+      if (store.has(key)) return Promise.resolve(null);
+      store.set(key, value);
+      return Promise.resolve('OK');
+    },
+    eval(_s, _n, key, token) {
+      if (store.get(String(key)) === String(token)) {
+        store.delete(String(key));
+        return Promise.resolve(1);
+      }
+      return Promise.resolve(0);
+    },
+  };
+}
+
+/**
+ * 任务 4.4（fix-push-recency-by-published-at）：日报链发布时间回填阶段编排集成测试。
+ *
+ * 回填阶段在 Value Judge 之后、Top N 之前对「should_push=true 且 published_at IS NULL」的事件
+ * 调 published-at-inference（mock 注入 generateObjectFn 控制推断结果）。断言：
+ * - NULL published_at 事件经回填（推断窗口内日期）后入候选并被推送。
+ * - AI 判不出（推断 null）→ 事件保持 NULL → 被时效闸排除（不推）。
+ * - 回填失败（推断抛错）不阻塞后续阶段（其余正常事件照常完成）。
+ * - 回填阶段确在 Value Judge 之后（只作用于已评分 should_push=true 的 NULL 事件）。
+ * - 回填高「判不出」率不触发 DEGRADE_ABORT_RATIO 误熔断（构造高判不出批，断言不抛/不中止）。
+ *
+ * 回填锁注入内存 Redis（memoryRedis）以确定性化、不依赖真实 Redis 锁残留。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 发布时间回填阶段（4.4）', () => {
+  // 回填推断 mock 须返回落在候选窗口闭区间内的 ISO（NOW=2000-01-01T03:00Z，下界 ≈ 1999-12-29T16:00Z）。
+  const IN_WINDOW_ISO = '2000-01-01T00:00:00.000Z';
+
+  it('NULL published_at 事件经回填（推断窗口内日期）后进入候选并被推送', async () => {
+    const items = [
+      nullDateItem({ id: 'bf1', url: 'https://ex.com/bf1', title: 'Backfilled news' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 推断返回窗口内日期 → 回填成功 → 事件入候选。
+      publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: IN_WINDOW_ISO }), maxAttempts: 1 },
+      publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+      sender,
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    expect(result.publishedAtBackfill?.backfilled).toBe(1); // 回填一条。
+    expect(result.topNCount).toBe(1); // 回填后入候选。
+    expect(result.outcome).toBe('pushed');
+    expect(sender.calls).toBe(1);
+
+    // 库内确认该事件 published_at 已被回填为窗口内日期（非 NULL）。
+    const { rows } = await pool!.query<{ published_at: Date | null }>(
+      `SELECT published_at FROM ai_news_events`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.published_at).not.toBeNull();
+  });
+
+  it('AI 判不出（推断返回 null）→ 事件保持 NULL → 被时效闸排除（不推）', async () => {
+    const items = [
+      nullDateItem({ id: 'und1', url: 'https://ex.com/und1', title: 'Undeterminable news' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 推断返回 null → 判不出 → 保持 NULL → 被候选窗口排除。
+      publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: null }), maxAttempts: 1 },
+      publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+      sender,
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    expect(result.publishedAtBackfill?.attempted).toBe(1);
+    expect(result.publishedAtBackfill?.backfilled).toBe(0);
+    expect(result.publishedAtBackfill?.undetermined).toBe(1); // 判不出一条。
+    expect(result.topNCount).toBe(0); // NULL → 时效闸排除 → 不入候选。
+    expect(result.outcome).toBe('skipped-no-candidates');
+    expect(sender.calls).toBe(0);
+
+    // 库内确认该事件 published_at 仍为 NULL（未臆造回填）。
+    const { rows } = await pool!.query<{ published_at: Date | null }>(
+      `SELECT published_at FROM ai_news_events`,
+    );
+    expect(rows[0]!.published_at).toBeNull();
+  });
+
+  it('回填失败（推断抛错）不阻塞后续阶段：其余正常事件照常推送', async () => {
+    // 一条 NULL published_at 事件（回填会抛错降级为 NULL → 被排除）；
+    // 一条采集即带窗口内 published_at 的正常事件（不进回填域、照常入候选推送）。
+    const items = [
+      nullDateItem({ id: 'fail1', url: 'https://ex.com/fail1', title: 'Backfill failing news' }),
+      item({ id: 'ok1', url: 'https://ex.com/ok1', title: 'Healthy news' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 推断抛错 → inferPublishedAt 内部降级为 null → 该 NULL 事件保持 NULL；不抛断流水线。
+      publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: null, throwError: true }), maxAttempts: 1, logError: () => {} },
+      publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+      sender,
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // 回填阶段尝试了那条 NULL 事件、判不出（推断降级 null），但不抛断；正常事件照常完成。
+    expect(result.publishedAtBackfill?.attempted).toBe(1); // 仅 NULL 事件进回填域。
+    expect(result.publishedAtBackfill?.backfilled).toBe(0); // 抛错降级 → 未回填。
+    expect(result.outcome).toBe('pushed'); // 流水线未被阻塞，正常事件推送。
+    expect(result.topNCount).toBe(1); // 仅采集即带日期的正常事件入候选。
+    expect(sender.calls).toBe(1);
+  });
+
+  it('回填只作用于已评分 should_push=true 的 NULL 事件（在 Value Judge 之后）', async () => {
+    // 一条 NULL published_at 但 judge 失败（未评分 → should_push 非 true）的事件：
+    // 因 judge 失败该事件无 should_push=true → 不进回填域（证明回填在评分后、只覆盖已评分 should_push）。
+    // 另一条 NULL published_at 且 judge 成功（should_push=true）的事件：进回填域、被回填。
+    const items = [
+      nullDateItem({ id: 'unscored', url: 'https://ex.com/unscored', title: 'BAD unscored item' }),
+      nullDateItem({ id: 'scored', url: 'https://ex.com/scored', title: 'Good scored item' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      // 'BAD unscored item' judge 失败（未评分、无 should_push）；'Good scored item' 成功（should_push=true）。
+      judge: { judge: { generateObjectFn: judgeMock({ failTitles: new Set(['BAD unscored item']) }), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: IN_WINDOW_ISO }), maxAttempts: 1 },
+      publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+      sender,
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // judge 分母 2、降级 1 = 0.5（不严格 > 0.5）→ 不中止。
+    expect(result.judge).toEqual({ processed: 2, degraded: 1 });
+    // 回填只覆盖「评分后 should_push=true」的那一条 NULL 事件（未评分的不进回填域）。
+    expect(result.publishedAtBackfill?.attempted).toBe(1);
+    expect(result.publishedAtBackfill?.backfilled).toBe(1);
+    expect(result.topNCount).toBe(1); // 仅已评分 + 回填成功者入候选。
+    expect(result.outcome).toBe('pushed');
+    expect(sender.calls).toBe(1);
+  });
+
+  it('AI 回填出未来/荒谬日期 → schema refine + CAS 上界拒、事件仍 NULL → 被时效闸排除（任务 6.2 反向）', async () => {
+    // 端到端反向用例：published-at-inference 的 generateObject 返回**未来**日期（绕过时效闸的攻击面）。
+    // 期望：schema refine（合理下限<=date<=now）把越界值归一为 null → inferPublishedAt 返回 null →
+    //       事件保持 NULL → Top N 时效闸排除（不被误推）。双层防御的 schema 层 + NULL 排除兜底。
+    const items = [
+      nullDateItem({ id: 'fut1', url: 'https://ex.com/fut1', title: 'Future dated backfill' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 推断返回相对 NOW(2000) 的未来日期（2099）→ schema refine 归一 null → 保持 NULL。
+      publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: '2099-01-01T00:00:00Z' }), maxAttempts: 1 },
+      publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+      sender,
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // 未来日期被 schema refine 拒 → 判不出（undetermined）、未回填 → NULL → 时效闸排除。
+    expect(result.publishedAtBackfill?.attempted).toBe(1);
+    expect(result.publishedAtBackfill?.backfilled).toBe(0);
+    expect(result.publishedAtBackfill?.undetermined).toBe(1);
+    expect(result.topNCount).toBe(0); // 未来值不被回填 → NULL → 不入候选。
+    expect(result.outcome).toBe('skipped-no-candidates');
+    expect(sender.calls).toBe(0); // 不被误推。
+
+    // 库内确认 published_at 仍 NULL（绝不回填越界未来值）。
+    const { rows } = await pool!.query<{ published_at: Date | null }>(
+      `SELECT published_at FROM ai_news_events`,
+    );
+    expect(rows[0]!.published_at).toBeNull();
+  });
+
+  it('回填→入候选→首推 success→次日同事件全通道 success→移出名单不重推（任务 6.4 幂等交互）', async () => {
+    // 验证：回填不破坏「一生一次 success」跨天去重与 UNIQUE 四元组。
+    // Day 1：NULL published_at 事件经回填入候选、首推 success。
+    // Day 2（next push_date）：同事件 published_at 已非 NULL（回填后冻结）、仍在窗口、should_push=true，
+    //        但已全通道 success → 候选窗口「尚未投递给所有通道」排除它 → 移出名单、不重推。
+    const url = 'https://ex.com/idem-bf';
+    const day1Items = [
+      nullDateItem({ id: 'idem-bf', url, title: 'Backfill then idempotent' }),
+    ];
+    // Day 1：NOW 锚点；回填窗口内日期。
+    // channels: ['telegram'] 显式钉死单通道——确定性、不依赖测试进程 ambient FEISHU env（开发者
+    // 本地 .env 可能配了飞书，会让默认通道集变成 [telegram, feishu] 而多出一条 success 记录）。
+    const s1 = okSender();
+    const r1 = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(day1Items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: IN_WINDOW_ISO }), maxAttempts: 1 },
+      publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+      sender: s1,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+    expect(r1.publishedAtBackfill?.backfilled).toBe(1);
+    expect(r1.topNCount).toBe(1);
+    expect(r1.outcome).toBe('pushed');
+    expect(s1.calls).toBe(1); // 首推 success。
+
+    // 确认事件已落 published_at（回填后冻结）+ 一条 event(success) 记录（Day 1 push_date）。
+    const evRows = await pool!.query<{ event_id: string; published_at: Date | null }>(
+      `SELECT event_id, published_at FROM ai_news_events`,
+    );
+    expect(evRows.rows).toHaveLength(1);
+    expect(evRows.rows[0]!.published_at).not.toBeNull();
+    const day1PushDate = (await import('../../push/push-date.js')).getPushDate(NOW);
+    const day1Recs = await pool!.query<{ status: string }>(
+      `SELECT status FROM push_records WHERE target_type='event' AND push_date=$1`,
+      [day1PushDate],
+    );
+    expect(day1Recs.rows.map((r) => r.status)).toEqual(['success']);
+
+    // Day 2：next 自然日的 NOW（+1 天），同 URL 重新抓到（不同 source_item_id）。事件 published_at
+    // 仍非 NULL（COALESCE/回填后冻结）、仍在 3 天窗口内、should_push=true。但已全通道 success →
+    // 候选窗口排除 → 不进 Top N、不重推（一生一次 success 跨天去重 + UNIQUE 四元组）。
+    const NOW_DAY2 = new Date(NOW.getTime() + 24 * 60 * 60 * 1000);
+    const day2Items = [
+      // 同 URL → 塌缩进既有事件（不新建）；published_at 已非 NULL → 不进回填域。
+      item({ id: 'idem-bf-d2', url, title: 'Backfill then idempotent again' }),
+    ];
+    const s2 = okSender();
+    const r2 = await runDailyWorkflow({
+      now: NOW_DAY2,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(day2Items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: IN_WINDOW_ISO }), maxAttempts: 1 },
+      publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+      sender: s2,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // 回填不破坏跨天去重：事件全通道已 success → 移出统一名单 → 不重推。
+    expect(r2.publishedAtBackfill?.attempted).toBe(0); // published_at 已非 NULL → 不进回填域。
+    expect(r2.topNCount).toBe(0); // 已全通道 success → 候选窗口排除。
+    expect(r2.outcome).toBe('skipped-no-candidates');
+    expect(s2.calls).toBe(0); // 不重推（一生一次 success）。
+
+    // UNIQUE 四元组：仍只有 Day 1 一条 event(success)，Day 2 未新增。
+    const allEventRecs = await pool!.query<{ n: string }>(
+      `SELECT count(*) AS n FROM push_records WHERE target_type='event' AND status='success'`,
+    );
+    expect(Number(allEventRecs.rows[0]!.n)).toBe(1);
+  });
+
+  it('回填高「判不出」率不触发 DEGRADE_ABORT_RATIO 误熔断', async () => {
+    // 构造一批 should_push=true 且 published_at NULL 的事件（judge 全过、大分母 0 降级），
+    // 回填推断全返回 null（高判不出率 100%）。若回填误计入熔断分母会中止；正确则不中止。
+    const items = Array.from({ length: 4 }, (_, i) =>
+      nullDateItem({ id: `hd${i}`, url: `https://ex.com/hd${i}`, title: `High undetermined ${i}` }),
+    );
+    const sender = okSender();
+    const alert = vi.fn();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      // judge 全过（分母 4、降级 0）。
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 回填推断全 null（判不出率 100%）。
+      publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: null }), maxAttempts: 1 },
+      publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+      sender,
+      lock: LOCK_OPTS,
+      alert,
+    });
+
+    // 关键断言：未抛 WorkflowAbortError、outcome 非 'aborted-degrade'。
+    expect(result.outcome).not.toBe('aborted-degrade');
+    // judge 熔断分母不含回填：judge 全过 0 降级。
+    expect(result.judge).toEqual({ processed: 4, degraded: 0 });
+    // 回填全判不出（4 条），但仅 log、不熔断、不入任何降级率分母。
+    expect(result.publishedAtBackfill?.attempted).toBe(4);
+    expect(result.publishedAtBackfill?.undetermined).toBe(4);
+    expect(result.publishedAtBackfill?.backfilled).toBe(0);
+    // 全部判不出 → NULL 全被时效闸排除 → 无候选，但是「正常 skipped-no-candidates」而非「因回填熔断中止」。
+    expect(result.outcome).toBe('skipped-no-candidates');
+    expect(result.topNCount).toBe(0);
+    expect(sender.calls).toBe(0);
   });
 });

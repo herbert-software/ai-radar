@@ -246,6 +246,14 @@ export async function selectWeeklyEvents(
       and(
         eq(aiNewsEvents.shouldPush, true),
         // 被汇总窗口 [windowStart, windowEnd)（左闭右开，ISO 周边界，禁滚动 7×24h）。
+        // ⚠️ 启用前必改（跟踪项，fix-push-recency-by-published-at design D6 / proposal 非目标）：
+        // 周报汇总窗口仍键于 `first_seen_at`（抓取时刻），与日报/告警已修复的同一根因 bug 未根治——
+        // first_seen_at 是 raw_item 入库时刻、与文章真实发布时间无关；冷启动/新增源时历史老文的
+        // first_seen_at 恰落进本周窗口，会重演「把历史老文当本周内容刷屏」的 bug。
+        // weekly-report 当前默认禁用（WEEKLY_REPORT_ENABLED=false），本期 scope-out；但**重新启用前**
+        // 必须先把下面两行的窗口键由 `firstSeenAt` 改为 `publishedAt`（同口径 NULL 处理：NULL 经 AI
+        // 推断回填、仍 NULL 则排除，参见 top-n.ts / alert-scan.ts 与 published-at-inference 模块），
+        // 否则会重蹈本 bug。勿静默遗忘。
         gte(aiNewsEvents.firstSeenAt, anchor.windowStart),
         lt(aiNewsEvents.firstSeenAt, anchor.windowEnd),
         // 下限闸：NULL importance 被 gte 自然排除。

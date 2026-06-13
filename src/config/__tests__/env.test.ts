@@ -116,6 +116,58 @@ describe('parseEnv —— P1 数值/比率配置校验', () => {
   });
 });
 
+describe('parseEnv —— PUBLISHED_AT_INFERENCE_MAX_PER_RUN 经 envSchema 校验（任务 6.1 / design D4）', () => {
+  // 固化「进 zod 校验、非法即启动失败」：证明该配置走 envSchema（coerce + int + positive），
+  // 非裸读 process.env（裸读会绕过校验、让非法值静默生效，违反 env 全局不变量）。
+
+  it('未提供时取默认 20', () => {
+    const env = parseEnv(validEnv());
+    expect(env.PUBLISHED_AT_INFERENCE_MAX_PER_RUN).toBe(20);
+  });
+
+  it('合法值（"20"）coerce 为 number 20', () => {
+    const source = {
+      ...validEnv(),
+      PUBLISHED_AT_INFERENCE_MAX_PER_RUN: '20',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.PUBLISHED_AT_INFERENCE_MAX_PER_RUN).toBe(20);
+    expect(typeof env.PUBLISHED_AT_INFERENCE_MAX_PER_RUN).toBe('number');
+  });
+
+  it('负数（"-5"）启动即报错（positive 校验，非裸读）', () => {
+    const source = {
+      ...validEnv(),
+      PUBLISHED_AT_INFERENCE_MAX_PER_RUN: '-5',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('NaN（"abc"）启动即报错（number coerce 校验）', () => {
+    const source = {
+      ...validEnv(),
+      PUBLISHED_AT_INFERENCE_MAX_PER_RUN: 'abc',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('0 启动即报错（positive，0 不合法）', () => {
+    const source = {
+      ...validEnv(),
+      PUBLISHED_AT_INFERENCE_MAX_PER_RUN: '0',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('小数（"3.5"）启动即报错（int 校验）', () => {
+    const source = {
+      ...validEnv(),
+      PUBLISHED_AT_INFERENCE_MAX_PER_RUN: '3.5',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+});
+
 describe('parseEnv —— 飞书可选通道（feishu-push 5.1）', () => {
   it('两者均缺 → 飞书 disabled，纯 Telegram 部署照常启动（向后兼容）', () => {
     const env = parseEnv(validEnv()); // validEnv 不含 FEISHU_*。

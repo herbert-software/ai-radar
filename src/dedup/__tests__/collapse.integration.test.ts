@@ -553,4 +553,111 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     const outcomes = await collapseUncollapsedRawItems(db!);
     expect(outcomes.some((o) => o.rawItemId === paperId)).toBe(false);
   });
+
+  // ── 塌缩层确定性 published_at NULL-fill（task 1b.2，design D8）──────────────
+  // COALESCE(published_at, EXCLUDED.published_at) 单向 NULL-fill：
+  // 首建无日期 → 后到确定日期补入；首建有日期 → 后到不同日期不覆盖。
+
+  it('首建无日期 + 后到同 dedup_key 有确定日期 → COALESCE 补入（确定性优先于 AI）', async () => {
+    const ts = Date.now();
+    const url = `https://example.com/nullfill/${ts}`;
+    const knownPub = new Date('2026-05-15T00:00:00Z');
+
+    // 首条 raw_item 无 publishedAt（null）→ 事件 published_at 为 NULL。
+    const id1 = await seedRawItem({
+      sourceItemId: `nullfill-1-${ts}`,
+      url,
+      title: 'Null-first title',
+      publishedAt: null,
+    });
+    const first = await collapseRawItem(
+      { id: id1, url, title: 'Null-first title', publishedAt: null, fetchedAt: new Date() },
+      db!,
+    );
+    const dedupKey = first.dedupKey!;
+
+    let rows = await fetchEventByDedupKey(dedupKey);
+    expect(rows).toHaveLength(1);
+    // 首建 published_at 为 NULL（首条无发布时间）。
+    expect(rows[0]!.published_at).toBeNull();
+
+    // 后到同 dedup_key 的 raw_item 带确定 publishedAt → COALESCE 把确定值补入。
+    const id2 = await seedRawItem({
+      sourceItemId: `nullfill-2-${ts}`,
+      url,
+      title: 'Dated arrival title',
+      publishedAt: knownPub,
+    });
+    await collapseRawItem(
+      { id: id2, url, title: 'Dated arrival title', publishedAt: knownPub, fetchedAt: new Date() },
+      db!,
+    );
+
+    rows = await fetchEventByDedupKey(dedupKey);
+    expect(rows).toHaveLength(1);
+    // published_at 由 NULL 经 COALESCE 单向补入确定值（NULL→已知）。
+    expect(rows[0]!.published_at).not.toBeNull();
+    expect(rows[0]!.published_at?.toISOString()).toBe(knownPub.toISOString());
+    // 身份/代表/first_seen 仍冻结（仅 published_at 被补值）。
+    expect(rows[0]!.representative_raw_item_id).toBe(id1.toString());
+    expect(rows[0]!.representative_title).toBe('Null-first title');
+    // source_count 累加为 2（两条都贡献）。
+    expect(Number(rows[0]!.source_count)).toBe(2);
+
+    // 补值后该事件 published_at 非 NULL，故不再进 AI 推断域：
+    // 以 `published_at IS NULL` 查询断言该事件不在结果（后续回填查询不会选中它）。
+    const { rows: nullRows } = await pool!.query<{ event_id: string }>(
+      `SELECT event_id FROM ai_news_events WHERE dedup_key = $1 AND published_at IS NULL`,
+      [dedupKey],
+    );
+    expect(nullRows).toHaveLength(0);
+
+    await db!.delete(schema.aiNewsEvents).where(sql`dedup_key = ${dedupKey}`);
+  });
+
+  it('首建已有日期 + 后到不同日期 → 保持首建值不变（COALESCE 不覆盖已设值）', async () => {
+    const ts = Date.now();
+    const url = `https://example.com/nofill-overwrite/${ts}`;
+    const d1 = new Date('2026-05-01T00:00:00Z');
+    const d2 = new Date('2026-05-20T00:00:00Z');
+
+    // 首建已有 publishedAt = D1。
+    const id1 = await seedRawItem({
+      sourceItemId: `nofill-1-${ts}`,
+      url,
+      title: 'Dated-first title',
+      publishedAt: d1,
+    });
+    const first = await collapseRawItem(
+      { id: id1, url, title: 'Dated-first title', publishedAt: d1, fetchedAt: new Date() },
+      db!,
+    );
+    const dedupKey = first.dedupKey!;
+    const before = (await fetchEventByDedupKey(dedupKey))[0]!;
+    expect(before.published_at).not.toBeNull();
+
+    // 后到同 dedup_key 带**不同** publishedAt = D2 → 不得覆盖首建 D1（COALESCE 已设值不变）。
+    const id2 = await seedRawItem({
+      sourceItemId: `nofill-2-${ts}`,
+      url,
+      title: 'Different-date arrival',
+      publishedAt: d2,
+    });
+    await collapseRawItem(
+      { id: id2, url, title: 'Different-date arrival', publishedAt: d2, fetchedAt: new Date() },
+      db!,
+    );
+
+    const after = (await fetchEventByDedupKey(dedupKey))[0]!;
+    // published_at 保持首建值不变（与首建后读回快照逐字相等），未被 D2 覆盖。
+    expect(after.published_at?.toISOString()).toBe(before.published_at?.toISOString());
+    // 显式断言不等于后到的 D2（证明确实未被覆盖）。
+    expect(after.published_at?.toISOString()).not.toBe(d2.toISOString());
+    // 身份/代表/first_seen 仍冻结，source_count 累加为 2。
+    expect(after.representative_raw_item_id).toBe(id1.toString());
+    expect(after.representative_title).toBe('Dated-first title');
+    expect(Number(after.source_count)).toBe(2);
+
+    await db!.delete(schema.aiNewsEvents).where(sql`dedup_key = ${dedupKey}`);
+  });
 });

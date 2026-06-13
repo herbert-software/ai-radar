@@ -8,9 +8,11 @@
  * - INSERT **省略 event_id**：由 DB 默认 `gen_random_uuid()::text` 生成不透明身份。
  * - 首建写 representative_raw_item_id / representative_title（取代表 raw_item 的**原始 title**，
  *   非归一化，保证 NOT NULL 可读）/ first_seen_at / published_at，初始化 source_count=1。
- * - ON CONFLICT DO UPDATE 的 set **只含** source_count（累加）与 last_seen_at（更新），
- *   绝不覆盖 event_id / representative_raw_item_id / representative_title /
- *   first_seen_at / published_at（P0 persistEventScores 全列覆盖式 set 是反面模板）。
+ * - ON CONFLICT DO UPDATE 的 set 累加 source_count、更新 last_seen_at，并对 published_at 做
+ *   `COALESCE(published_at, EXCLUDED.published_at)` 单向 NULL-fill（仅 NULL→已知补值，已设值
+ *   绝不被覆盖——确定性事实优先于 AI 推断，design D8）；event_id / representative_raw_item_id /
+ *   representative_title / first_seen_at 仍冻结、绝不覆盖（P0 persistEventScores 全列覆盖式 set
+ *   是反面模板）。
  * - unprocessable raw_item（无 canonical_url 且归一后标题为空）不产生 event，
  *   仅把 raw_items.unprocessable 置 true。
  * - 去重判定全程程序 + DB 唯一约束，本期仅硬去重，无 embedding/LLM。
@@ -85,7 +87,8 @@ async function writeNormalizationBack(
  * 3. unprocessable → 不产生 event，返回。
  * 4. 否则 `INSERT ... ON CONFLICT (dedup_key) DO UPDATE`：
  *    - INSERT 省略 event_id（DB 生成），首建身份/代表/时间列、source_count=1；
- *    - 冲突时 set 只累加 source_count、更新 last_seen_at。
+ *    - 冲突时 set 累加 source_count、更新 last_seen_at，并对 published_at 做 COALESCE 单向
+ *      NULL-fill（已设值不覆盖，design D8）。
  * 5. 无论可处理与否，最后把 raw_items.collapsed 置 true（幂等标记）：
  *    塌缩对每条 raw_item 只贡献一次 source_count；崩溃重跑安全（已 collapsed 的不再扫到），
  *    unprocessable 的也标记处理过、不会每轮被重复扫（Codex C1）。
@@ -133,10 +136,13 @@ export async function collapseRawItem(
       })
       .onConflictDoUpdate({
         target: aiNewsEvents.dedupKey,
-        // set 只累加 source_count、更新 last_seen_at——绝不覆盖身份/代表/时间列（design D1）。
+        // set 累加 source_count、更新 last_seen_at；published_at 经 COALESCE 单向 NULL-fill
+        // （仅 NULL→已知补值，已设值绝不被覆盖）——绝不覆盖身份/代表/first_seen_at（design D8）。
+        // EXCLUDED.published_at 是 ON CONFLICT 的 proposed-insertion 行列名（snake_case）。
         set: {
           sourceCount: sql`${aiNewsEvents.sourceCount} + 1`,
           lastSeenAt: now,
+          publishedAt: sql`COALESCE(${aiNewsEvents.publishedAt}, EXCLUDED.published_at)`,
         },
       });
 

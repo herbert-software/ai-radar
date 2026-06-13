@@ -12,6 +12,16 @@
  * 关键不变量（绝不可违背，realtime-alerts / design D6）：
  * - **判定必在评分后**：importance_score 评分前为 NULL（`NULL >= 85` 恒假），阈值判定查 SQL
  *   `importance_score IS NOT NULL AND >= 阈值`——评分阶段已先于本判定执行，绝不以 NULL 误判。
+ * - **候选时效闸键于 `published_at`（绝不基于 `first_seen_at`）**：候选窗口为闭区间
+ *   `lowerBound <= published_at <= now`——下界 `gte(published_at, lowerBound)` 拦超窗老文（lowerBound
+ *   与日报候选同源 startOfDayInTimeZone，防冷启动/新增源把历史老文误当重大发布刷屏），上界
+ *   `lte(published_at, now)` 拦确定性来源（RSS/GitHub）与 AI 的任何未来值（未来值 `>= 下界` 恒真会
+ *   绕过下界闸被当重大发布告警，故上界绝不可省）。`published_at` 为 NULL 者经 AI 推断回填、仍 NULL
+ *   则被时效闸自然排除（Drizzle gte/lte 对 NULL 返回假）。`windowDays=0`（不限窗口）旁路**只免下界**
+ *   gte，**不免** NULL 排除与未来上界——旁路时候选条件退化为 `published_at IS NOT NULL AND
+ *   published_at <= now`（须显式 isNotNull + lte，否则旧 NULL/未来事件会绕过修复刷屏）。单次扫描
+ *   上限取序按 `published_at DESC`（取最新发布）。`first_seen_at` 语义不变（仍记首次抓取，供调试/
+ *   僵尸 claim 回收），**不再**用于告警时效过滤。
  * - **非 LLM 决定**：是否告警完全由程序阈值决定，禁止 LLM 参与。
  * - **高频链路不套用日报「全源 0」系统级告警**：高频轮询全源 0 / 空轮是常态，本工作流**不调**
  *   classifySystemFailure（否则每天数十次误告警刷屏，见 daily-intel-pipeline）。
@@ -26,7 +36,7 @@
  * - **状态机复用**：告警推送复用 dispatcher 同一「待发→pending→原子送达→success/failed」状态机
  *   （含 headline 缺失回退链——告警事件可能尚无中文摘要），仅 target_type/channel 口径不同。
  */
-import { and, desc, gte, isNotNull, sql } from 'drizzle-orm';
+import { and, desc, gte, isNotNull, lte, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env, isFeishuEnabled } from '../config/env.js';
@@ -51,6 +61,8 @@ import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 import type { SelectedEvent } from '../selection/top-n.js';
 import { getPushDate, startOfDayInTimeZone } from '../push/push-date.js';
 import { acquireAlertLock, type AcquireAlertLockOptions } from './alert-lock.js';
+import { backfillPublishedAt } from '../agents/published-at-inference/backfill.js';
+import type { InferPublishedAtOptions } from '../agents/published-at-inference/index.js';
 
 type DbLike = typeof defaultDb;
 
@@ -85,6 +97,16 @@ export interface RunAlertScanOptions {
   lock?: AcquireAlertLockOptions;
   /** 运行期日志 sink（默认 console.error）。 */
   log?: AlertLogSink;
+  /**
+   * 发布时间回填阶段的推断选项（透传给 backfillPublishedAt 的 `infer`）。
+   * 注入 mock generateObjectFn / maxAttempts 等，使测试控制推断结果、不依赖真实 LLM。
+   */
+  publishedAtInfer?: Omit<InferPublishedAtOptions, 'now'>;
+  /**
+   * 发布时间回填阶段的 Redis 锁选项（透传给 backfillPublishedAt 的 `lock`）。
+   * 注入 mock Redis / TTL；不传则用真实 Redis（集成测有真实 Redis 可用）。
+   */
+  publishedAtLock?: AcquireAlertLockOptions;
 }
 
 /** 单条告警的发送结果。 */
@@ -126,6 +148,9 @@ interface AlertCandidate {
  *   importance_score IS NOT NULL AND importance_score >= 阈值   ← 判定必在评分后（NULL 不误判）
  *   AND NOT EXISTS (push_records WHERE target_type='alert' AND target_id=event_id
  *                     AND status='success')   ← 任一通道从未 success 告警（channel-agnostic）
+ *   AND 时效闸（闭区间）：windowDays>0 → lowerBound <= published_at <= now（下界隐含非 NULL）；
+ *       windowDays=0 旁路 → published_at IS NOT NULL AND published_at <= now（只免下界 gte、不免
+ *       NULL 排除与未来上界）。键于 published_at（非 first_seen_at）、上界拦未来值、NULL 即排除。
  *
  * **统一模型（Model B）**：选题与通道解耦——channel-agnostic 选出「该告警的事件」，再由 runAlertScan
  * 同份发放给所有已配置通道（通道只负责投递上游统一选好的信息）。跨天去重靠「从未 success（任一通道）」
@@ -157,8 +182,9 @@ export async function selectAlertCandidates(
   )`;
   const notAlertedToAllChannels = sql`${alertedChannelCount} < ${cfgChannels.length}`;
 
-  // 时间窗口下界：与日报候选窗口同源（startOfDayInTimeZone），防冷启动积压刷屏。
-  // windowDays=0 表示不限窗口（向后兼容旧行为，不推荐）；>0 时仅选近 N 天内首次出现的事件。
+  // 时效闸下界：键于 published_at（非 first_seen_at），与日报候选窗口同源（startOfDayInTimeZone），
+  // 防冷启动/新增源把历史老文（first_seen_at=今天但 published_at 旧）误当重大发布刷屏。
+  // windowDays=0 表示不限窗口（向后兼容旧行为，不推荐）；>0 时仅选 published_at 在近 N 天内的事件。
   const lowerBound = windowDays > 0 ? startOfDayInTimeZone(now, windowDays - 1) : null;
 
   const rows = await dbh
@@ -176,12 +202,19 @@ export async function selectAlertCandidates(
         isNotNull(aiNewsEvents.importanceScore),
         gte(aiNewsEvents.importanceScore, String(threshold)),
         notAlertedToAllChannels,
-        // 时间窗口：仅对近 windowDays 天内首次出现的事件告警（防积压刷屏）。
-        lowerBound !== null ? gte(aiNewsEvents.firstSeenAt, lowerBound) : undefined,
+        // 时效闸下界（闭区间下半）：windowDays>0 → published_at >= lowerBound（gte 对 NULL 返回假，
+        // 隐含排除 NULL）；windowDays=0 旁路 → 只免下界 gte，但仍须 isNotNull(published_at) 排除
+        // NULL（旁路不免 NULL 排除，否则旧/未推断成功的 NULL 事件会绕过修复刷屏）。
+        lowerBound !== null
+          ? gte(aiNewsEvents.publishedAt, lowerBound)
+          : isNotNull(aiNewsEvents.publishedAt),
+        // 时效闸上界（恒含，任何 windowDays 都加）：published_at <= now 拦确定性来源（RSS/GitHub）与
+        // AI 的任何未来值（未来值 `>= 下界` 恒真会绕过下界闸被当重大发布告警，故上界绝不可省）。
+        lte(aiNewsEvents.publishedAt, now),
       ),
     )
-    // 单次扫描上限：优先最新事件（first_seen_at DESC），超出 maxCandidates 的下轮补发。
-    .orderBy(desc(aiNewsEvents.firstSeenAt))
+    // 单次扫描上限：优先最新发布事件（published_at DESC），超出 maxCandidates 的下轮补发。
+    .orderBy(desc(aiNewsEvents.publishedAt))
     .limit(maxCandidates);
 
   return rows.map((r) => ({
@@ -262,6 +295,29 @@ export async function runAlertScan(
   const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
   log(
     `评分: 送判 ${judgeResult.judged} 条, 降级 ${judgeResult.degradedCount} 条, claim 跳过 ${judgeResult.claimSkipped} 条`,
+  );
+
+  // ── 阶段 3.5：发布时间回填（published-at-inference，realtime-alerts spec / design D2/D4）。
+  // **必在 selectAlertCandidates 之前**：对「评分后达阈值（importance_score 非 NULL 且 >= threshold）
+  // 且 published_at IS NULL」的事件，逐条经 Redis per-event 锁 → AI 推断 → CAS 回填（受
+  // PUBLISHED_AT_INFERENCE_MAX_PER_RUN 上限 + first_seen_at 超窗剪枝约束）。与日报链回填经 1.4 CAS
+  // （UPDATE ... WHERE published_at IS NULL）+ 1.5 Redis 锁（published-at-infer:{event_id}）并发安全。
+  // 高频告警链**无降级率熔断阶段**，回填的「判不出/失败」天然不影响任何熔断；失败降级不抛断、不阻塞
+  // 后续阶段（backfillPublishedAt 内部已逐事件 catch 降级）。
+  const backfillStats = await backfillPublishedAt({
+    scope: { kind: 'alert', threshold },
+    windowDays,
+    now,
+    dbh,
+    // exactOptionalPropertyTypes：仅在显式注入时透传，避免传 undefined 给「可选非 undefined」字段。
+    ...(options.publishedAtInfer ? { infer: options.publishedAtInfer } : {}),
+    ...(options.publishedAtLock ? { lock: options.publishedAtLock } : {}),
+    logError: (message, detail) =>
+      log(`[published-at-inference] ${message}`, detail),
+  });
+  log(
+    `发布时间回填: 尝试 ${backfillStats.attempted} 条, 回填 ${backfillStats.backfilled} 条, ` +
+      `判不出 ${backfillStats.undetermined} 条, 失败 ${backfillStats.failed} 条`,
   );
 
   // ── 阶段 4：评分**后**判阈值 + 推送告警（纯程序阈值，非 LLM 决定）。

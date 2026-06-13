@@ -5,7 +5,12 @@
  * - importance 低于下限闸的事件被过滤（即便 should_push=true）。
  * - 已被任一 push_date 以 telegram success 推送过的事件不再入选（跨天不重推）。
  * - 候选多于 N 时确定性取前 N（对同一批已落库事件多次运行结果一致）。
- * - should_push=false / 不在近 N 天窗口的事件不入候选。
+ * - should_push=false 的事件不入候选。
+ * - 时效闸键于 published_at（闭区间 lowerBound <= published_at <= now）：
+ *   · published_at 旧的高分老文（first_seen_at=今天）不入候选（证明改用 published_at）；
+ *   · published_at 在窗口内的入候选；
+ *   · published_at 为 NULL 的不入候选（gte/lte 对 NULL 返假 → NULL 即排除）；
+ *   · published_at 为未来日期（含来自确定性来源 RSS/GitHub）的不入候选（上界排除）。
  *
  * 缺 DATABASE_URL 时自动跳过。用唯一 dedup_key 前缀隔离造的 event 行，afterAll 清理。
  */
@@ -21,6 +26,9 @@ process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 
 const { selectTopN } = await import('../top-n.js');
+// 与 selectTopN 内部时效窗口下界共用的唯一时间源（push-date.ts，Asia/Shanghai）——
+// 6.3 边界用例用它算下界、断言窗口「今天」与 push_date 同源（无第二套时区计算）。
+const { startOfDayInTimeZone } = await import('../../push/push-date.js');
 
 const databaseUrl = process.env.DATABASE_URL;
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl }) : null;
@@ -57,7 +65,11 @@ async function seedEvent(args: {
       args.developerRelevance ?? 50,
       args.hypeRisk ?? 0,
       args.firstSeenAt ?? new Date('2099-02-01T00:00:00Z'),
-      args.publishedAt ?? null,
+      // 时效闸已键于 published_at：默认给一个在窗口内（< NOW）的发布时间，使非时效用例
+      // 不被时效闸误过滤；要测「NULL 即排除」的用例显式传 publishedAt: null。
+      args.publishedAt === undefined
+        ? new Date('2099-02-01T00:00:00Z')
+        : args.publishedAt,
     ],
   );
   return rows[0]!.event_id;
@@ -159,16 +171,11 @@ describe.skipIf(!databaseUrl)('Top N 候选窗口（DB 侧不变量）', () => {
     expect(ids).toContain(fresh);
   });
 
-  it('should_push=false 与不在近 N 天窗口的事件不入候选', async () => {
+  it('should_push=false 的事件不入候选', async () => {
     const notPush = await seedEvent({
       key: 'notpush',
       importance: 90,
       shouldPush: false,
-    });
-    const stale = await seedEvent({
-      key: 'stale',
-      importance: 90,
-      firstSeenAt: new Date('2099-01-01T00:00:00Z'), // 远早于近 3 天。
     });
     const ok = await seedEvent({ key: 'inwindow', importance: 90 });
 
@@ -176,7 +183,104 @@ describe.skipIf(!databaseUrl)('Top N 候选窗口（DB 侧不变量）', () => {
     const ids = top.map((e) => e.eventId);
     expect(ids).toContain(ok);
     expect(ids).not.toContain(notPush);
-    expect(ids).not.toContain(stale);
+  });
+
+  it('时效闸键于 published_at（非 first_seen_at）：旧 published_at 的高分老文不入候选', async () => {
+    // 关键回归：模拟「新增源/冷启动」——历史老文 published_at 多年前，但今日才首次抓到
+    // （first_seen_at = 今天，落在窗口内）。改用 published_at 后该老文必被时效闸排除，
+    // 不再被误当近 N 天新消息推送（2026-06-13 刷屏 bug 的根因用例）。
+    const staleOldArticle = await seedEvent({
+      key: 'stale-pub',
+      importance: 95,
+      firstSeenAt: new Date('2099-02-01T00:00:00Z'), // 今天才首见。
+      publishedAt: new Date('2090-01-01T00:00:00Z'), // 发布于多年前，远早于近 3 天窗口。
+    });
+    const fresh = await seedEvent({
+      key: 'fresh-pub',
+      importance: 90,
+      publishedAt: new Date('2099-02-01T00:00:00Z'), // 窗口内。
+    });
+
+    const top = await selectTopN({ now: NOW, importanceFloor: 60, windowDays: 3 }, db!);
+    const ids = top.map((e) => e.eventId);
+    expect(ids).toContain(fresh); // published_at 在窗口内 → 入候选。
+    expect(ids).not.toContain(staleOldArticle); // first_seen=今天但 published_at 太旧 → 出窗。
+  });
+
+  it('published_at 为 NULL 的事件不入候选（gte/lte 对 NULL 返假 → NULL 即排除）', async () => {
+    const nullPub = await seedEvent({
+      key: 'null-pub',
+      importance: 95,
+      publishedAt: null, // AI 推断后仍判不出 → 保持 NULL。
+    });
+    const ok = await seedEvent({ key: 'null-ok', importance: 90 });
+
+    const top = await selectTopN({ now: NOW, importanceFloor: 60, windowDays: 3 }, db!);
+    const ids = top.map((e) => e.eventId);
+    expect(ids).toContain(ok);
+    expect(ids).not.toContain(nullPub); // NULL published_at 被自然排除。
+  });
+
+  it('published_at 为未来日期的事件不入候选（上界 published_at <= now 排除）', async () => {
+    // 未来日期可来自确定性来源（RSS pubDate / GitHub pushed_at 源端 bug、时区错配、恶意 feed），
+    // 经采集直接入库不过 AI 拦截；gte(published_at, lowerBound) 对未来恒真，必须靠上界 lte 兜底。
+    const futurePub = await seedEvent({
+      key: 'future-pub',
+      importance: 95,
+      publishedAt: new Date('2099-02-05T00:00:00Z'), // 晚于 NOW（2099-02-01）。
+    });
+    const ok = await seedEvent({ key: 'future-ok', importance: 90 });
+
+    const top = await selectTopN({ now: NOW, importanceFloor: 60, windowDays: 3 }, db!);
+    const ids = top.map((e) => e.eventId);
+    expect(ids).toContain(ok);
+    expect(ids).not.toContain(futurePub); // 未来日期被上界排除。
+  });
+
+  it('时区下界边界（任务 6.3①）：上海窗口下界 00:00 前 1 秒出窗、后 1 秒入窗', async () => {
+    // 下界由 startOfDayInTimeZone(NOW, windowDays-1) 算出（与 push_date 同源 Asia/Shanghai）。
+    // 闭区间 lowerBound <= published_at；published_at 是绝对时刻（timestamptz）的两个 UTC 时刻比较。
+    // 构造「下界前 1 秒」与「下界后 1 秒」两条事件，断言前者出窗、后者入窗——固化日界 UTC 前后一瞬
+    // 行为唯一确定（design D1「时区比较口径」/ spec「时区比较口径必须显式且唯一」）。
+    const windowDays = 3;
+    const lowerBound = startOfDayInTimeZone(NOW, windowDays - 1); // 与 selectTopN 内部同一函数。
+    const justBefore = await seedEvent({
+      key: 'lb-before',
+      importance: 95,
+      publishedAt: new Date(lowerBound.getTime() - 1000), // 下界前 1 秒 → 出窗。
+    });
+    const justAfter = await seedEvent({
+      key: 'lb-after',
+      importance: 90,
+      publishedAt: new Date(lowerBound.getTime() + 1000), // 下界后 1 秒 → 入窗。
+    });
+
+    // topN: 100 避免 TOP_N 默认上限（本套件无 afterEach、跨 it 累积事件可能挤掉本用例的入窗事件）——
+    // 本用例只验「下界 ±1 秒入/出窗」，topN 充足时入窗事件必出现在结果里、不被名额上限混淆。
+    const top = await selectTopN({ now: NOW, topN: 100, importanceFloor: 60, windowDays }, db!);
+    const ids = top.map((e) => e.eventId);
+    expect(ids).not.toContain(justBefore); // < lowerBound → 出窗（闭区间下界严格之外）。
+    expect(ids).toContain(justAfter); // >= lowerBound → 入窗。
+  });
+
+  it('上界边界（任务 6.3②）：published_at = now 入窗（含等于）、now + 1ms 出窗（未来排除）', async () => {
+    // 上界 lte(published_at, now) 含等于：now 当刻入窗、now+1ms 严格未来出窗（与上下界共用同一 now）。
+    const atNow = await seedEvent({
+      key: 'ub-eq-now',
+      importance: 95,
+      publishedAt: new Date(NOW.getTime()),
+    });
+    const justFuture = await seedEvent({
+      key: 'ub-future-1ms',
+      importance: 90,
+      publishedAt: new Date(NOW.getTime() + 1),
+    });
+
+    // topN: 100 同上：避免名额上限挤掉入窗事件，隔离「上界 ±1ms 入/出窗」为唯一被测变量。
+    const top = await selectTopN({ now: NOW, topN: 100, importanceFloor: 60, windowDays: 3 }, db!);
+    const ids = top.map((e) => e.eventId);
+    expect(ids).toContain(atNow); // <= now 含等于 → 入窗。
+    expect(ids).not.toContain(justFuture); // now+1ms 未来 → 出窗。
   });
 
   it('候选多于 N 时确定性取前 N，且多次运行结果一致', async () => {

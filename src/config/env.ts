@@ -151,9 +151,19 @@ const envSchema = z.object({
   // 任一阶段分母 > 0 且其降级率严格 > 此值 → 中止 + 告警，不推残缺日报。
   DEGRADE_ABORT_RATIO: z.coerce.number().min(0).max(1).default(0.5),
 
-  // --- 候选窗口（daily-intel-pipeline D5）---
-  // first_seen_at 在近 N 天的事件才进候选。
+  // --- 候选窗口（daily-intel-pipeline D5；fix-push-recency-by-published-at D1/D5）---
+  // 日报候选时效窗口天数（近 N 天）。**语义已变更**：天数复用、变量名保留（保配置兼容），
+  // 但时效闸的键已由「抓取近 N 天（first_seen_at）」改为「**发布近 N 天（published_at）**」——
+  // first_seen_at 仅记首次抓取时刻、与文章真实发布时间无关，会把冷启动抓到的历史老文误当近期。
+  // 改键后 NULL published_at 经 AI 推断回填、仍 NULL 则排除（详见 top-n.ts 顶部注释与 design D1）。
   FIRST_SEEN_WINDOW_DAYS: z.coerce.number().int().positive().default(3),
+
+  // --- 发布时间 AI 推断成本闸（fix-push-recency-by-published-at D4）---
+  // 单轮回填（published-at-inference）最多对多少个 NULL published_at 事件调 LLM 推断。
+  // 回填作用域（should_push=true / 达阈值 + published_at IS NULL）可能远大于 Top N / 告警单次上限，
+  // 故须独立成本闸硬封单轮 LLM 调用量（Top N / ALERT_MAX_PER_SCAN 限不住）；超出者下轮补填。
+  // 进 zod 校验：非法值（负数/NaN/0）启动即报错，守 env 全局不变量（裸读 process.env 会绕过）。
+  PUBLISHED_AT_INFERENCE_MAX_PER_RUN: z.coerce.number().int().positive().default(20),
 
   // --- BullMQ 每日定时触发（daily-intel-pipeline D7 / feishu-push 5.5）---
   // cron 表达式（BullMQ repeat.pattern）触发 daily-digest 任务，默认每日 08:03。
@@ -200,8 +210,11 @@ const envSchema = z.object({
   // 告警单例锁 `alert:{channel}:{event_id}` TTL（毫秒）：job 级短时持有，覆盖「单事件渲染+单通道送达」
   // 最坏时长；崩溃后经 TTL 自动释放（锁键不含时间，无 TTL 会永久死锁该事件告警，故释放语义不可省）。
   ALERT_LOCK_TTL_MS: z.coerce.number().int().positive().default(60000),
-  // 告警候选时间窗口（天数）：仅对 first_seen_at 在近 N 天内的事件发告警（防冷启动积压刷屏）。
-  // 默认 3（同日报候选窗口量级）；0 表示不限窗口（不推荐）。
+  // 告警候选时间窗口（天数）：仅对近 N 天内的事件发告警（防冷启动积压刷屏）。
+  // **语义已变更**（fix-push-recency-by-published-at D1/D5）：天数复用、变量名保留（保配置兼容），
+  // 但时效闸的键已由「抓取近 N 天（first_seen_at）」改为「**发布近 N 天（published_at）**」。
+  // 默认 3（同日报候选窗口量级）；0 表示不限窗口（不推荐）——旁路仅免下界 gte，仍须排除 NULL
+  // 与未来 published_at（见 alert-scan.ts 顶部注释与 design D1）。
   ALERT_FIRST_SEEN_WINDOW_DAYS: z.coerce.number().int().nonnegative().default(3),
   // 单次 alert-scan 最多发送的告警条数（防 Telegram rate limit 刷屏）。
   // 默认 5；超出的候选按 first_seen_at DESC 保留最新，其余待下轮（20min 后）补发。

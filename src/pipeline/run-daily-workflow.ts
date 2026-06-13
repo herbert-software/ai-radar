@@ -39,6 +39,9 @@ import {
   type ScoreEventsOptions,
 } from '../agents/value-judge/score-events.js';
 import { selectTopN, type SelectedEvent } from '../selection/top-n.js';
+import { backfillPublishedAt } from '../agents/published-at-inference/backfill.js';
+import type { InferPublishedAtOptions } from '../agents/published-at-inference/index.js';
+import type { AcquireAlertLockOptions } from './alert-lock.js';
 import {
   digestEvent,
   type EventForDigest,
@@ -64,6 +67,7 @@ import {
   stageShouldAbort,
   type StageDegrade,
 } from './circuit-breaker.js';
+import type { BackfillPublishedAtResult } from '../agents/published-at-inference/backfill.js';
 
 type DbLike = typeof defaultDb;
 
@@ -133,6 +137,16 @@ export interface RunDailyWorkflowOptions {
   alert?: AlertSink;
   /** 熔断阈值（默认 env.DEGRADE_ABORT_RATIO）。 */
   abortRatio?: number;
+  /**
+   * 发布时间回填阶段的推断选项（透传给 backfillPublishedAt 的 `infer`）。
+   * 注入 mock generateObjectFn / maxAttempts 等，使测试控制推断结果、不依赖真实 LLM。
+   */
+  publishedAtInfer?: Omit<InferPublishedAtOptions, 'now'>;
+  /**
+   * 发布时间回填阶段的 Redis 锁选项（透传给 backfillPublishedAt 的 `lock`）。
+   * 注入 mock Redis / TTL；不传则用真实 Redis（集成测有真实 Redis 可用）。
+   */
+  publishedAtLock?: AcquireAlertLockOptions;
 }
 
 /** 工作流结束状态（供 worker / 可观测 / 测试断言）。 */
@@ -160,6 +174,12 @@ export interface RunDailyWorkflowResult {
   topNCount: number;
   /** 是否触发了系统级故障告警。 */
   alerted: boolean;
+  /**
+   * 发布时间回填阶段统计（**仅可观测**，绝不影响 outcome / 熔断）。
+   * 回填的「判不出/失败」绝不计入 DEGRADE_ABORT_RATIO 分母（只含 judge + digest 两阶段）。
+   * 未执行回填（如未抢到锁提前返回）时为 undefined。
+   */
+  publishedAtBackfill?: BackfillPublishedAtResult;
 }
 
 /** 把 Top N 选中事件补齐 canonical_url（供摘要降级回退到 URL）。 */
@@ -308,6 +328,30 @@ export async function runDailyWorkflow(
     // 注意：judge 分母 = 0 时 stageShouldAbort 返回 false——**不中止**，直接进 Top N，
     // 已评分的常青事件仍可入选并推送（禁止误判「今日无候选」）。
 
+    // ── 阶段 3.5：发布时间回填（published-at-inference，daily spec / design D2/D4）。
+    // **必在 Value Judge 之后、Top N 之前**：对「should_push=true 且 published_at IS NULL」的收窄
+    // 候选域，逐条经 Redis per-event 锁 → AI 推断 → CAS 回填（受 PUBLISHED_AT_INFERENCE_MAX_PER_RUN
+    // 上限 + first_seen_at 超窗剪枝约束）。能补的补、补不出（AI 判不出）的保持 NULL 由 Top N 时效闸排除。
+    // **绝不计入降级率熔断**（daily spec「每日定时单队列顺序编排」/ design D2）：回填的「判不出/失败」
+    // 是预期高比例的安全失败方向，绝不构造 StageDegrade、绝不传 stageShouldAbort/stageDegradeRate、
+    // 绝不进 DEGRADE_ABORT_RATIO 分母——熔断分母仍只含 judgeStage / digestStage 两阶段。回填统计仅
+    // 记日志（可观测），失败降级不抛断、不阻塞后续阶段（backfillPublishedAt 内部已逐事件 catch 降级）。
+    const backfillStats = await backfillPublishedAt({
+      scope: { kind: 'daily' },
+      windowDays: env.FIRST_SEEN_WINDOW_DAYS,
+      now,
+      dbh,
+      // exactOptionalPropertyTypes：仅在显式注入时透传，避免传 undefined 给「可选非 undefined」字段。
+      ...(options.publishedAtInfer ? { infer: options.publishedAtInfer } : {}),
+      ...(options.publishedAtLock ? { lock: options.publishedAtLock } : {}),
+      logError: (message, detail) =>
+        console.error(`[pipeline][published-at-inference] ${message}`, detail),
+    });
+    console.error(
+      `[pipeline] 发布时间回填: 尝试 ${backfillStats.attempted} 条, 回填 ${backfillStats.backfilled} 条, ` +
+        `判不出 ${backfillStats.undetermined} 条, 失败 ${backfillStats.failed} 条（不计入熔断）`,
+    );
+
     // ── 阶段 4：Top N 选择（程序确定性，不交给 LLM）。统一日报模型 Model B：选一份 channel-blind
     // Top N，候选窗口排除「已投递给所有已配置通道」者（还差任一通道就留在名单、由各通道 per-channel
     // 跨天补发）。故先解析「已配置通道集」传入 selectTopN（同一份 channelSenders 在阶段 6 复用分发）。
@@ -428,6 +472,7 @@ export async function runDailyWorkflow(
         digest: digestStage,
         topNCount: topN.length,
         alerted,
+        publishedAtBackfill: backfillStats,
       };
     }
 
@@ -509,6 +554,7 @@ export async function runDailyWorkflow(
       digest: digestStage,
       topNCount: topN.length,
       alerted,
+      publishedAtBackfill: backfillStats,
     };
   } finally {
     await lock.release();

@@ -39,6 +39,12 @@ export interface AcquireAlertLockOptions {
   redis?: RedisLike;
   /** 锁 TTL（毫秒），默认 env.ALERT_LOCK_TTL_MS。须覆盖「单事件渲染 + 单通道送达」最坏时长。 */
   ttlMs?: number;
+  /**
+   * 覆盖锁键（向后兼容泛化）：不传时维持原 `alert:{event_id}` 行为（告警分发锁，零变化）；
+   * 传入时用该 key 作锁键。供其他 per-event 单例场景复用本获取/释放语义而不与告警锁争用同键
+   * （如发布时间回填用 `published-at-infer:{event_id}`，须与 `alert:{event_id}` 区分开）。
+   */
+  key?: string;
 }
 
 // 「核对令牌再删」——只删自己持有的锁，避免锁过期被他人重获后误删（经典分布式锁安全）。
@@ -68,7 +74,9 @@ export async function acquireAlertLock(
   options: AcquireAlertLockOptions = {},
 ): Promise<AlertLock | null> {
   const ttlMs = options.ttlMs ?? env.ALERT_LOCK_TTL_MS;
-  const key = alertLockKey(eventId);
+  // 默认锁键 `alert:{event_id}`（不传 options.key 时维持告警分发锁的原行为，零变化）；
+  // 传 options.key 时用该键（供回填等其他 per-event 单例场景复用本语义、不争用告警锁）。
+  const key = options.key ?? alertLockKey(eventId);
   const token = randomUUID();
 
   // 未注入 redis 时新建一次性连接，并在 release 时关闭（避免句柄泄漏）。
