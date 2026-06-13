@@ -95,6 +95,16 @@ export function createFeishuSender(
         '不应在飞书 disabled 时构造 FeishuSender。',
     );
   }
+  // 测试安全守卫：VITEST 下若未注入 fetchImpl（即将用真实 globalThis.fetch POST 到 env.FEISHU_WEBHOOK_URL），
+  // 直接抛错——防测试经「通道集回退到真实 sender」把测试日报/告警真发到生产飞书 webhook。测试须注入
+  // mock sender（senders 选项）或注入 options.fetchImpl，并确保通道集不回退真实 sender。
+  // 注：单测（feishu.test.ts）注入 fetchImpl 桩、不触网，本守卫放行。
+  if (process.env.VITEST && !options.fetchImpl) {
+    throw new Error(
+      'createFeishuSender: 测试环境（VITEST）禁止构造真实飞书发送器——会真发到生产 webhook。' +
+        '请注入 mock sender（senders）或 options.fetchImpl，或钉 channels 不让其回退真实 sender。',
+    );
+  }
   const fetchImpl: FetchLike =
     options.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
   const logError = options.logError ?? defaultLogError;

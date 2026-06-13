@@ -257,6 +257,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       judge: { judge: { generateObjectFn: judgeMock({ failTitles: new Set(['BAD judge item']) }), maxAttempts: 1 } },
       digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert,
     });
@@ -286,6 +287,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
         judge: { judge: { generateObjectFn: judgeMock({ failTitles: new Set(['BAD a', 'BAD b']) }), maxAttempts: 1 } },
         digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
         sender,
+        channels: ['telegram'],
         lock: LOCK_OPTS,
         alert,
       }),
@@ -312,6 +314,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
         // 摘要对所有 Top N 失败（failTitles 命中两条标题）→ 摘要分母 2、降级 2 = 1.0 > 0.5。
         digest: { generateObjectFn: digestMock({ failTitles: new Set(['topic one', 'topic two']) }), maxAttempts: 1 },
         sender,
+        channels: ['telegram'],
         lock: LOCK_OPTS,
         alert,
       }),
@@ -349,6 +352,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
       digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert,
     });
@@ -373,6 +377,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
       digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert,
     });
@@ -405,6 +410,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
       digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert,
     });
@@ -440,6 +446,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
         judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
         digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
         sender,
+        channels: ['telegram'],
         lock: { redis: leaseLosingRedis, ttlMs: 30_000, renewIntervalMs: 1 },
         alert,
       }),
@@ -465,6 +472,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
       digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
       sender: okSender(),
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert: vi.fn(),
     });
@@ -486,6 +494,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
       digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert,
     });
@@ -617,6 +626,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
       digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert,
     });
@@ -679,6 +689,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 发布时间回填阶段（4.4）', (
       publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: IN_WINDOW_ISO }), maxAttempts: 1 },
       publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert: vi.fn(),
     });
@@ -711,6 +722,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 发布时间回填阶段（4.4）', (
       publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: null }), maxAttempts: 1 },
       publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert: vi.fn(),
     });
@@ -747,6 +759,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 发布时间回填阶段（4.4）', (
       publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: null, throwError: true }), maxAttempts: 1, logError: () => {} },
       publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert: vi.fn(),
     });
@@ -778,6 +791,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 发布时间回填阶段（4.4）', (
       publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: IN_WINDOW_ISO }), maxAttempts: 1 },
       publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert: vi.fn(),
     });
@@ -810,6 +824,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 发布时间回填阶段（4.4）', (
       publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: '2099-01-01T00:00:00Z' }), maxAttempts: 1 },
       publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert: vi.fn(),
     });
@@ -928,6 +943,7 @@ describe.skipIf(!canRun)('runDailyWorkflow 发布时间回填阶段（4.4）', (
       publishedAtInfer: { generateObjectFn: inferMock({ publishedAt: null }), maxAttempts: 1 },
       publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
       sender,
+      channels: ['telegram'],
       lock: LOCK_OPTS,
       alert,
     });

@@ -35,6 +35,15 @@ export interface TelegramSenderOptions {
 export function createTelegramSender(
   options: TelegramSenderOptions = {},
 ): MessageSender {
+  // 测试安全守卫：VITEST 下若未注入 api（即将用真实 env.TELEGRAM_BOT_TOKEN 新建 grammY bot），
+  // 直接抛错——防测试经「通道集回退到真实 sender」把测试日报/告警真发到生产 chat。测试须注入
+  // mock sender（senders/sender 选项）或注入 options.api，并确保通道集不回退真实 sender。
+  if (process.env.VITEST && !options.api) {
+    throw new Error(
+      'createTelegramSender: 测试环境（VITEST）禁止构造真实 Telegram 发送器——会真发到生产 chat。' +
+        '请注入 mock sender（senders/sender）或 options.api，或钉 channels 不让其回退真实 sender。',
+    );
+  }
   const api: BotApiLike =
     options.api ?? (new Bot(env.TELEGRAM_BOT_TOKEN).api as unknown as BotApiLike);
   const chatId = options.chatId ?? env.TELEGRAM_CHAT_ID;
