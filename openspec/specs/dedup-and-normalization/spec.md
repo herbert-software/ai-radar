@@ -31,9 +31,9 @@
 
 **排除行不得停在 `collapsed=false` 被每轮无界重扫**：类型路由的排除必须在塌缩**查询层**完成（事件塌缩入口的 `WHERE` 增加 `raw_type IS DISTINCT FROM 'product' AND raw_type IS DISTINCT FROM 'paper'`，使 product/paper 行不进 pending 集）；并且：产品行由产品塌缩成功后置 `collapsed=true`（见 product-discovery），论文行因 P2 无任何下游消费、入库即置 `collapsed=true`（标记为已路由/已沉淀）。否则被排除的 product/paper 行永远 `collapsed=false`，事件塌缩入口每轮重扫全部历史 product/paper 行，工作量随累计行数线性无界增长（与 P1 对新闻行严格置 `collapsed=true` 的设计不对称）。`collapsed` 列对 product/paper 行语义为「已按 raw_type 路由处理完毕」，对新闻行语义为「已塌缩进 ai_news_events」。各采集器**必须为每条 `raw_item` 标注非空 `raw_type`**（PH→`product`、arXiv→`paper`、RSS→`news`、HN/GitHub→其类型），NULL `raw_type` 视为采集器 bug；类型路由对 NULL 的「视作新闻」是防御性兜底、非鼓励留空。
 
-塌缩的 `INSERT` 分支必须**省略 `event_id`**，由数据库默认值 `gen_random_uuid()::text` 生成不透明身份；首次创建时必须写入 `representative_raw_item_id`、`representative_title`（取代表 `raw_item` 的**原始 title**——非归一化标题，保证 `NOT NULL`，供摘要降级时回退展示；原始 title 通常可读，极个别为空串 `''` 的情形由摘要降级兜底到 canonical_url）、`first_seen_at`、`published_at`（取代表 `raw_item` 的发布时间），并初始化 `source_count=1`。`ON CONFLICT DO UPDATE` 分支必须**只**累加 `source_count` 并更新 `last_seen_at`；**禁止**在 `UPDATE` 的 `set` 中覆盖 `event_id`、`representative_raw_item_id`、`representative_title`、`first_seen_at`、`published_at`——否则事件身份与「首建代表原文」语义被后到的 `raw_item` 破坏。
+塌缩的 `INSERT` 分支必须**省略 `event_id`**，由数据库默认值 `gen_random_uuid()::text` 生成不透明身份；首次创建时必须写入 `representative_raw_item_id`、`representative_title`（取代表 `raw_item` 的**原始 title**——非归一化标题，保证 `NOT NULL`，供摘要降级时回退展示；原始 title 通常可读，极个别为空串 `''` 的情形由摘要降级兜底到 canonical_url）、`first_seen_at`、`published_at`（取代表 `raw_item` 的发布时间），并初始化 `source_count=1`。`ON CONFLICT DO UPDATE` 分支必须累加 `source_count`、更新 `last_seen_at`，并且**仅在事件当前 `published_at IS NULL` 时**用后到 `raw_item` 的非 NULL `published_at` 经 `COALESCE` 补值（identity-preserving NULL-fill：`published_at = COALESCE(ai_news_events.published_at, excluded.published_at)`）——这是**确定性事实优先于 AI 推断**的体现（DB 已有的确定发布时间绝不交给 LLM，见 published-at-inference）。`ON CONFLICT DO UPDATE` 分支**禁止**覆盖 `event_id`、`representative_raw_item_id`、`representative_title`、`first_seen_at`，也**禁止**把已非 NULL 的 `published_at` 覆盖为其它值（`COALESCE` 保证已设值不变、只允许 `NULL → 已知` 单向补值）——否则事件身份与「首建代表原文」语义被后到的 `raw_item` 破坏。多条同 `dedup_key` 但日期不同的 `raw_item` 并发塌缩时，NULL-fill 取**先抢到行锁那条**的确定日期：取哪条依到达序、非全序确定，但**始终是某条真实 `raw_item` 的确定发布时间**（不丢、不臆造），与「首建代表 = 第一条命中」的到达序语义一致；契约只承诺「填入某个确定发布时间」（任一确定值都满足时效闸语义），不承诺选最早/最晚，故无需 per-dedup 序列化锁或聚合子查询。
 
-流水线下游对同一事件行的后续写入（Value Judge 写 `*_score`/`should_push`、中文摘要写 `summary_zh`）必须以 `UPDATE ... WHERE event_id = ?` 定位、`set` 中**只含本阶段目标列**，禁止用 `INSERT ... ON CONFLICT` 模板（P0 `persistEventScores` 的全列覆盖式 `set` 是反面模板），以免把 `published_at`/`representative_*`/`first_seen_at` 覆盖回 NULL 而使 Top N 排序静默退化。
+流水线下游对同一事件行的后续写入（Value Judge 写 `*_score`/`should_push`、中文摘要写 `summary_zh`、published-at-inference 在所有关联 raw_item 均无发布时间时回填 `published_at`）必须以 `UPDATE ... WHERE event_id = ?` 定位、`set` 中**只含本阶段目标列**（published-at-inference 的回填须附 `AND published_at IS NULL` 的 CAS 守卫），禁止用 `INSERT ... ON CONFLICT` 模板（P0 `persistEventScores` 的全列覆盖式 `set` 是反面模板），以免把 `published_at`/`representative_*`/`first_seen_at` 覆盖回 NULL 而使 Top N 排序静默退化。
 
 去重判定必须全程由程序与 DB 唯一约束保障，禁止交给 LLM。本期仅做此硬去重层，禁止引入 embedding 相似度或 LLM 二次判断。
 
@@ -51,7 +51,11 @@
 
 #### 场景:再次塌缩不覆盖身份与代表原文
 - **当** 第二条同 `dedup_key` 的 `raw_item` 经 `ON CONFLICT DO UPDATE` 命中已存在事件
-- **那么** `event_id`、`representative_raw_item_id`、`representative_title`、`first_seen_at`、`published_at` 保持首建值不变，仅 `source_count` 累加、`last_seen_at` 更新
+- **那么** `event_id`、`representative_raw_item_id`、`representative_title`、`first_seen_at` 保持首建值不变，仅 `source_count` 累加、`last_seen_at` 更新；`published_at` 在首建已非 NULL 时保持不变（`COALESCE` 不覆盖已设值）
+
+#### 场景:后到 raw_item 的确定发布时间补空（确定性优先于 AI）
+- **当** 某事件首建时 `published_at` 为 NULL（首条 raw_item 无发布时间），后到的同 `dedup_key` raw_item 带确定 `published_at`
+- **那么** `ON CONFLICT DO UPDATE` 经 `COALESCE(ai_news_events.published_at, excluded.published_at)` 把确定值补入（`NULL → 已知` 单向），该事件不再进入 AI 推断阶段（确定性事实优先、不交 LLM）
 
 ### 需求:不可处理条目兜底
 
