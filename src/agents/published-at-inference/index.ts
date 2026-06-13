@@ -15,9 +15,8 @@
  * 记 error 日志后**返回 null（无法判定）**，绝不回填 now()/fetchedAt、绝不抛断流水线。
  * 回填编排（backfill.ts）据此「null 即跳过该事件」，与候选过滤层「NULL 即排除」自洽。
  */
-import { generateObject } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
-import { env } from '../../config/env.js';
+import { buildModel, defaultGenerateObject } from '../llm-client.js';
 import { makePublishedAtInferenceSchema } from './schema.js';
 
 export { makePublishedAtInferenceSchema, REASONABLE_LOWER_BOUND } from './schema.js';
@@ -57,22 +56,6 @@ export interface InferPublishedAtOptions {
 }
 
 export const DEFAULT_MAX_ATTEMPTS = 3;
-
-/** 真实 SDK 适配：保留宽松签名以便依赖注入；加 abortSignal 超时。 */
-const defaultGenerateObject: GenerateObjectFn = (args) =>
-  generateObject({
-    ...args,
-    abortSignal: AbortSignal.timeout(env.LLM_TIMEOUT_MS),
-  }) as unknown as Promise<{ object: unknown }>;
-
-function buildModel(): ReturnType<ReturnType<typeof createOpenAI>> {
-  const provider = createOpenAI({
-    baseURL: env.LLM_BASE_URL,
-    apiKey: env.LLM_API_KEY,
-    headers: { 'X-Title': 'ai-radar' },
-  });
-  return provider(env.LLM_MODEL);
-}
 
 function buildPrompt(input: InferPublishedAtInput, now: Date): string {
   const parts = [

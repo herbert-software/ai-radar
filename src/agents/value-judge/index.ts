@@ -10,9 +10,8 @@
  * 依赖注入：`generateObject` 经参数注入（默认用真实 SDK），
  * 使 vitest 可在不依赖真实 key 的前提下覆盖成功/失败路径。
  */
-import { generateObject } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
-import { env } from '../../config/env.js';
+import { buildModel, defaultGenerateObject } from '../llm-client.js';
 import { valueJudgeOutputSchema, type ValueJudgeOutput } from './schema.js';
 
 export { valueJudgeOutputSchema };
@@ -65,23 +64,6 @@ export interface JudgeOptions {
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
-
-/** 真实 SDK 适配：保留宽松签名以便依赖注入。 */
-const defaultGenerateObject: GenerateObjectFn = (args) =>
-  // 加 abortSignal 超时：防一条挂起的 LLM 响应卡死整个评分阶段（超时抛错 → 走既有重试/降级链路）。
-  generateObject({
-    ...args,
-    abortSignal: AbortSignal.timeout(env.LLM_TIMEOUT_MS),
-  }) as unknown as Promise<{ object: unknown }>;
-
-function buildModel(): ReturnType<ReturnType<typeof createOpenAI>> {
-  const provider = createOpenAI({
-    baseURL: env.LLM_BASE_URL,
-    apiKey: env.LLM_API_KEY,
-    headers: { 'X-Title': 'ai-radar' },
-  });
-  return provider(env.LLM_MODEL);
-}
 
 function buildPrompt(input: JudgeRawItemInput): string {
   const parts = [

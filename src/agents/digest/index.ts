@@ -13,9 +13,8 @@
  * 边界：本模块只产出经校验的摘要对象；落库（UPDATE summary_zh）与降级回退
  * （representative_title / 剔除）由 ./persistence.ts 实现。
  */
-import { generateObject } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
-import { env } from '../../config/env.js';
+import { buildModel, defaultGenerateObject } from '../llm-client.js';
 import { digestOutputSchema, HEADLINE_MAX, type DigestOutput } from './schema.js';
 
 export { digestOutputSchema };
@@ -68,23 +67,6 @@ export interface SummarizeOptions {
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
-
-/** 真实 SDK 适配：保留宽松签名以便依赖注入。 */
-const defaultGenerateObject: GenerateObjectFn = (args) =>
-  // 加 abortSignal 超时：防一条挂起的 LLM 响应卡死整个摘要阶段（超时抛错 → 走既有重试/降级链路）。
-  generateObject({
-    ...args,
-    abortSignal: AbortSignal.timeout(env.LLM_TIMEOUT_MS),
-  }) as unknown as Promise<{ object: unknown }>;
-
-function buildModel(): ReturnType<ReturnType<typeof createOpenAI>> {
-  const provider = createOpenAI({
-    baseURL: env.LLM_BASE_URL,
-    apiKey: env.LLM_API_KEY,
-    headers: { 'X-Title': 'ai-radar' },
-  });
-  return provider(env.LLM_MODEL);
-}
 
 function buildPrompt(input: SummarizeEventInput): string {
   const parts = [
