@@ -15,7 +15,8 @@
     "test": "vitest run",
     "migrate": "drizzle-kit migrate",
     "worker": "tsx src/pipeline/worker-main.ts",
-    "smoke": "tsx src/pipeline/smoke.ts"
+    "smoke": "tsx src/pipeline/smoke.ts",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.69",

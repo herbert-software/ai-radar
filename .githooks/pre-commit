@@ -1,0 +1,8 @@
+#!/bin/sh
+# 提交前跑 ESLint，挡住 lint 错误进 CI。
+# 配置方式：`npm install` 经 package.json 的 prepare 钩子自动执行
+#   git config core.hooksPath .githooks
+# 临时跳过（不建议）：git commit --no-verify
+set -e
+echo "[pre-commit] eslint ..."
+npm run lint
