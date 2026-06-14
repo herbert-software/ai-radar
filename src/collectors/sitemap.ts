@@ -248,10 +248,13 @@ function firstChildTag(blockXml: string, tag: string): string | null {
     const gt = blockXml.indexOf('>', lt);
     if (gt === -1) return null;
     const inner = blockXml.slice(lt + 1, gt); // < 与 > 之间（单标签内）
-    const nm = /^([\w-]+:)?([\w-]+)/.exec(inner); // 标签名（可选命名空间前缀）
-    if (nm && nm[2]!.toLowerCase() === tagLower && inner[0] !== '/') {
+    const nm = /^([\w-]+:)?([\w-]+)/.exec(inner); // 捕获：[1]=命名空间前缀(可选) [2]=本地名
+    // 只匹配**无命名空间前缀**的标准 sitemap 标签（<loc>/<lastmod>）。
+    // `!nm[1]` 排除扩展命名空间标签（如 Google 图片扩展 `<image:loc>`、`<video:loc>`、`<news:...>`）——
+    // 否则块内 `<image:loc>` 在 `<loc>` 之前会被误当页面 URL、fetch 图片而非文章（Bugbot #3）。
+    if (nm && !nm[1] && nm[2]!.toLowerCase() === tagLower && inner[0] !== '/') {
       const contentStart = gt + 1;
-      const closeRe = new RegExp(`</(?:[\\w-]+:)?${tag}\\s*>`, 'i');
+      const closeRe = new RegExp(`</${tag}\\s*>`, 'i');
       const cm = closeRe.exec(blockXml.slice(contentStart));
       if (!cm) return null;
       return decodeXmlEntities(blockXml.slice(contentStart, contentStart + cm.index).trim());
@@ -461,16 +464,16 @@ async function collectOneSitemap(
     }
     if (!pathname.startsWith(pathPrefix)) continue;
     pathMatchCount += 1;
-    // FIX-7（SSRF 防护）：文章 host 必须 === sitemap host 或为其子域，否则跳过该 loc。
-    // 防 sitemap 被攻陷/MITM 时列内网/元数据 host（169.254.169.254 等）被 fetch；
-    // 信任边界 = 仅抓与配置 sitemap 同 host/子域的文章。
+    // FIX-7（SSRF 防护）+ Bugbot #2：文章 host 必须与 sitemap host 同注册域（apex 与 www 视同站、含子域），
+    // 否则跳过该 loc。剥前导 `www.` 后比对，使 sitemap 在 `www.x.com` 时 apex `x.com` 的文章也可采（反之亦然）；
+    // 仍拒内网/元数据 host（169.254.169.254）、后缀仿冒（x.com.evil.com）、近似域（evilx.com）。
+    // 信任边界 = sitemap 被攻陷/MITM 时不致 fetch 任意内网/外部 host。
     const cHost = new URL(c).hostname;
-    if (
-      sitemapHost === null ||
-      (cHost !== sitemapHost && !cHost.endsWith('.' + sitemapHost))
-    ) {
+    const sBase = sitemapHost === null ? null : sitemapHost.replace(/^www\./, '');
+    const aBase = cHost.replace(/^www\./, '');
+    if (sBase === null || (aBase !== sBase && !aBase.endsWith('.' + sBase))) {
       ctx.logError(
-        `sitemap[${vendor}] 文章 host (${cHost}) 非 sitemap host (${sitemapHost}) 或其子域，跳过（SSRF 防护）`,
+        `sitemap[${vendor}] 文章 host (${cHost}) 非 sitemap 注册域 (${sBase}) 或其子域，跳过（SSRF 防护）`,
         { url: c },
       );
       continue;

@@ -550,6 +550,28 @@ describe('collectSitemaps SSRF host 限制（FIX-7）', () => {
     expect(items).toHaveLength(1);
   });
 
+  it('apex 文章（sitemap 在 www.）视同注册域、应被采（Bugbot #2，www/apex 互通）', async () => {
+    const fetchArticle = vi.fn(articleRouter());
+    const items = await mod.collectSitemaps({
+      sources: [ANTHROPIC_CONFIG], // sitemapUrl host = www.anthropic.com
+      fetchText: async () =>
+        `<urlset>
+          <url><loc>https://anthropic.com/news/apex-article</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url>
+          <url><loc>https://blog.anthropic.com/news/sub-article</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url>
+        </urlset>`,
+      fetchArticle,
+      querySeenCanonicalUrls: async () => new Set(),
+      now: NOW,
+      windowDays: WINDOW_DAYS,
+      logError: () => {},
+    });
+    const fetched = fetchArticle.mock.calls.map((c) => c[0]);
+    // apex（剥 www 后同注册域）与子域均允许；不再因 host !== www.anthropic.com 被误拒。
+    expect(fetched).toContain('https://anthropic.com/news/apex-article');
+    expect(fetched).toContain('https://blog.anthropic.com/news/sub-article');
+    expect(items).toHaveLength(2);
+  });
+
   it('文章 host 为 sitemap host 的子域 → 放行', async () => {
     const cfg: SitemapSourceConfig = {
       sitemapUrl: 'https://anthropic.com/sitemap.xml',
@@ -643,21 +665,30 @@ describe('parseSitemap ReDoS（indexOf 线性扫描：未闭合 <url> 大畸形 
     expect(entries).toEqual([]); // 块内无任何闭合标签 → firstChildTag('loc') 返 null → 不计入。
   });
 
-  it('正常 <loc>/<lastmod> 与命名空间 <image:loc> 仍正确解析（FIX-A 不破坏正向）', () => {
+  it('图片扩展 <image:loc> 不被误当页面 loc，块内真 <loc> 优先（Bugbot #3）', () => {
     const xml = `<urlset xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
       <url>
-        <image:loc>https://www.anthropic.com/news/ns-prefixed</image:loc>
+        <image:loc>https://www.anthropic.com/images/cover.jpg</image:loc>
+        <loc>https://www.anthropic.com/news/real-article</loc>
         <lastmod>2026-06-13T10:00:00+00:00</lastmod>
       </url>
     </urlset>`;
     const entries = mod.parseSitemap(xml);
-    // 命名空间前缀 <image:loc> 由 firstChildTag 的 `(?:[\w-]+:)?` 宽松匹配。
+    // firstChildTag 只匹配无命名空间前缀的标准 <loc>；image:loc 在前也不被误取为页面 URL。
     expect(entries).toEqual([
       {
-        loc: 'https://www.anthropic.com/news/ns-prefixed',
+        loc: 'https://www.anthropic.com/news/real-article',
         lastmod: '2026-06-13T10:00:00+00:00',
       },
     ]);
+  });
+
+  it('仅含 <image:loc>（无标准 <loc>）的块不产生条目（Bugbot #3）', () => {
+    const xml = `<urlset xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+      <url><image:loc>https://www.anthropic.com/images/only.jpg</image:loc></url>
+    </urlset>`;
+    // 无标准 <loc> → firstChildTag('loc') 返 null → 不计入（绝不 fetch 图片 URL 当文章）。
+    expect(mod.parseSitemap(xml)).toEqual([]);
   });
 });
 
