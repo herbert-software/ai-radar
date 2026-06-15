@@ -170,3 +170,144 @@ describe.skipIf(!databaseUrl)('统一入库（源内幂等不变量）', () => {
     expect(await countBySourceItemId(sid)).toBe(1);
   });
 });
+
+/**
+ * store 层文本加固集成测试（add-semantic-dedup-and-store-hardening，任务 1.4）——需本地 Postgres。
+ *
+ * 验证：
+ * ① 一批含 NUL/控制符标题的条目，store 层净化后全部入库、绝不让 NUL 进 Postgres 致 INSERT 抛错；
+ *    metadata 字符串值递归净化后 JSON.stringify→jsonb 写入不抛。
+ * ② 注入一条会触发 INSERT 抛错的坏数据（source_item_id 超 varchar(255)），验证被 per-item try/catch
+ *    隔离、`skippedError=1`、其余条目照常入库、整批不中止。
+ *
+ * 不在源写字面控制字节：用 String.fromCharCode 构造（同 sanitize/hf-papers 测试范式）。
+ * 用唯一 source 前缀隔离，afterAll 清理本套件造的行。
+ */
+describe.skipIf(!databaseUrl)('store 层文本加固（净化 + per-item 入库隔离）', () => {
+  const HARDEN_SOURCE = 'store-harden-itest';
+  const NUL = String.fromCharCode(0);
+  const BEL = String.fromCharCode(7); // C0 控制符。
+
+  async function countBySource(): Promise<number> {
+    const { rows } = await pool!.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM raw_items WHERE source = $1`,
+      [HARDEN_SOURCE],
+    );
+    return Number(rows[0]!.n);
+  }
+
+  beforeAll(async () => {
+    if (pool) await pool.query(`DELETE FROM raw_items WHERE source = $1`, [HARDEN_SOURCE]);
+  });
+
+  afterAll(async () => {
+    if (pool) await pool.query(`DELETE FROM raw_items WHERE source = $1`, [HARDEN_SOURCE]);
+  });
+
+  it('① 含 NUL/控制符标题与 metadata 的整批：净化后全部入库不抛错', async () => {
+    const ts = Date.now();
+    const items = [
+      {
+        source: HARDEN_SOURCE as 'rss',
+        sourceItemId: `nul-a-${ts}`,
+        url: `https://example.com/nul-a-${ts}`,
+        title: `Safe${NUL}Title A`, // 标题含 NUL：净化前直插会致 Postgres text INSERT 抛错。
+        content: `body${BEL} with C0`,
+        publishedAt: null,
+        rawType: 'news',
+        metadata: { vendor: `Lab${NUL}X`, note: `n${BEL}` }, // metadata 字符串值含危险码点。
+      },
+      {
+        source: HARDEN_SOURCE as 'rss',
+        sourceItemId: `nul-b-${ts}`,
+        url: `https://example.com/nul-b-${ts}`,
+        title: `Clean Title B`,
+        content: null,
+        publishedAt: null,
+        rawType: 'news',
+      },
+    ];
+
+    const result = await storeCollectedItems(items, { dbh: db! });
+    // 两条都入库、无一被隔离（净化使 INSERT 成功）。
+    expect(result.received).toBe(2);
+    expect(result.attempted).toBe(2);
+    expect(result.inserted).toBe(2);
+    expect(result.skippedError).toBe(0);
+    expect(result.skippedInvalid).toBe(0);
+    expect(await countBySource()).toBe(2);
+
+    // 入库后的 title/content 不含 NUL/C0；metadata 字符串值已净化、可被 jsonb 正确读回。
+    const { rows } = await pool!.query<{
+      title: string;
+      content: string | null;
+      metadata: { vendor?: string; note?: string } | null;
+    }>(
+      `SELECT title, content, metadata FROM raw_items WHERE source = $1 AND source_item_id = $2`,
+      [HARDEN_SOURCE, `nul-a-${ts}`],
+    );
+    expect(rows[0]!.title).toBe('SafeTitle A');
+    expect(rows[0]!.content).toBe('body with C0');
+    expect(rows[0]!.metadata?.vendor).toBe('LabX');
+    expect(rows[0]!.metadata?.note).toBe('n');
+  });
+
+  it('② 单条 INSERT 抛错被隔离：skippedError=1、其余照常入库、整批不中止', async () => {
+    const ts = Date.now();
+    // 坏条目：source_item_id 超 varchar(255) → Postgres「value too long」在该条 INSERT 抛错，
+    // 净化不改变其长度，故必走 per-item try/catch。夹在两条正常条目之间，验证整批不中止。
+    const tooLongId = 'x'.repeat(300);
+    const items = [
+      {
+        source: HARDEN_SOURCE as 'rss',
+        sourceItemId: `ok-before-${ts}`,
+        url: `https://example.com/ok-before-${ts}`,
+        title: 'ok before',
+        content: null,
+        publishedAt: null,
+        rawType: 'news',
+      },
+      {
+        source: HARDEN_SOURCE as 'rss',
+        sourceItemId: tooLongId, // 触发 INSERT 抛错。
+        url: `https://example.com/bad-${ts}`,
+        title: 'bad row',
+        content: null,
+        publishedAt: null,
+        rawType: 'news',
+      },
+      {
+        source: HARDEN_SOURCE as 'rss',
+        sourceItemId: `ok-after-${ts}`,
+        url: `https://example.com/ok-after-${ts}`,
+        title: 'ok after',
+        content: null,
+        publishedAt: null,
+        rawType: 'news',
+      },
+    ];
+
+    const logged: string[] = [];
+    const result = await storeCollectedItems(items, {
+      dbh: db!,
+      logError: (m) => logged.push(m),
+    });
+
+    // 三条都 attempted（坏条 source_item_id 非空、过了前置校验，进 INSERT 才抛）。
+    expect(result.received).toBe(3);
+    expect(result.attempted).toBe(3);
+    // 坏条被隔离计入 skippedError；两条正常条目照常入库。
+    expect(result.skippedError).toBe(1);
+    expect(result.inserted).toBe(2);
+    expect(result.skippedInvalid).toBe(0);
+    // 错误日志记下被隔离的坏条（至少一条）。
+    expect(logged.some((m) => m.includes('单条目入库抛错被隔离'))).toBe(true);
+
+    // 前后两条正常条目都在库；坏条不在库（其超长 id 无法写入）。
+    const before = await pool!.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM raw_items WHERE source = $1 AND source_item_id IN ($2, $3)`,
+      [HARDEN_SOURCE, `ok-before-${ts}`, `ok-after-${ts}`],
+    );
+    expect(Number(before.rows[0]!.n)).toBe(2);
+  });
+});

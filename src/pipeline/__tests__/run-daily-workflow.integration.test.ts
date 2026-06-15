@@ -30,6 +30,8 @@ const { runDailyWorkflow, WorkflowAbortError } = await import(
 );
 // 产品段零件模块（供 vi.spyOn 注入塌缩/候选桩，验证日报产品段编排：塌缩只调一次、候选失败降级等）。
 const productDigestModule = await import('../product-digest.js');
+// 已校验 env（可变对象，非 frozen）：6.1 off-switch 用例临时改 SEMANTIC_DEDUP_ENABLED 后还原。
+const { env } = await import('../../config/env.js');
 
 const databaseUrl = process.env.DATABASE_URL;
 const redisUrl = process.env.REDIS_URL;
@@ -1328,5 +1330,301 @@ describe.skipIf(!canRun)('runDailyWorkflow 产品中文化编排（阶段 5.5，
       collapseSpy.mockRestore();
       await cleanupProducts();
     }
+  });
+});
+
+/**
+ * runDailyWorkflow 语义去重 + 知识库入库阶段接线集成测试
+ * （add-semantic-dedup-and-store-hardening，组 F，tasks 6.1/6.2，design D3/D7）。
+ *
+ * 验证编排接线（不重测组 D/E 内部，已各自单测/集成）：
+ * - 6.1 语义阶段在 collapse 之后、value-judge 之前运行：注入 embedManyFn 桩（恒同向量 → cosine_sim=1
+ *   > 0.88 → high-auto 合并）使两个**不同 dedup_key（不硬塌缩）但语义同**的事件合并为一条，
+ *   被吞者置 merged_into（tombstone），且 tombstone 不被 value-judge 复活、不进 Top N（组 4.7 闭环）。
+ * - 6.1 SEMANTIC_DEDUP_ENABLED=off → 跳过语义层（不调 embedManyFn、不合并），其余阶段照常推送。
+ * - 6.1 语义降级（embedding 调用抛错）不抛断、不进 judge/digest 熔断分母、不影响 outcome。
+ * - 6.2 KB 入库在 push 成功之后运行：注入 KB Agent 桩产出 long_term_value>=70 → 写入 kb_documents；
+ *   候选 = 当日 push success 且非 tombstone（被合并掉的事件不进 KB 候选）。
+ * - 6.2 KB 阶段异常不影响已成功的 push outcome（防御性 try/catch）。
+ *
+ * embedding 列为 vector(1536)：注入桩须返回 1536 维向量。kb_documents/kb_ingestion_records 不在
+ * 顶部 cleanup 的 TRUNCATE 内，故本块 beforeEach/afterEach 额外清理。推送注入 mock sender + 钉 channels。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 语义去重 + 知识库接线（组 F 6.1/6.2）', () => {
+  /** 1536 维同向量（任意两事件 cosine_sim=1 → high-auto 合并）。 */
+  const ONE_VEC = (() => {
+    const v = new Array<number>(1536).fill(0);
+    v[0] = 1;
+    return v;
+  })();
+
+  /** embedMany 桩：对每个文本返回同一单位向量（不触网）。 */
+  function embedManySame() {
+    return async (args: { values: string[] }) => ({
+      embeddings: args.values.map(() => [...ONE_VEC]),
+    });
+  }
+
+  /** embedMany 桩：恒抛错（模拟 embedding 外部调用失败 → 语义降级为不合并）。 */
+  function embedManyFail() {
+    return async () => {
+      throw new Error('embed boom');
+    };
+  }
+
+  /** KB Agent generateObject 桩：返回 long_term_value=opts.value 的合法元数据。 */
+  function kbAgentMock(opts: { value: number } = { value: 90 }) {
+    return async () => ({
+      object: {
+        kb_title: 'KB 标题',
+        summary_zh: '这是一段中文知识摘要。',
+        tags: ['AI'],
+        entities: ['OpenAI'],
+        source_urls: [],
+        event_date: '2000-01-01',
+        long_term_value: opts.value,
+      },
+    });
+  }
+
+  async function cleanupKb() {
+    if (!pool) return;
+    await pool.query(`TRUNCATE TABLE kb_documents, kb_ingestion_records RESTART IDENTITY`);
+  }
+
+  beforeEach(cleanupKb);
+  afterEach(cleanupKb);
+
+  it('6.1 语义阶段合并语义同事件（high-auto），被吞置 tombstone 不被 Top N 重复推送', async () => {
+    // 两条**不同 URL（不同 dedup_key → 不硬塌缩）**但语义同的新闻事件；embedManyFn 桩使二者 cosine_sim=1
+    // → high-auto 合并为一条。存活者 = first_seen_at 较早者（并列取 event_id 字典序小）。
+    const items = [
+      item({ id: 'sem-a', url: 'https://ex.com/sem-a', title: 'OpenAI ships GPT' }),
+      item({ id: 'sem-b', url: 'https://ex.com/sem-b', title: 'OpenAI releases GPT model' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      semantic: { embedding: { embed: { embedManyFn: embedManySame(), maxAttempts: 1 } } },
+      // KB Agent 注入桩（push 后跑 KB；此用例不主断 KB，仅避免默认 VITEST 守卫噪声）。
+      kb: { agent: { generateObjectFn: kbAgentMock(), maxAttempts: 1 }, embed: { embedManyFn: embedManySame(), maxAttempts: 1 } },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // 语义阶段确实跑了并合并一次（high-auto）。
+    expect(result.semantic).toBeDefined();
+    expect(result.semantic!.highAutoMerged).toBe(1);
+
+    // 库内：恰一条 tombstone（merged_into 非空）、一条存活者（merged_into 为 NULL）。
+    const { rows: evRows } = await pool!.query<{ event_id: string; merged_into: string | null }>(
+      `SELECT event_id, merged_into FROM ai_news_events ORDER BY first_seen_at`,
+    );
+    expect(evRows).toHaveLength(2);
+    const survivors = evRows.filter((r) => r.merged_into === null);
+    const tombstones = evRows.filter((r) => r.merged_into !== null);
+    expect(survivors).toHaveLength(1);
+    expect(tombstones).toHaveLength(1);
+    // tombstone 指向存活者。
+    expect(tombstones[0]!.merged_into).toBe(survivors[0]!.event_id);
+
+    // tombstone 不被 value-judge 复活 / 不进 Top N → 只推存活者一条（合并核心闭环，组 4.7）。
+    expect(result.topNCount).toBe(1);
+    expect(result.outcome).toBe('pushed');
+    expect(sender.calls).toBe(1);
+    // 仅存活者一条 event success（tombstone 不推）。
+    const { rows: pr } = await pool!.query<{ target_id: string }>(
+      `SELECT target_id FROM push_records WHERE target_type='event' AND status='success'`,
+    );
+    expect(pr).toHaveLength(1);
+    expect(pr[0]!.target_id).toBe(survivors[0]!.event_id);
+  });
+
+  it('6.1 SEMANTIC_DEDUP_ENABLED=off → 跳过语义层（不调 embed、不合并），其余阶段照常推送', async () => {
+    const saved = env.SEMANTIC_DEDUP_ENABLED;
+    env.SEMANTIC_DEDUP_ENABLED = 'off';
+    const embedSpy = vi.fn(embedManySame());
+    try {
+      const items = [
+        item({ id: 'off-a', url: 'https://ex.com/off-a', title: 'OpenAI ships GPT' }),
+        item({ id: 'off-b', url: 'https://ex.com/off-b', title: 'OpenAI releases GPT model' }),
+      ];
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        semantic: { embedding: { embed: { embedManyFn: embedSpy, maxAttempts: 1 } } },
+        kb: { agent: { generateObjectFn: kbAgentMock(), maxAttempts: 1 }, embed: { embedManyFn: embedManySame(), maxAttempts: 1 } },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+
+      // off：语义阶段整段跳过（result.semantic undefined、embed 桩未被调用、无合并）。
+      expect(result.semantic).toBeUndefined();
+      expect(embedSpy).not.toHaveBeenCalled();
+      // 两事件均无 embedding、均非 tombstone（纯硬去重态）。
+      const { rows } = await pool!.query<{ merged_into: string | null }>(
+        `SELECT merged_into FROM ai_news_events`,
+      );
+      expect(rows).toHaveLength(2);
+      expect(rows.every((r) => r.merged_into === null)).toBe(true);
+      // 其余阶段照常：两条独立事件都进 Top N、正常推送。
+      expect(result.topNCount).toBe(2);
+      expect(result.outcome).toBe('pushed');
+      expect(sender.calls).toBe(1);
+    } finally {
+      env.SEMANTIC_DEDUP_ENABLED = saved;
+    }
+  });
+
+  it('6.1 语义降级（embedding 抛错）不抛断、不进 judge/digest 熔断分母、不影响 outcome', async () => {
+    const items = [
+      item({ id: 'deg-a', url: 'https://ex.com/deg-a', title: 'News alpha' }),
+      item({ id: 'deg-b', url: 'https://ex.com/deg-b', title: 'News beta' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // embedding 恒抛错 → bootstrap 整批 failed、无合并；语义阶段不向上抛、不中止流水线。
+      semantic: { embedding: { embed: { embedManyFn: embedManyFail(), maxAttempts: 1 }, logError: () => {} } },
+      kb: { agent: { generateObjectFn: kbAgentMock(), maxAttempts: 1 }, embed: { embedManyFn: embedManySame(), maxAttempts: 1 } },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // 语义阶段跑了但全降级（embedding 失败 → 无合并），不抛断。
+    expect(result.semantic).toBeDefined();
+    expect(result.semantic!.highAutoMerged).toBe(0);
+    expect(result.semantic!.llmConfirmedMerged).toBe(0);
+    expect(result.semantic!.embedding.failed).toBeGreaterThan(0);
+    // 熔断分母只含 judge/digest，语义降级不计入：judge 全过、digest 全过。
+    expect(result.judge).toEqual({ processed: 2, degraded: 0 });
+    expect(result.digest.degraded).toBe(0);
+    // 不影响 outcome：两条独立事件照常推送。
+    expect(result.outcome).toBe('pushed');
+    expect(result.topNCount).toBe(2);
+    expect(sender.calls).toBe(1);
+  });
+
+  it('6.2 KB 入库在 push 之后运行：高价值已推送事件写入 kb_documents', async () => {
+    const items = [
+      item({ id: 'kb-a', url: 'https://ex.com/kb-a', title: 'High value AI news' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      semantic: { embedding: { embed: { embedManyFn: embedManySame(), maxAttempts: 1 } } },
+      // KB Agent 产 long_term_value=90 (>=70) → 入库；embedding 桩供 kb_documents 向量。
+      kb: { agent: { generateObjectFn: kbAgentMock({ value: 90 }), maxAttempts: 1 }, embed: { embedManyFn: embedManySame(), maxAttempts: 1 } },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    expect(result.outcome).toBe('pushed');
+    expect(result.kb).toBeDefined();
+    expect(result.kb!.candidates).toBe(1); // 当日唯一 push success 事件。
+    expect(result.kb!.ingested).toBe(1);
+
+    // kb_documents 落一行，target_id = 被推送事件、kb_provider='custom'。
+    const { rows: docs } = await pool!.query<{ target_id: string; long_term_value: number }>(
+      `SELECT target_id, long_term_value FROM kb_documents`,
+    );
+    expect(docs).toHaveLength(1);
+    expect(Number(docs[0]!.long_term_value)).toBe(90);
+    const { rows: recs } = await pool!.query<{ status: string; kb_provider: string }>(
+      `SELECT status, kb_provider FROM kb_ingestion_records`,
+    );
+    expect(recs).toHaveLength(1);
+    expect(recs[0]!.status).toBe('success');
+    expect(recs[0]!.kb_provider).toBe('custom');
+  });
+
+  it('6.2 低价值（long_term_value<70）被准入闸拦下、不写 kb_documents', async () => {
+    const items = [
+      item({ id: 'kb-low', url: 'https://ex.com/kb-low', title: 'Low value news' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      semantic: { embedding: { embed: { embedManyFn: embedManySame(), maxAttempts: 1 } } },
+      kb: { agent: { generateObjectFn: kbAgentMock({ value: 62 }), maxAttempts: 1 }, embed: { embedManyFn: embedManySame(), maxAttempts: 1 } },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    expect(result.outcome).toBe('pushed');
+    expect(result.kb!.candidates).toBe(1);
+    expect(result.kb!.gatedOut).toBe(1);
+    expect(result.kb!.ingested).toBe(0);
+    const { rows } = await pool!.query<{ n: string }>(`SELECT count(*) AS n FROM kb_documents`);
+    expect(Number(rows[0]!.n)).toBe(0);
+  });
+
+  it('6.2 KB 阶段异常不影响已成功的 push outcome（防御性兜底）', async () => {
+    // KB Agent 注入恒抛错的 generateObjectFn → runKbIngestion 内部逐条 agentFailed 隔离；
+    // 即便内部未隔离的异常，run-daily 外层 try/catch 也兜住，不影响已 pushed 的 outcome。
+    const items = [
+      item({ id: 'kb-err', url: 'https://ex.com/kb-err', title: 'KB error path news' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      semantic: { embedding: { embed: { embedManyFn: embedManySame(), maxAttempts: 1 } } },
+      kb: {
+        agent: {
+          generateObjectFn: async () => {
+            throw new Error('kb agent boom');
+          },
+          maxAttempts: 1,
+          logError: () => {},
+        },
+      },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // push 已成功：outcome 不被 KB 失败污染。
+    expect(result.outcome).toBe('pushed');
+    expect(sender.calls).toBe(1);
+    // KB 阶段跑了但无入库（Agent 全失败）。
+    expect(result.kb).toBeDefined();
+    expect(result.kb!.ingested).toBe(0);
+    const { rows } = await pool!.query<{ n: string }>(`SELECT count(*) AS n FROM kb_documents`);
+    expect(Number(rows[0]!.n)).toBe(0);
   });
 });

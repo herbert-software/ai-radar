@@ -5,8 +5,11 @@
  * 对齐 spec「ai_products 产品表可迁移」三场景：
  *  - 迁移落 ai_products 表与合并唯一约束（UNIQUE canonical_domain/github_repo/product_hunt_slug）
  *  - ai_products 迁移 forward-only 且幂等（既有迁移不重写、新增迁移可重跑无变化）
- *  - ai_products 不含向量列（零向量不变量）
+ *  - ai_products 不含向量列（P3 起向量能力仅及 ai_news_events / kb_documents，ai_products 仍无向量列）
  * 并覆盖「迁移落核心表与本期新增列」中 ai_news_events.judge_claimed_at 一项。
+ *
+ * 注：P3（add-semantic-dedup-and-store-hardening）解除「全库零向量」不变量、启用 vector 扩展，
+ * 故本套件不再断言扩展全局缺席——vector 扩展的正当启用由 p3-vector-kb-migration.integration.test.ts 断言。
  *
  * 依赖：需要一个已执行 `drizzle-kit migrate` 的本地 Postgres（compose 起的库即可），
  * 通过 DATABASE_URL 注入；不依赖真实外网、不依赖 LLM。
@@ -116,7 +119,10 @@ describe.skipIf(!databaseUrl)('ai_products 迁移落表与硬合并约束', () =
     }
   });
 
-  it('ai_products 不含任何向量列且未启用 vector 扩展（零向量不变量）', async () => {
+  // 注：P3（add-semantic-dedup-and-store-hardening）解除「全库零向量」不变量并启用 vector 扩展，
+  // 但向量能力仅及 ai_news_events / kb_documents——ai_products 仍不得含向量列（spec「ai_products 不含向量列」
+  // 修改后场景）。故此处只断言 ai_products 表无 vector 列，不再断言扩展全局缺席（扩展由 P3 迁移正当启用）。
+  it('ai_products 不含任何向量列（向量能力仅及 ai_news_events / kb_documents）', async () => {
     // 任何列的 udt_name/data_type 不得为 vector。
     const { rows: vectorCols } = await pool!.query<{ column_name: string }>(
       `
@@ -127,15 +133,6 @@ describe.skipIf(!databaseUrl)('ai_products 迁移落表与硬合并约束', () =
       `,
     );
     expect(vectorCols).toHaveLength(0);
-
-    // vector 扩展不得被本期迁移启用。
-    const { rows: ext } = await pool!.query<{ extname: string }>(
-      `SELECT extname FROM pg_extension WHERE extname = 'vector'`,
-    );
-    expect(
-      ext,
-      `本期不得启用 vector 扩展；实际 pg_extension 含 vector：${JSON.stringify(ext)}`,
-    ).toHaveLength(0);
   });
 
   it('ai_news_events 含 judge_claimed_at（并发评分原子 claim 列）', async () => {

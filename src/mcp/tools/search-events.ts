@@ -10,7 +10,7 @@
  * 向后兼容 content 文本。annotations.readOnlyHint:true。入参由 SDK 自动校验（handler 不再 parse）。
  */
 import { z } from 'zod';
-import { and, count, gte, ilike, lte, or, sql, type SQL } from 'drizzle-orm';
+import { and, count, gte, ilike, isNull, lte, or, sql, type SQL } from 'drizzle-orm';
 import { aiNewsEvents } from '../../db/schema.js';
 import { getContext } from '../context.js';
 import { escapeLike } from '../lib/sql-like.js';
@@ -71,7 +71,9 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
     const { db } = getContext();
 
     // 参数化过滤条件（全部经 drizzle 占位符，禁字符串拼 SQL）。
-    const conds: SQL[] = [];
+    // P3 tombstone 排除（合并核心闭环）：恒加 `merged_into IS NULL`，不向 agent/用户暴露被合并掉的
+    // 重复行（同时作用于下方 total count 与分页 rows 两查询，spec「tombstone 对所有下游消费者不可见」）。
+    const conds: SQL[] = [isNull(aiNewsEvents.mergedInto)];
     if (q !== undefined && q !== '') {
       const pattern = `%${escapeLike(q)}%`;
       const kw = or(

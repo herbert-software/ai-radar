@@ -24,7 +24,7 @@
  *
  * 边界：本模块只编排，调用各组已导出函数，不重写其内部逻辑、不改 schema。
  */
-import { inArray } from 'drizzle-orm';
+import { and, inArray, isNull } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, rawItems } from '../db/schema.js';
 import { env } from '../config/env.js';
@@ -34,6 +34,16 @@ import {
 } from '../collectors/index.js';
 import { createLookbackArxivCursorStore } from '../collectors/arxiv-cursor.js';
 import { collapseUncollapsedRawItems } from '../dedup/collapse.js';
+import {
+  semanticMergeEvents,
+  type SemanticMergeOptions,
+  type SemanticMergeResult,
+} from '../dedup/semantic-merge.js';
+import {
+  runKbIngestion,
+  type RunKbIngestionOptions,
+  type KbIngestionResult,
+} from '../kb/index.js';
 import {
   scoreUnscoredEvents,
   type ScoreEventsOptions,
@@ -152,6 +162,18 @@ export interface RunDailyWorkflowOptions {
    * 注入 mock Redis / TTL；不传则用真实 Redis（集成测有真实 Redis 可用）。
    */
   publishedAtLock?: AcquireAlertLockOptions;
+  /**
+   * 语义去重阶段选项（透传给 semanticMergeEvents 的 embedding / search / judge 桩；P3 语义层，6.1）。
+   * 注入 mock embedManyFn / generateObjectFn / 阈值等，使测试不触真实 embedding/LLM。
+   * `thisRoundEventIds` 由本编排在 collapse 之后注入（调用方无需自带）。
+   */
+  semantic?: Omit<SemanticMergeOptions, 'now' | 'thisRoundEventIds'>;
+  /**
+   * 知识库入库阶段选项（透传给 runKbIngestion 的 agent / embed / store 桩；P3 KB 层，6.2）。
+   * 注入 mock generateObjectFn / embedManyFn 等，使测试不触真实 LLM/embedding。
+   * `now` 由本编排注入（候选 push_date 与 push 阶段同源）。
+   */
+  kb?: Omit<RunKbIngestionOptions, 'now'>;
 }
 
 /** 工作流结束状态（供 worker / 可观测 / 测试断言）。 */
@@ -185,6 +207,18 @@ export interface RunDailyWorkflowResult {
    * 未执行回填（如未抢到锁提前返回）时为 undefined。
    */
   publishedAtBackfill?: BackfillPublishedAtResult;
+  /**
+   * 语义去重阶段统计（**仅可观测**，绝不影响 outcome / 熔断；P3 语义层，6.1）。
+   * 语义降级（embedding/检索/LLM judge/合并冲突）一律「不合并」、不抛断、不计入 judge/digest
+   * 熔断分母（语义层独立）。`SEMANTIC_DEDUP_ENABLED=off` 或阶段未执行（如未抢到锁提前返回）时为 undefined。
+   */
+  semantic?: SemanticMergeResult;
+  /**
+   * 知识库入库阶段统计（**仅可观测**，绝不影响 outcome / 熔断；P3 KB 层，6.2）。
+   * KB 阶段在 push 成功之后运行、永不向上抛、降级不计入 judge/digest 熔断分母。
+   * 未执行（如早退 / 未抢到锁）时为 undefined。
+   */
+  kb?: KbIngestionResult;
 }
 
 /** 把 Top N 选中事件补齐 canonical_url（供摘要降级回退到 URL）。 */
@@ -307,6 +341,60 @@ export async function runDailyWorkflow(
         newsProcessableCount,
       });
       alerted = true;
+    }
+
+    // ── 阶段 2.5：语义去重（P3 第三/四层 + 确定性合并，spec「语义去重仅作用于日报链新闻事件」/ design D3）。
+    //    **位置约束**：collapse 之后、value-judge 之前——合并必在 push **之前**完成（跨天幂等前提：
+    //    存活者通常为前日已 push 的较早事件，push 候选「从未以该 channel success」据此跳过、同事件次日不重推），
+    //    且被吞 tombstone 须在 value-judge 候选 SELECT 前置就位才不会被复活评分（tombstone 排除已由组 4.7 收口）。
+    //    **仅日报链调用**：实时告警链（alert-scan.ts）恒走硬去重快路径、不调本阶段（6.3）。
+    //    **SEMANTIC_DEDUP_ENABLED 开关**：为 'off' 时整阶段跳过，退回纯硬去重态、其余阶段照常（spec「开关关闭退回硬去重」）。
+    //    **降级安全 + 不进熔断分母**：semanticMergeEvents 内部逐事件 catch（embedding/检索/LLM judge/合并冲突
+    //    一律「不合并」、保留独立、不抛断），故本编排对语义阶段不构造 StageDegrade、不传 stageShouldAbort、
+    //    绝不进 DEGRADE_ABORT_RATIO 分母（熔断分母仍只含 judge + digest 两阶段，语义层独立）；统计仅记日志（可观测）。
+    let semanticResult: SemanticMergeResult | undefined;
+    if (env.SEMANTIC_DEDUP_ENABLED === 'on') {
+      // 嵌入顺序须「先嵌本轮新事件」（保今日新事件本轮即可作查询对象，spec「嵌入顺序」）：把本轮 collapse
+      // 可处理 outcomes 的 dedup_key 解析为「仍 embedding IS NULL 且非 tombstone」的事件 id 集传入。
+      // collapse outcomes 不直接给 event_id（仅 dedup_key），故经 dedup_key 反查；空集时 bootstrap 退化为
+      // 纯 first_seen_at 升序（仍正确，只是不保证本轮新事件优先嵌入）。
+      const thisRoundDedupKeys = [
+        ...new Set(
+          outcomes
+            .filter((o) => !o.unprocessable && o.dedupKey !== null)
+            .map((o) => o.dedupKey as string),
+        ),
+      ];
+      let thisRoundEventIds: string[] = [];
+      if (thisRoundDedupKeys.length > 0) {
+        const rows = await dbh
+          .select({ eventId: aiNewsEvents.eventId })
+          .from(aiNewsEvents)
+          .where(
+            and(
+              inArray(aiNewsEvents.dedupKey, thisRoundDedupKeys),
+              isNull(aiNewsEvents.embedding),
+              isNull(aiNewsEvents.mergedInto),
+            ),
+          );
+        thisRoundEventIds = rows.map((r) => r.eventId);
+      }
+      semanticResult = await semanticMergeEvents(
+        {
+          now,
+          ...options.semantic,
+          ...(thisRoundEventIds.length > 0 ? { thisRoundEventIds } : {}),
+        },
+        dbh,
+      );
+      console.error(
+        `[pipeline] 语义去重: 处理 ${semanticResult.processed} 条, ` +
+          `高相似合并 ${semanticResult.highAutoMerged} 条, LLM 确认合并 ${semanticResult.llmConfirmedMerged} 条, ` +
+          `LLM 不合并 ${semanticResult.llmNotMerged} 条, 异常跳过 ${semanticResult.skippedError} 条, ` +
+          `embedding(候选 ${semanticResult.embedding.candidates}/嵌入 ${semanticResult.embedding.embedded}/失败 ${semanticResult.embedding.failed})（不计入熔断）`,
+      );
+    } else {
+      console.error('[pipeline] 语义去重: SEMANTIC_DEDUP_ENABLED=off，跳过语义层（退回纯硬去重）');
     }
 
     // ── 阶段 3：Value Judge 逐条（只送判未评分事件）。单条降级整批继续（G3 内已容错）。
@@ -520,6 +608,7 @@ export async function runDailyWorkflow(
         topNCount: topN.length,
         alerted,
         publishedAtBackfill: backfillStats,
+        ...(semanticResult ? { semantic: semanticResult } : {}),
       };
     }
 
@@ -594,6 +683,30 @@ export async function runDailyWorkflow(
       );
     }
 
+    // ── 阶段 7：知识库入库（P3 KB 层，spec「知识库准入闸只入精选」/ design D7，6.2）。
+    //    **位置约束**：必在 push **成功之后**（无 failedChannels 才到此）——候选 = 当日 `push_records.status
+    //    ='success'` 且 `merged_into IS NULL`（非 tombstone）的 event（runKbIngestion 内部据 now→push_date
+    //    选候选）。对齐 config 流水线 `Push → KB Ingestion` 顺序，控成本（只入已推送高价值事件）。
+    //    **永不向上抛 + 不进熔断分母**：KB 阶段失败绝不污染既有 outcome（已 pushed）/不触发既有熔断/不重试整 job
+    //    （push 已 success，整 job 抛错会致 BullMQ 重跑日报、徒增重复 push 风险）。故整段包 try/catch：
+    //    runKbIngestion 内部已逐条隔离（Agent/embed/写入失败跳过该条、认领状态感知幂等），此处再兜一层
+    //    防御性 catch（如选候选 SELECT 异常），任何异常仅记日志、不抛断、不影响 outcome（语义/KB 层独立于熔断）。
+    let kbResult: KbIngestionResult | undefined;
+    try {
+      kbResult = await runKbIngestion({ now, ...options.kb }, dbh);
+      console.error(
+        `[pipeline] 知识库入库: 候选 ${kbResult.candidates} 条, Agent 成功 ${kbResult.agentOk}/失败 ${kbResult.agentFailed}, ` +
+          `准入闸拦下 ${kbResult.gatedOut} 条, 入库 ${kbResult.ingested} 条, ` +
+          `认领跳过 ${kbResult.skippedClaimed} 条, 写入失败 ${kbResult.storeFailed} 条（不计入熔断、不阻塞 outcome）`,
+      );
+    } catch (error) {
+      // 防御性兜底：KB 阶段任何未被内部隔离的异常都不向上抛、不污染已成功的 push outcome。
+      console.error(
+        `[pipeline] 知识库入库阶段异常（已隔离，不影响日报推送 outcome）`,
+        error,
+      );
+    }
+
     return {
       // 所有通道均非 failed：有任一 'sent' → pushed；否则（全 skipped，如各通道今日已 success）
       // → skipped-no-candidates。
@@ -606,6 +719,8 @@ export async function runDailyWorkflow(
       topNCount: topN.length,
       alerted,
       publishedAtBackfill: backfillStats,
+      ...(semanticResult ? { semantic: semanticResult } : {}),
+      ...(kbResult ? { kb: kbResult } : {}),
     };
   } finally {
     await lock.release();

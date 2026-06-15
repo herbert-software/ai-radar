@@ -173,6 +173,9 @@ export async function backfillPublishedAt(
       and(
         isNull(aiNewsEvents.publishedAt),
         scopePredicate(options.scope),
+        // P3 tombstone 排除（合并核心闭环）：候选 SELECT 加 `merged_into IS NULL`——不浪费推断预算在
+        // 被吞 tombstone 上、不在 tombstone 落 published_at（spec「tombstone 对所有下游消费者不可见」）。
+        isNull(aiNewsEvents.mergedInto),
         lowerBound !== null
           ? gte(aiNewsEvents.firstSeenAt, lowerBound)
           : undefined,
@@ -243,6 +246,10 @@ export async function backfillPublishedAt(
             and(
               eq(aiNewsEvents.eventId, candidate.eventId),
               isNull(aiNewsEvents.publishedAt),
+              // P3 tombstone 排除（合并核心闭环）：回填 CAS 自身 WHERE 加 `merged_into IS NULL`——同
+              // value-judge 的 TOCTOU 理由（告警链 backfillPublishedAt 不持日报锁，SELECT→CAS 分离，
+              // 间隙日报合并可把本事件置 tombstone）。谓词落 CAS 才使「tombstone 绝不被回填复活」成立。
+              isNull(aiNewsEvents.mergedInto),
               sql`${new Date(inferred)} <= now()`,
             ),
           )

@@ -77,6 +77,9 @@ async function handler(): Promise<CallToolResult> {
           and ${pushRecords.targetId} = ${aiNewsEvents.eventId}
           and ${pushRecords.status} = 'success'`,
       )
+      // P3 tombstone 排除（合并核心闭环）：不因 tombstone 虚增「事件数」（被合并掉的事件不计入
+      // count(distinct event_id)，spec「tombstone 对所有下游消费者不可见」）。
+      .where(sql`${aiNewsEvents.mergedInto} IS NULL`)
       .groupBy(rawItems.source);
 
     // 3. 以 source 为键合并两组统计（采集统计是全集，事件统计左并入）。

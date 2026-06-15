@@ -258,6 +258,9 @@ export async function selectWeeklyEvents(
         lt(aiNewsEvents.firstSeenAt, anchor.windowEnd),
         // 下限闸：NULL importance 被 gte 自然排除。
         gte(aiNewsEvents.importanceScore, String(importanceFloor)),
+        // P3 tombstone 排除（合并核心闭环）：周报聚合不重复计数被合并掉的事件（spec「tombstone 对
+        // 所有下游消费者不可见」）。
+        isNull(aiNewsEvents.mergedInto),
       ),
     );
 

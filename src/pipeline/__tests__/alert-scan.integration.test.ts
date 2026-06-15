@@ -14,7 +14,7 @@
  *
  * 缺 DATABASE_URL 时整套件 skip。每个用例用唯一 source/event 前缀隔离 + 全表清理本套件行。
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import * as schema from '../../db/schema.js';
@@ -31,6 +31,9 @@ process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 
 const { runAlertScan, selectAlertCandidates } = await import('../alert-scan.js');
+// 6.3：语义合并 / KB 入库模块，供 vi.spyOn 断言**告警链不调用**它们（保持硬去重快路径）。
+const semanticMergeModule = await import('../../dedup/semantic-merge.js');
+const kbModule = await import('../../kb/index.js');
 
 const databaseUrl = process.env.DATABASE_URL;
 const SOURCE = 'alert-scan-itest';
@@ -211,6 +214,32 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.channel).toBe('telegram');
     expect(rows[0]!.status).toBe('success');
+  });
+
+  it('6.3 告警链不触发语义合并 / KB 入库（保持硬去重快路径，仅日报链做语义层）', async () => {
+    // spy 语义合并 / KB 入库编排入口：跑一次产生并处理事件的完整 alert-scan（含 collapse + dispatch），
+    // 断言二者**零调用**——语义去重与 KB 入库仅日报链执行，告警链恒走硬去重快路径（spec / design D3）。
+    const semanticSpy = vi.spyOn(semanticMergeModule, 'semanticMergeEvents');
+    const kbSpy = vi.spyOn(kbModule, 'runKbIngestion');
+    try {
+      const sender = okSender();
+      const result = await runAlertScan(
+        opts({
+          collect: { collectors: collectorsReturning([rssItem('Alert no semantic', 'https://x.com/ns')]) },
+          judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+          senders: { telegram: sender },
+          threshold: 85,
+        }),
+      );
+      // 告警链照常完成（采集→塌缩→评分→阈值→告警），但全程不调语义合并 / KB。
+      expect(result.alertCandidateCount).toBe(1);
+      expect(sender.calls).toBe(1);
+      expect(semanticSpy).not.toHaveBeenCalled();
+      expect(kbSpy).not.toHaveBeenCalled();
+    } finally {
+      semanticSpy.mockRestore();
+      kbSpy.mockRestore();
+    }
   });
 
   it('Model B：channel-agnostic 选一次，同一告警事件发放给所有已配置通道（telegram + feishu）', async () => {

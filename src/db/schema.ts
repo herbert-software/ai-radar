@@ -1,24 +1,29 @@
 /**
- * Drizzle schema —— 三张承重表（P0 建立，P1 演进）。
+ * Drizzle schema —— 承重表（P0 建立，P1/P2 演进，P3 补向量与知识库）。
  *
- * 对齐 QA.md §8.1 / §8.2 / §8.6 的 DDL，并叠加 P1 的硬去重 / 推送链路所需列
+ * 对齐 QA.md §8.1 / §8.2 / §8.6 / §8.7 的 DDL，并叠加 P1 的硬去重 / 推送链路所需列
  * （platform-foundation MODIFIED：event_id surrogate key、dedup_key、
  * representative_raw_item_id、published_at、title_hash、unprocessable）。
  *
- * 零向量不变量（design / spec「PostgreSQL 使用 pgvector 镜像但不启用向量能力」）：
- * 本文件禁止任何 vector 列、禁止 pgvector 相关 import / CREATE EXTENSION。
+ * 向量能力（P3 起按需启用，design「迁移计划」/ spec「P3 向量与知识库 Schema 可迁移」）：
+ * 仅 `ai_news_events`（语义去重 embedding）与 `kb_documents`（知识库检索 embedding）含
+ * `vector(1536)` 列；`ai_products` 等其余表仍禁止 vector 列（产品语义合并不在 P3 范围）。
+ * 向量维度钉死 1536（所选默认模型 `text-embedding-3-small`）——换不同维度模型属新的
+ * forward-only 迁移，不在本期热切。`CREATE EXTENSION IF NOT EXISTS vector;` 由 P3 迁移落。
  *
  * 受限表集不变量（spec「数据库 Schema 可迁移」/「ai_products 产品表可迁移」）：
- * P2 解禁并新建 `ai_products`（产品发现硬规则合并所需）；仍禁止定义其余五张表
- * （item_event_relations / item_product_relations / kb_ingestion_records /
- * ai_tools / task_patterns）——事件-产品关系表留待 P3 语义合并、工具/任务模式表
- * 留待 P5 顾问期提案再加。
+ * P2 解禁并新建 `ai_products`（产品发现硬规则合并所需）；P3 解禁并新建 `kb_documents` /
+ * `kb_ingestion_records`（本地表知识库 + 入库幂等日志）；仍禁止定义其余三张表
+ * （item_event_relations / item_product_relations / ai_tools / task_patterns）——
+ * 事件-产品关系表 P3 改用 `ai_news_events.merged_into` tombstone 替代、不建关系表；
+ * 工具/任务模式表留待 P5 顾问期提案再加。
  */
 import { sql } from 'drizzle-orm';
 import {
   bigint,
   bigserial,
   boolean,
+  customType,
   date,
   integer,
   jsonb,
@@ -29,6 +34,35 @@ import {
   unique,
   varchar,
 } from 'drizzle-orm/pg-core';
+
+/**
+ * pgvector `vector(N)` 列类型（drizzle 无内置，经 customType 自定义；不引入 `pgvector` npm 包）。
+ *
+ * - DDL：`drizzle-kit generate` 据 `dataType()` 输出 `vector(1536)`，与 pgvector 的定长向量列一致。
+ * - 维度钉死 1536（design D1）：构造时传 `{ dimensions: 1536 }`，换维度=新迁移。
+ * - driver 值映射：写入把 `number[]` 序列化为 `[v1,v2,...]` 文本（pgvector 接受的字面量）；读取
+ *   时 driver 回传 pgvector 的文本表示（如 `[0.1,0.2,...]`），`fromDriver` 解析回 `number[]`，使
+ *   `data: number[]` 的声明类型与运行期值一致（消费方拿到的恒为数组，不是 `[...]` 字符串）。
+ * `CREATE EXTENSION vector` 不由列类型负责——在迁移 SQL 顶部显式 `CREATE EXTENSION IF NOT EXISTS vector;`。
+ */
+const vector = customType<{
+  data: number[];
+  driverData: string;
+  config: { dimensions: number };
+}>({
+  dataType(config) {
+    return `vector(${config?.dimensions ?? 1536})`;
+  },
+  toDriver(value: number[]): string {
+    return `[${value.join(',')}]`;
+  },
+  fromDriver(value: string): number[] {
+    // pgvector 文本表示 `[v1,v2,...]` → number[]。去首尾括号后按逗号切分；空向量返回 []。
+    const inner = value.replace(/^\[/, '').replace(/\]$/, '');
+    if (inner.length === 0) return [];
+    return inner.split(',').map((s) => Number(s));
+  },
+});
 
 /**
  * 原始信息表（QA.md §8.1）。
@@ -123,6 +157,13 @@ export const aiNewsEvents = pgTable('ai_news_events', {
   // RETURNING` 原子 claim，仅 claim 成功者评分——防双评分覆写。超时回收阈值 T>L+W 使
   // claim 后崩溃的事件可被后续运行重新 claim（僵尸 claim 回收）。本组只建列，claim 逻辑后续组。
   judgeClaimedAt: timestamp('judge_claimed_at', { withTimezone: true }),
+  // P3 语义去重 embedding（可空，design D1/D2）：value-judge/digest 之前由语义层生成并落库，
+  // 维度钉死 1536（text-embedding-3-small）。NULL = 尚未嵌入或空文本兜底跳过（保留独立、不合并）。
+  embedding: vector('embedding', { dimensions: 1536 }),
+  // P3 语义合并 tombstone 指针（可空，design D5/D5a）：被吞事件置 merged_into=存活 event_id，
+  // 不物理删除——保留 dedup_key 唯一占位、可观测可回溯。所有「把行当独立事件用」的下游读点
+  // 必须排除 merged_into IS NOT NULL（spec「tombstone 对所有下游消费者不可见」），否则被吞事件复活重推。
+  mergedInto: varchar('merged_into', { length: 128 }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 }, (table) => [
@@ -172,7 +213,8 @@ export const pushRecords = pgTable(
  * 三者各自独立，作为塌缩 `ON CONFLICT` 冲突目标；NULL 键不参与约束（PG UNIQUE 放行多 NULL 行）。
  * 合并由 DB 唯一约束 + 确定性程序保障，绝不交 LLM。
  *
- * 零向量不变量：本表禁止任何 vector 列、禁止 CREATE EXTENSION vector（语义能力留 P3）。
+ * ai_products 无向量不变量：P3 已启用 pgvector，但向量能力仅及 ai_news_events / kb_documents——
+ * 本表仍禁止任何 vector 列（产品语义合并不在 P3 范围，仍用硬规则合并，spec「ai_products 不含向量列」）。
  *
  * 本期富化列（QA §8.3 的 vendor/category/score 等）留 P5 顾问期 forward-only 追加，
  * 本期仅建硬合并/推送所需列。representative_raw_item_id 为 P2 新增过渡列（QA §8.3 DDL 未列，
@@ -212,5 +254,66 @@ export const aiProducts = pgTable(
     unique('ai_products_canonical_domain_key').on(table.canonicalDomain),
     unique('ai_products_github_repo_key').on(table.githubRepo),
     unique('ai_products_product_hunt_slug_key').on(table.productHuntSlug),
+  ],
+);
+
+/**
+ * 本地表知识库（P3 新增，design D7 / spec「本地表知识库存储」）。
+ * 仅精选内容入库（准入闸 `long_term_value >= 70`，知识库不是垃圾桶）；候选 = 当日推送 success
+ * 且非 tombstone（`merged_into IS NULL`）的事件。入库由程序执行（LLM 仅产入库元数据）。
+ *
+ * 本表自身**无业务唯一约束**——幂等由 `kb_ingestion_records` 的 UNIQUE(target_type,target_id,kb_provider)
+ * 保障（两表同事务写入、状态感知认领，见 spec「知识库入库幂等」）。`id` 由 kb_ingestion_records.kb_document_id 回指。
+ * `embedding vector(1536)` 供未来检索（本期不建 HNSW 索引，数据量上来再单独优化，design D4 同理）。
+ */
+export const kbDocuments = pgTable('kb_documents', {
+  id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+  // 目标实体类型/标识（与 push_records / kb_ingestion_records 同口径）：本期仅事件入库（target_type='event'）。
+  targetType: varchar('target_type', { length: 32 }).notNull(),
+  targetId: varchar('target_id', { length: 128 }).notNull(),
+  kbTitle: text('kb_title'),
+  summaryZh: text('summary_zh'),
+  // 标签/实体/来源 URL：知识摘要 Agent 产出的结构化数组，jsonb 存储。
+  tags: jsonb('tags'),
+  entities: jsonb('entities'),
+  sourceUrls: jsonb('source_urls'),
+  eventDate: date('event_date'),
+  // 长期价值分（准入闸已在程序层过滤 >= 70；列保留全量值供审计）。
+  longTermValue: integer('long_term_value'),
+  // 知识库检索 embedding（可空，供未来检索）；维度钉死 1536，同 ai_news_events.embedding。
+  embedding: vector('embedding', { dimensions: 1536 }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+});
+
+/**
+ * 知识库入库记录表（QA.md §8.7，P3 新增 / spec「知识库入库幂等」）。
+ * `UNIQUE(target_type, target_id, kb_provider)` 保障同一目标对同一 provider **最终只成功一次**。
+ *
+ * 状态感知认领（design D7 / spec）：`INSERT(pending) ON CONFLICT DO UPDATE SET status='pending'
+ * WHERE status<>'success' RETURNING`——success 跳过、failed/僵尸 pending 重新抢到重试；**绝不用
+ * DO NOTHING**（否则 failed 永久挡死重试）。认领成功后「插 kb_documents + 置 success + 回指
+ * kb_document_id」同一事务（本组只建 schema，认领/事务逻辑由组 E 实现）。
+ * `kb_provider='custom'` 指向本地表 kb_documents；`kb_document_id` 回指 kb_documents.id（文本，QA §8.7）。
+ */
+export const kbIngestionRecords = pgTable(
+  'kb_ingestion_records',
+  {
+    id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+    targetType: varchar('target_type', { length: 32 }).notNull(),
+    targetId: varchar('target_id', { length: 128 }).notNull(),
+    // dify/ragflow/custom（QA §8.7）：本期仅 'custom' 接线，其余取值预留不接。
+    kbProvider: varchar('kb_provider', { length: 64 }).notNull(),
+    // 回指 kb_documents.id（QA §8.7 为 VARCHAR(255)，沿用原 DDL 类型，不改既有列语义）。
+    kbDocumentId: varchar('kb_document_id', { length: 255 }),
+    status: varchar('status', { length: 32 }).notNull(),
+    ingestedAt: timestamp('ingested_at'),
+    errorMessage: text('error_message'),
+  },
+  (table) => [
+    unique('kb_ingestion_records_target_type_target_id_kb_provider_key').on(
+      table.targetType,
+      table.targetId,
+      table.kbProvider,
+    ),
   ],
 );

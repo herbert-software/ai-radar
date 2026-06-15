@@ -12,7 +12,7 @@
  *
  * 本骨架由组 A 建；handler 实现由组 C 填（暂返 NOT_IMPLEMENTED 占位）。
  */
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { aiNewsEvents } from '../../db/schema.js';
 import { getContext } from '../context.js';
@@ -44,15 +44,20 @@ export const markEventTool: McpToolDescriptor = {
     const { db } = getContext();
     // 确定性 DB 写：仅置 should_push=false（ai_news_events 无 metadata 列、reason 不入库）。
     // `.returning` 取受影响行，用以区分命中/未命中（命中 0 行 = eventId 不存在）。
+    // P3 tombstone 排除（合并核心闭环）：WHERE 加 `merged_into IS NULL`——命中 tombstone（被合并掉的
+    // 死 event_id）时 0 行受影响、走下方「未找到」分支，不在 tombstone 上静默落写（spec「tombstone 对
+    // 所有下游消费者不可见」：mark 命中 tombstone 走 updated.length===0 的「未找到」分支）。
     const updated = await db
       .update(aiNewsEvents)
       .set({ shouldPush: false })
-      .where(eq(aiNewsEvents.eventId, eventId))
+      .where(and(eq(aiNewsEvents.eventId, eventId), isNull(aiNewsEvents.mergedInto)))
       .returning({ eventId: aiNewsEvents.eventId });
 
     if (updated.length === 0) {
-      // 不静默成功：目标不存在是业务可恢复错误 → isError（不 throw 断连）。
-      return toIsError(`事件不存在：event_id=${eventId}，未做任何变更。`);
+      // 不静默成功：目标不存在（或为已被合并的 tombstone）是业务可恢复错误 → isError（不 throw 断连）。
+      return toIsError(
+        `事件不存在或已被合并：event_id=${eventId}，未做任何变更。`,
+      );
     }
 
     // reason 仅记 stderr 日志（不入 DB；stdout 是 JSON-RPC 专用通道，禁污染）。
