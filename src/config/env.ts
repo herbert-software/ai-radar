@@ -321,6 +321,33 @@ const envSchema = z.object({
   // 写分提交延迟上界 W（毫秒）：LLM 返回后写 *_score / 事务提交的延迟上界（含 DB 写排队与进程暂停容限）。
   // 仅用于启动期校验 T > L + W；默认 60000。
   JUDGE_WRITE_BUDGET_MS: z.coerce.number().int().positive().default(60000),
+
+  // --- P3 语义去重 + 知识库 embedding（add-semantic-dedup-and-store-hardening，design D1/D2/D4）---
+  // embedding 模型名（经 Vercel AI SDK embed/embedMany 调用）。默认 text-embedding-3-small（1536 维、
+  // 多语种含中英文、便宜）。**注意**：向量列维度在迁移中钉死 1536（design D1），换不同维度模型属新的
+  // forward-only 迁移、非热切——改本值不会自动重建向量列，须配套迁移，否则维度不匹配落库报错。
+  EMBEDDING_MODEL: z.string().min(1).default('text-embedding-3-small'),
+  // 构造 embedding 文本时代表 raw_item content 摘录的截断字符数（design D2）。
+  // embedding 文本 = representative_title ‖ content 摘录（截断到此值）；防超长文本撑爆 token/调用。
+  // 非法值（NaN/负/0）启动即报错（守 env 不变量，裸读 process.env 会绕过校验）。
+  EMBEDDING_TEXT_MAX_CHARS: z.coerce.number().int().positive().default(2000),
+  // 候选窗口 bootstrap 单轮 backlog 上限（design D3 / spec「候选窗口 bootstrap」）：单轮日报最多为多少条
+  // embedding IS NULL 的窗内事件补嵌（先本轮新事件、再 first_seen_at 升序填补历史存活者）；余量后续轮次续嵌。
+  // 防 P3 首部署一次性嵌满 14 天 backlog 撑爆 embedding 调用 / 拖住日报单例锁。默认 500；非法值启动即报错。
+  EMBEDDING_BOOTSTRAP_MAX_PER_RUN: z.coerce.number().int().positive().default(500),
+  // 语义去重高相似度自动合并阈值（design D4）：cosine_sim > 此值 → 直接判同事件、合并（跳过 LLM）。
+  // 默认 0.88（QA §9.2 起点，非实测调优）。范围 [0,1]；越界/NaN 启动即报错。
+  SEMANTIC_DEDUP_HIGH: z.coerce.number().min(0).max(1).default(0.88),
+  // 语义去重 LLM 二次判断下界阈值（design D4）：SEMANTIC_DEDUP_LLM < sim <= SEMANTIC_DEDUP_HIGH → 交 LLM；
+  // sim <= 此值 → 不合并。默认 0.82（QA §9.2 起点）。范围 [0,1]；越界/NaN 启动即报错。
+  // 跨字段不变量（见下方 superRefine）：必须 SEMANTIC_DEDUP_LLM < SEMANTIC_DEDUP_HIGH，否则灰区为空/反转。
+  SEMANTIC_DEDUP_LLM: z.coerce.number().min(0).max(1).default(0.82),
+  // 语义去重候选时间窗（天数，design D4）：仅在 first_seen_at >= now()-此值 的窗内检索 KNN 候选 + 补嵌。
+  // 默认 14（跨天去重需比历史存活者）。非法值（NaN/负/0）启动即报错。
+  SEMANTIC_WINDOW_DAYS: z.coerce.number().int().positive().default(14),
+  // 语义去重总开关（design「迁移计划·回滚」）：'on' 启用语义合并阶段；'off' 跳过、退回硬去重态。
+  // 默认 'on'。仅日报链调用语义层（告警链恒走硬去重快路径，不受此开关影响）。
+  SEMANTIC_DEDUP_ENABLED: z.enum(['on', 'off']).default('on'),
 })
   // 飞书配置完整性跨字段校验（feishu-push 5.1）：
   // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；
@@ -357,6 +384,22 @@ const envSchema = z.object({
           `必须严格大于 L + W = LLM_TIMEOUT_MS(${data.LLM_TIMEOUT_MS}) + JUDGE_WRITE_BUDGET_MS(${data.JUDGE_WRITE_BUDGET_MS}) = ${minReclaim}ms。` +
           `否则正在合法评分/写分（总时长 < L+W）的事件会被另一链路误回收 → 双评分覆写。` +
           `请上调 JUDGE_CLAIM_RECLAIM_MS 到 > ${minReclaim}。`,
+      });
+    }
+  })
+  // 语义去重阈值序不变量（add-semantic-dedup-and-store-hardening，design D4）：
+  // 灰区 = (SEMANTIC_DEDUP_LLM, SEMANTIC_DEDUP_HIGH]，必须 SEMANTIC_DEDUP_LLM < SEMANTIC_DEDUP_HIGH。
+  // 若 LLM >= HIGH，灰区为空或反转——0.82–0.88 的「交 LLM 二次判断」档位失效，分流语义破坏。
+  // 启动期快速失败，禁止配出阈值倒挂。
+  .superRefine((data, ctx) => {
+    if (data.SEMANTIC_DEDUP_LLM >= data.SEMANTIC_DEDUP_HIGH) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SEMANTIC_DEDUP_LLM'],
+        message:
+          `语义去重阈值倒挂：SEMANTIC_DEDUP_LLM(${data.SEMANTIC_DEDUP_LLM}) 必须严格小于 ` +
+          `SEMANTIC_DEDUP_HIGH(${data.SEMANTIC_DEDUP_HIGH})——LLM 灰区为 (LLM, HIGH]，` +
+          `两者相等或倒挂会使「0.82–0.88 交 LLM 二次判断」档位为空，分流失效。`,
       });
     }
   });

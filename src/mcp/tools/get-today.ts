@@ -14,7 +14,7 @@
  * 入参由 SDK 依 inputSchema 自动校验（task 5.1，handler 内不再 parse）。
  */
 import { z } from 'zod';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { channelEnum, TARGET_TYPE, type Channel } from '../../push/targets.js';
 import { aiNewsEvents, aiProducts, pushRecords } from '../../db/schema.js';
 import { getContext } from '../context.js';
@@ -134,7 +134,10 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
           representativeTitle: aiNewsEvents.representativeTitle,
         })
         .from(aiNewsEvents)
-        .where(inArray(aiNewsEvents.eventId, eventIds));
+        // P3 tombstone 排除（合并核心闭环，纵深防御）：今日 push_date 的 success 集本只含存活者
+        // （tombstone 已被 value-judge/Top N 排除、当日绝不新推，spec 传递性安全注），但 tombstone 可能
+        // 保留被合并前某历史 push_date 的 success——故仍显式排除，绝不向 agent/用户还原重复 tombstone 行。
+        .where(and(inArray(aiNewsEvents.eventId, eventIds), isNull(aiNewsEvents.mergedInto)));
       const urlMap = await loadCanonicalUrls(
         db,
         rows.map((r) => r.eventId),

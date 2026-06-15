@@ -29,7 +29,7 @@
  * - importance 下限闸（env.IMPORTANCE_FLOOR）：低于阈值不入选，宁可少于 N 条也不凑数。
  * - 排序与名单由程序定，**不交给 LLM**。
  */
-import { and, eq, gte, lte, sql } from 'drizzle-orm';
+import { and, eq, gte, isNull, lte, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env } from '../config/env.js';
@@ -248,6 +248,9 @@ export async function selectTopN(
         lte(aiNewsEvents.publishedAt, now),
         // importance 下限闸：低于阈值不入选（宁缺勿凑）。NULL importance 被 gte 自然排除。
         gte(aiNewsEvents.importanceScore, String(importanceFloor)),
+        // P3 tombstone 排除（合并核心闭环）：被吞 tombstone 绝不入选推送——否则与存活者重复推送同一
+        // 现实事件，使合并比不合并更糟（spec「tombstone 对所有下游消费者不可见」）。
+        isNull(aiNewsEvents.mergedInto),
         notDeliveredToAllChannels,
       ),
     );

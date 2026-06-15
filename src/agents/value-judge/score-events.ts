@@ -111,6 +111,10 @@ export async function claimEventForJudging(
       and(
         eq(aiNewsEvents.eventId, eventId),
         isNull(aiNewsEvents.importanceScore),
+        // P3 tombstone 排除（合并核心闭环）：claim CAS 自身 WHERE 必须加 `merged_into IS NULL`——
+        // 告警链 scoreUnscoredEvents 不持日报锁，SELECT→claim 分离，间隙日报合并可把本事件置 tombstone
+        // （TOCTOU）。仅 SELECT 收口不充分；谓词落 claim CAS 才使「tombstone 绝不被 claim/复活」成立。
+        isNull(aiNewsEvents.mergedInto),
         or(
           isNull(aiNewsEvents.judgeClaimedAt),
           lt(aiNewsEvents.judgeClaimedAt, reclaimCutoff),
@@ -172,7 +176,10 @@ export async function scoreUnscoredEvents(
       representativeTitle: aiNewsEvents.representativeTitle,
     })
     .from(aiNewsEvents)
-    .where(isNull(aiNewsEvents.importanceScore));
+    // P3 tombstone 排除（合并核心闭环）：候选 SELECT 加 `merged_into IS NULL`——被吞 tombstone（评分
+    // 前 importance_score 为 NULL）若不排除会被 value-judge 重新选中评分「复活」、进而被 Top N 选中独立
+    // 推送，使合并比不合并更糟（spec「tombstone 对所有下游消费者不可见」）。claim/评分写 CAS 另各自加。
+    .where(and(isNull(aiNewsEvents.importanceScore), isNull(aiNewsEvents.mergedInto)));
 
   let scored = 0;
   let degradedCount = 0;
@@ -204,6 +211,9 @@ export async function scoreUnscoredEvents(
 
       // 关键不变量：UPDATE ... WHERE event_id = ?，set 仅含 *_score 与 should_push。
       // 绝不带身份/代表/排序列，绝不用 INSERT ON CONFLICT。
+      // P3 tombstone 排除（合并核心闭环）：评分写 CAS 自身 WHERE 加 `merged_into IS NULL`——claim 成功
+      // 后、评分写前仍存在链内二次 TOCTOU（日报合并可在此间隙把已 claim 的事件置 tombstone）。谓词落
+      // 评分写 CAS 才使「tombstone 绝不被写 *_score/should_push 复活」成立（命中 0 行=无害空写、跳过）。
       await dbh
         .update(aiNewsEvents)
         .set({
@@ -213,7 +223,7 @@ export async function scoreUnscoredEvents(
           hypeRiskScore: scoreColumns.hypeRiskScore,
           shouldPush: scoreColumns.shouldPush,
         })
-        .where(eq(aiNewsEvents.eventId, event.eventId));
+        .where(and(eq(aiNewsEvents.eventId, event.eventId), isNull(aiNewsEvents.mergedInto)));
 
       scored += 1;
     } catch (error) {

@@ -24,6 +24,7 @@ import {
   normalizeUrl,
   NORMALIZER_VERSION,
 } from '../dedup/normalize.js';
+import { sanitizeDeep, sanitizeText } from './sanitize.js';
 import { defaultLogError, type CollectedItem, type LogError } from './types.js';
 
 type DbLike = typeof defaultDb;
@@ -42,6 +43,13 @@ export interface StoreResult {
   attempted: number;
   /** 因 source_item_id 缺失被跳过的条目数。 */
   skippedInvalid: number;
+  /**
+   * 因单条 INSERT 抛错被 per-item try/catch 隔离的条目数（净化后仍触发约束/编码错误等）。
+   * 与既有「单源失败不中止整批采集」对称：单条坏数据被捕获、记错误日志、计入此统计、循环继续，
+   * **绝不**因单条中止整批入库。`received`/`attempted`/`inserted`/`processableCount`/`skippedInvalid`
+   * 既有口径语义不变。
+   */
+  skippedError: number;
   /** 成功新插入的行数（冲突跳过的不计入）。 */
   inserted: number;
   /**
@@ -75,6 +83,7 @@ export async function storeCollectedItems(
 
   let attempted = 0;
   let skippedInvalid = 0;
+  let skippedError = 0;
   let inserted = 0;
   let processableCount = 0;
   const insertedIds: bigint[] = [];
@@ -92,9 +101,18 @@ export async function storeCollectedItems(
       continue;
     }
 
+    // 统一文本净化（全源收口，spec「store 层统一文本净化（全源收口）」/ design D8）：
+    // 剔 NUL/C0 控制符（保留 \t\n\r）+ lone surrogate（保留合法 emoji 代理对）。
+    // store 是 raw_items 唯一 text sink，对**所有源**生效（sitemap/hf-papers 自层净化保留作纵深防御）。
+    // 净化在归一化**之前**，使 canonical_url / title_hash 据净化后的干净文本生成（不改可处理性口径：
+    // 归一化本就丢标点/控制噪声，净化只是提前剔除危险码点）。
+    const title = sanitizeText(item.title);
+    const url = item.url === null ? null : sanitizeText(item.url);
+    const content = item.content === null ? null : sanitizeText(item.content);
+
     // 入库时即时生成 canonical_url / title_hash（复用规范化纯函数）。
-    const canonicalUrl = normalizeUrl(item.url);
-    const titleHash = computeTitleHash(item.title);
+    const canonicalUrl = normalizeUrl(url);
+    const titleHash = computeTitleHash(title);
 
     // 可处理 = 能构造 canonical_url 或 title_hash（非 unprocessable）。与塌缩侧 unprocessable
     // 判定同口径（无 canonical_url 且归一后标题为空 → 两者皆 null）。源内重复项也计入：
@@ -103,39 +121,58 @@ export async function storeCollectedItems(
       processableCount += 1;
     }
 
-    const metadata = JSON.stringify({
-      ...(item.metadata ?? {}),
-      normalizer_version: NORMALIZER_VERSION,
-    });
+    // metadata 净化必须**递归对每个字符串值施加、且在 JSON.stringify 之前**（spec 强约束）：
+    // 坏码点若留到 stringify 之后，jsonb 写入仍会因 NUL 报错；直接净化序列化整串会误伤 JSON 结构
+    // 字符或漏掉嵌套值。故先 sanitizeDeep 净化对象内各层字符串值、再序列化。
+    const metadata = JSON.stringify(
+      sanitizeDeep({
+        ...(item.metadata ?? {}),
+        normalizer_version: NORMALIZER_VERSION,
+      }),
+    );
 
     attempted += 1;
 
-    const rows = await dbh
-      .insert(rawItems)
-      .values({
+    // per-item 入库隔离（spec「store 层 per-item 入库隔离」/ design D8）：单条 INSERT 抛错被捕获、
+    // 记错误日志、skippedError += 1、循环继续处理后续条目——**绝不**因单条坏数据中止整批入库
+    // （与既有「单源失败不中止整批采集」对称）。
+    try {
+      const rows = await dbh
+        .insert(rawItems)
+        .values({
+          source: item.source,
+          sourceItemId,
+          rawType: item.rawType,
+          url,
+          canonicalUrl,
+          title,
+          titleHash,
+          content,
+          publishedAt: item.publishedAt,
+          // collapsed 透传（默认 false）：arXiv 论文置 true，入库即标「已按 raw_type 路由/沉淀」，
+          // 使事件塌缩入口不每轮重扫（与新闻行「塌缩后置 true」对称，见 dedup/collapse.ts 查询层过滤）。
+          collapsed: item.collapsed ?? false,
+          metadata: sql`${metadata}::jsonb`,
+        })
+        // 源内幂等：UNIQUE(source, source_item_id) 冲突即跳过（不更新，保留首条）。
+        .onConflictDoNothing({
+          target: [rawItems.source, rawItems.sourceItemId],
+        })
+        .returning({ id: rawItems.id });
+
+      if (rows.length > 0) {
+        inserted += 1;
+        insertedIds.push(rows[0]!.id);
+      }
+    } catch (error) {
+      skippedError += 1;
+      logError('单条目入库抛错被隔离（不中止整批）', {
         source: item.source,
         sourceItemId,
-        rawType: item.rawType,
-        url: item.url,
-        canonicalUrl,
-        title: item.title,
-        titleHash,
-        content: item.content,
-        publishedAt: item.publishedAt,
-        // collapsed 透传（默认 false）：arXiv 论文置 true，入库即标「已按 raw_type 路由/沉淀」，
-        // 使事件塌缩入口不每轮重扫（与新闻行「塌缩后置 true」对称，见 dedup/collapse.ts 查询层过滤）。
-        collapsed: item.collapsed ?? false,
-        metadata: sql`${metadata}::jsonb`,
-      })
-      // 源内幂等：UNIQUE(source, source_item_id) 冲突即跳过（不更新，保留首条）。
-      .onConflictDoNothing({
-        target: [rawItems.source, rawItems.sourceItemId],
-      })
-      .returning({ id: rawItems.id });
-
-    if (rows.length > 0) {
-      inserted += 1;
-      insertedIds.push(rows[0]!.id);
+        title,
+        error,
+      });
+      continue;
     }
   }
 
@@ -143,6 +180,7 @@ export async function storeCollectedItems(
     received: items.length,
     attempted,
     skippedInvalid,
+    skippedError,
     inserted,
     insertedIds,
     processableCount,

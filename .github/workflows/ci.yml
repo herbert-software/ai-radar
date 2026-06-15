@@ -76,4 +76,14 @@ jobs:
           # Product Hunt Developer Token（必填占位）：PH 采集器单测注入桩、不触网，
           # 仅用于满足 env 启动校验；真实拉取由 11.3 一次性勘验，不在 CI 实跑。
           PRODUCT_HUNT_TOKEN: ci-placeholder-ph-token
+          # P3 语义去重 + 知识库 embedding（add-semantic-dedup-and-store-hardening）：均有默认值，
+          # 此处注入显式占位使 CI 跑到与默认一致的配置；embedding/LLM 二判单测注入桩不触网，
+          # 真实 embedding/LLM 送达由用户本地真实 key 一次性勘验，不在 CI 实跑。
+          EMBEDDING_MODEL: text-embedding-3-small
+          EMBEDDING_TEXT_MAX_CHARS: "2000"
+          EMBEDDING_BOOTSTRAP_MAX_PER_RUN: "500"
+          SEMANTIC_DEDUP_HIGH: "0.88"
+          SEMANTIC_DEDUP_LLM: "0.82"
+          SEMANTIC_WINDOW_DAYS: "14"
+          SEMANTIC_DEDUP_ENABLED: "on"
         run: npm run test

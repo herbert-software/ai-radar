@@ -23,6 +23,10 @@
  *   上限取序按 `published_at DESC`（取最新发布）。`first_seen_at` 语义不变（仍记首次抓取，供调试/
  *   僵尸 claim 回收），**不再**用于告警时效过滤。
  * - **非 LLM 决定**：是否告警完全由程序阈值决定，禁止 LLM 参与。
+ * - **不做语义去重 / 不做 KB 入库**（add-semantic-dedup-and-store-hardening 6.3，spec「语义去重仅作用于
+ *   日报链新闻事件」）：本高频链恒走硬去重快路径，**绝不**调 semanticMergeEvents（embedding/LLM 二次
+ *   判断/事件合并）或 runKbIngestion——语义层与 KB 入库**仅日报链**执行。日报链合并产生的 tombstone
+ *   仍存于库，故 selectAlertCandidates 仍须排除 `merged_into IS NOT NULL`（已加，组 4.7），但本链不**产生**合并。
  * - **高频链路不套用日报「全源 0」系统级告警**：高频轮询全源 0 / 空轮是常态，本工作流**不调**
  *   classifySystemFailure（否则每天数十次误告警刷屏，见 daily-intel-pipeline）。
  * - **独立四元组**：`target_type='alert'`、`target_id=event_id`、`push_date=触发当日(Asia/Shanghai)`，
@@ -36,7 +40,7 @@
  * - **状态机复用**：告警推送复用 dispatcher 同一「待发→pending→原子送达→success/failed」状态机
  *   （含 headline 缺失回退链——告警事件可能尚无中文摘要），仅 target_type/channel 口径不同。
  */
-import { and, desc, gte, isNotNull, lte, sql } from 'drizzle-orm';
+import { and, desc, gte, isNotNull, isNull, lte, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env, isFeishuEnabled } from '../config/env.js';
@@ -201,6 +205,9 @@ export async function selectAlertCandidates(
         // 判定必在评分后：importance_score 非 NULL（评分前为 NULL，`NULL >= 阈值` 恒假，不误判）。
         isNotNull(aiNewsEvents.importanceScore),
         gte(aiNewsEvents.importanceScore, String(threshold)),
+        // P3 tombstone 排除（合并核心闭环）：不对已被日报链合并掉的死 event_id 告警（spec「tombstone
+        // 对所有下游消费者不可见」）。注：告警链不调语义合并，但日报链合并的 tombstone 仍存于库中。
+        isNull(aiNewsEvents.mergedInto),
         notAlertedToAllChannels,
         // 时效闸下界（闭区间下半）：windowDays>0 → published_at >= lowerBound（gte 对 NULL 返回假，
         // 隐含排除 NULL）；windowDays=0 旁路 → 只免下界 gte，但仍须 isNotNull(published_at) 排除

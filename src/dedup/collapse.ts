@@ -15,7 +15,13 @@
  *   是反面模板）。
  * - unprocessable raw_item（无 canonical_url 且归一后标题为空）不产生 event，
  *   仅把 raw_items.unprocessable 置 true。
- * - 去重判定全程程序 + DB 唯一约束，本期仅硬去重，无 embedding/LLM。
+ * - 去重判定全程程序 + DB 唯一约束（硬去重层）；P3 起 embedding/LLM 语义合并由 semantic-dedup
+ *   承接（塌缩之后、value-judge 之前），其落库仍由程序 + DB 单事务执行。
+ *
+ * **tombstone 改投（P3，dedup-and-normalization「tombstone 改投」/ semantic-dedup「确定性事件合并」）**：
+ * 塌缩的 `ON CONFLICT (dedup_key)` 命中行可能已被语义合并置 `merged_into` 非空（tombstone）。此时必须
+ * 把该 raw_item 改塌缩进 `merged_into` 指向的**链解析后终态存活者**（`merged_into IS NULL`），禁止新建
+ * 重复、禁止向 tombstone 累加 source_count。详见 collapseRawItem 内联注释（守卫谓词 + 链解析 + 并发原子性）。
  */
 import { and, eq, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
@@ -113,18 +119,29 @@ export async function collapseRawItem(
     return { rawItemId: item.id, dedupKey: null, unprocessable: true };
   }
 
+  // 经上方早返回后 dedupKey 必非空；捕获到 const 使其类型在事务闭包内仍为 string（窄化不跨闭包）。
+  const dedupKey: string = norm.dedupKey;
   const now = new Date();
 
-  // 「INSERT/ON CONFLICT 塌缩」+「markCollapsed 该 raw_item」必须原子提交（同一事务）：
+  // 「INSERT/ON CONFLICT 塌缩（含 tombstone 改投）」+「markCollapsed 该 raw_item」必须原子提交（同一事务）：
   // 否则崩在二者之间 → 下轮 collapseUncollapsedRawItems 重扫到该 raw_item（collapsed 仍 false）
   // → source_count 再 +1，违反「每 raw_item 恰好贡献一次」。崩在中间整体回滚，下轮重做仍只累加一次。
   // dbh 可能本身已是事务句柄；drizzle 的 tx.transaction() 会以 savepoint 嵌套，安全复用。
   await dbh.transaction(async (tx) => {
-    await tx
+    // ── INSERT ... ON CONFLICT (dedup_key) DO UPDATE，**DO UPDATE 加 `merged_into IS NULL` 守卫**。
+    // 守卫语义（P3 tombstone 改投并发原子性，dedup-and-normalization「改投的并发原子性」为权威）：
+    //   - 首建（无冲突）：INSERT 成功，returning 返回新行 event_id。
+    //   - 命中非 tombstone 行（merged_into IS NULL）：DO UPDATE 守卫满足 → source_count+1、
+    //     last_seen 更新、published_at COALESCE 单向 NULL-fill，returning 返回该行 event_id。
+    //   - 命中 tombstone 行（merged_into 非空）：DO UPDATE 守卫**不满足** → 0 行更新、**不动 tombstone**
+    //     （绝不把已冻结的 tombstone source_count 误 +1），returning 为空 → 下方走链解析改投存活者。
+    // ON CONFLICT 对冲突行本就持行锁，故命中 tombstone 时该行已被本事务锁住，与并发语义合并
+    // （对被吞行 FOR UPDATE）争同一 dedup_key 行锁而串行化（合并先/塌缩先两序皆不丢不重）。
+    const upserted = await tx
       .insert(aiNewsEvents)
       .values({
         // event_id 省略 → DB 默认 gen_random_uuid()::text 生成不透明身份（design D1）。
-        dedupKey: norm.dedupKey,
+        dedupKey,
         representativeRawItemId: item.id,
         // 代表 title 取**原始** title（非归一化），保证 NOT NULL 可读（spec / design D2）。
         representativeTitle: item.title,
@@ -144,13 +161,96 @@ export async function collapseRawItem(
           lastSeenAt: now,
           publishedAt: sql`COALESCE(${aiNewsEvents.publishedAt}, EXCLUDED.published_at)`,
         },
-      });
+        // ⚠️ tombstone 改投守卫：命中行 merged_into 非空时不更新（不动 tombstone source_count）。
+        setWhere: sql`${aiNewsEvents.mergedInto} IS NULL`,
+      })
+      .returning({ eventId: aiNewsEvents.eventId });
+
+    // returning 为空 = 命中 tombstone（DO UPDATE 守卫未满足、INSERT 也因冲突未发生）→ 改投存活者。
+    if (upserted.length === 0) {
+      await rerouteToSurvivor(tx, dedupKey, now);
+    }
 
     // 塌缩成功后把该 raw_item 置 collapsed=true：source_count 贡献恰好一次（幂等，design D1）。
     await markCollapsed(tx, item.id);
   });
 
-  return { rawItemId: item.id, dedupKey: norm.dedupKey, unprocessable: false };
+  return { rawItemId: item.id, dedupKey, unprocessable: false };
+}
+
+/**
+ * tombstone 改投：命中 tombstone 的 `dedup_key` 行时，把本 raw_item 的 source_count +1 改投到
+ * **链解析后终态存活者**（`merged_into IS NULL`）。
+ *
+ * 流程（在塌缩事务内、命中行已被 ON CONFLICT 行锁锁住后调用）：
+ * 1. 读命中 tombstone 行的 merged_into，沿链 `SELECT ... FOR UPDATE` 迭代到终态存活者
+ *    （`merged_into IS NULL`）；带**环路保护**（已访问集合，命中环报错告警），不停在中间 tombstone。
+ * 2. `UPDATE 存活者 SET source_count = source_count + 1, last_seen_at = now`——增量只落存活者，
+ *    **绝不**加到 tombstone（被吞 tombstone 的 source_count 此后冻结，semantic-dedup「source_count
+ *    不重复计数」）。published_at 不在此改投（tombstone 改投只贡献「新到 raw_item +1」，published_at
+ *    的确定性 NULL-fill 由首建/正常 DO UPDATE 路径承载；存活者 published_at 在合并时已 COALESCE）。
+ *
+ * **并发原子性**：靠冲突 dedup_key 那一行的行锁与并发语义合并（合并对被吞行 FOR UPDATE）串行化——
+ * 合并先提交 → 塌缩读到 merged_into 非空 → +1 落存活者；塌缩先提交（但此分支是命中已 tombstone 行、
+ * 由本函数 +1 落存活者）→ 自洽。两序皆不丢不重（dedup-and-normalization「改投的并发原子性」为权威）。
+ */
+async function rerouteToSurvivor(
+  tx: TxLike,
+  dedupKey: string,
+  now: Date,
+): Promise<void> {
+  // 沿 merged_into 链迭代到终态存活者；链上每行 FOR UPDATE（与并发合并/改投串行化）+ 环路保护。
+  const visited = new Set<string>();
+
+  // 起点：命中的 tombstone 行（按 dedup_key 定位，ON CONFLICT 已持其行锁；显式再 FOR UPDATE 取 merged_into）。
+  const startRows = await tx
+    .select({ eventId: aiNewsEvents.eventId, mergedInto: aiNewsEvents.mergedInto })
+    .from(aiNewsEvents)
+    .where(eq(aiNewsEvents.dedupKey, dedupKey))
+    .for('update');
+  const start = startRows[0];
+  if (!start) {
+    // 理论不应发生（命中冲突却查不到该 dedup_key 行）；记并返回，不新建重复、不抛断整批。
+    console.error(
+      `[collapse] tombstone 改投：按 dedup_key 未找到命中行（dedup_key=${dedupKey.slice(0, 16)}…），跳过改投。`,
+    );
+    return;
+  }
+  // 若命中行其实 merged_into IS NULL（极少数竞态：守卫与本读之间刚被「复活」？不应发生）——
+  // 那么它本身就是存活者，直接对其 +1（与正常 DO UPDATE 等价）。
+  let currentId = start.eventId;
+  let mergedInto = start.mergedInto;
+
+  while (mergedInto !== null) {
+    if (visited.has(currentId)) {
+      throw new Error(
+        `collapse: tombstone 改投的 merged_into 链检出环路（已访问 ${currentId}），中止改投并告警——数据异常。`,
+      );
+    }
+    visited.add(currentId);
+    currentId = mergedInto;
+    const rows = await tx
+      .select({ eventId: aiNewsEvents.eventId, mergedInto: aiNewsEvents.mergedInto })
+      .from(aiNewsEvents)
+      .where(eq(aiNewsEvents.eventId, currentId))
+      .for('update');
+    const row = rows[0];
+    if (!row) {
+      throw new Error(
+        `collapse: tombstone 改投的 merged_into 链断裂（${currentId} 不存在），中止改投并告警——数据异常。`,
+      );
+    }
+    mergedInto = row.mergedInto;
+  }
+
+  // currentId 为终态存活者（merged_into IS NULL）：仅对其 source_count +1（新到 raw_item 的贡献）+ 更新 last_seen。
+  await tx
+    .update(aiNewsEvents)
+    .set({
+      sourceCount: sql`${aiNewsEvents.sourceCount} + 1`,
+      lastSeenAt: now,
+    })
+    .where(eq(aiNewsEvents.eventId, currentId));
 }
 
 /** 把单条 raw_item 标记为已塌缩（collapsed=true），使其不再被塌缩入口扫到（幂等标记）。 */

@@ -344,6 +344,99 @@ describe('parseEnv —— SITEMAP_SOURCES 解析（add-tier1-ai-sources / design
   });
 });
 
+describe('parseEnv —— P3 语义去重 + 知识库 embedding 配置（add-semantic-dedup-and-store-hardening，任务 7.1）', () => {
+  it('未提供时取默认值', () => {
+    const env = parseEnv(validEnv());
+    expect(env.EMBEDDING_MODEL).toBe('text-embedding-3-small');
+    expect(env.EMBEDDING_TEXT_MAX_CHARS).toBe(2000);
+    expect(env.EMBEDDING_BOOTSTRAP_MAX_PER_RUN).toBe(500);
+    expect(env.SEMANTIC_DEDUP_HIGH).toBe(0.88);
+    expect(env.SEMANTIC_DEDUP_LLM).toBe(0.82);
+    expect(env.SEMANTIC_WINDOW_DAYS).toBe(14);
+    expect(env.SEMANTIC_DEDUP_ENABLED).toBe('on');
+  });
+
+  it('自定义合法值生效', () => {
+    const source = {
+      ...validEnv(),
+      EMBEDDING_MODEL: 'text-embedding-3-large',
+      EMBEDDING_TEXT_MAX_CHARS: '4000',
+      EMBEDDING_BOOTSTRAP_MAX_PER_RUN: '200',
+      SEMANTIC_DEDUP_HIGH: '0.9',
+      SEMANTIC_DEDUP_LLM: '0.8',
+      SEMANTIC_WINDOW_DAYS: '7',
+      SEMANTIC_DEDUP_ENABLED: 'off',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.EMBEDDING_MODEL).toBe('text-embedding-3-large');
+    expect(env.EMBEDDING_TEXT_MAX_CHARS).toBe(4000);
+    expect(env.EMBEDDING_BOOTSTRAP_MAX_PER_RUN).toBe(200);
+    expect(env.SEMANTIC_DEDUP_HIGH).toBe(0.9);
+    expect(env.SEMANTIC_DEDUP_LLM).toBe(0.8);
+    expect(env.SEMANTIC_WINDOW_DAYS).toBe(7);
+    expect(env.SEMANTIC_DEDUP_ENABLED).toBe('off');
+  });
+
+  it('EMBEDDING_TEXT_MAX_CHARS 非正（"0"）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      EMBEDDING_TEXT_MAX_CHARS: '0',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('EMBEDDING_BOOTSTRAP_MAX_PER_RUN 非整（"1.5"）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      EMBEDDING_BOOTSTRAP_MAX_PER_RUN: '1.5',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('SEMANTIC_DEDUP_HIGH 越界（>1）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      SEMANTIC_DEDUP_HIGH: '1.2',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('SEMANTIC_WINDOW_DAYS 负数（"-1"）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      SEMANTIC_WINDOW_DAYS: '-1',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('SEMANTIC_DEDUP_ENABLED 非枚举值（"true"）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      SEMANTIC_DEDUP_ENABLED: 'true',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('阈值倒挂（LLM >= HIGH）→ 快速失败（superRefine 跨字段校验）', () => {
+    const source = {
+      ...validEnv(),
+      SEMANTIC_DEDUP_HIGH: '0.8',
+      SEMANTIC_DEDUP_LLM: '0.85',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/SEMANTIC_DEDUP_LLM/);
+  });
+
+  it('阈值相等（LLM == HIGH）→ 快速失败（灰区为空）', () => {
+    const source = {
+      ...validEnv(),
+      SEMANTIC_DEDUP_HIGH: '0.85',
+      SEMANTIC_DEDUP_LLM: '0.85',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+});
+
 describe('parseEnv —— HF_PAPERS_MAX_PER_RUN 校验（add-tier1-ai-sources，FIX-6）', () => {
   it('合法值（"30"）coerce 为 number 30', () => {
     const source = {

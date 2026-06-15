@@ -19,7 +19,7 @@
  *
  * 本骨架由组 A 建；handler 实现由组 C 填（动态 import 推送链 + 各 channel 隔离；暂返 NOT_IMPLEMENTED 占位）。
  */
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { aiNewsEvents } from '../../db/schema.js';
 import { CHANNEL, channelEnum, type Channel } from '../../push/targets.js';
@@ -109,6 +109,9 @@ export const pushEventNowTool: McpToolDescriptor = {
     const { env, db } = getContext();
 
     // 读 event（取拼消息所需字段）；不存在 → isError（不 throw）。
+    // P3 tombstone 排除（合并核心闭环）：SELECT 加 `merged_into IS NULL`——命中 tombstone（被合并掉的
+    // 死 event_id）时查不到、走下方「不存在」分支，不手动推 tombstone（spec「tombstone 对所有下游
+    // 消费者不可见」：push-event-now SELECT 即排除、不手动推 tombstone）。
     const rows = await db
       .select({
         eventId: aiNewsEvents.eventId,
@@ -118,12 +121,12 @@ export const pushEventNowTool: McpToolDescriptor = {
         publishedAt: aiNewsEvents.publishedAt,
       })
       .from(aiNewsEvents)
-      .where(eq(aiNewsEvents.eventId, eventId))
+      .where(and(eq(aiNewsEvents.eventId, eventId), isNull(aiNewsEvents.mergedInto)))
       .limit(1);
 
     const row = rows[0];
     if (!row) {
-      return toIsError(`事件不存在：event_id=${eventId}，无法推送。`);
+      return toIsError(`事件不存在或已被合并：event_id=${eventId}，无法推送。`);
     }
 
     // 经 loadCanonicalUrls 等价填原文链接；缺（无代表源 / 源无 url）则无链接——非错误，照推。

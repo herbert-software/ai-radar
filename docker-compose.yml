@@ -15,9 +15,10 @@
 # 容器网络服务名（postgres/redis）覆盖 .env 中的 localhost。
 #
 # 不变量（来自 platform-foundation spec）：
-# - postgres 使用 pgvector/pgvector 镜像作为地基，但本期零向量：
-#   不挂任何 init SQL 去 CREATE EXTENSION vector，不建 vector 列。
-#   pgvector 镜像默认不会自动启用扩展，此处也不引入任何启用逻辑。
+# - postgres 使用 pgvector/pgvector 镜像作为地基。P3（add-semantic-dedup-and-store-hardening）起
+#   按需启用向量能力：`CREATE EXTENSION IF NOT EXISTS vector;` 由 P3 迁移（drizzle 0006）落，
+#   仅作用于 ai_news_events / kb_documents 的 vector(1536) 列（ai_products 不含向量列）。
+#   compose 不挂 init SQL 启用扩展——启用逻辑收口在迁移里，由 migrate 服务（npm run migrate）执行。
 
 # 应用三服务共享的构建与环境（YAML 锚点；merge key 只并顶层键，故各服务不再覆盖 environment）。
 x-app: &app
