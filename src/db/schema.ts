@@ -187,6 +187,10 @@ export const aiProducts = pgTable(
       .default(sql`gen_random_uuid()::text`),
     // QA §8.3 唯一 NOT NULL 业务列：塌缩 INSERT 必填（取 raw_item.title，缺失兜底 slug/domain）。
     name: varchar('name', { length: 255 }).notNull(),
+    // 产品中文展示列（可空）：中文化 Agent 写入，NULL = 未中文化 → 渲染回退英文 name。
+    // 仅产展示文本，绝不参与塌缩/合并/推送幂等等确定性状态判定。
+    nameZh: varchar('name_zh', { length: 255 }),
+    taglineZh: text('tagline_zh'),
     // 硬规则合并冲突键（各自 UNIQUE，作 ON CONFLICT 目标）；NULL 不参与约束。
     canonicalDomain: varchar('canonical_domain', { length: 255 }),
     githubRepo: varchar('github_repo', { length: 255 }),

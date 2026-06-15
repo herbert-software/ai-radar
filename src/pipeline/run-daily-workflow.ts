@@ -54,6 +54,7 @@ import {
 } from '../push/dispatcher.js';
 import {
   collapseProductsOnce,
+  digestPendingProducts,
   selectProductsForChannelSafe,
 } from './product-digest.js';
 import { createTelegramSender } from '../push/telegram.js';
@@ -472,6 +473,16 @@ export async function runDailyWorkflow(
     //    步骤 P1：产品塌缩一次（channel-blind）。**必在 channel 展开之前只跑一次**——产品塌缩单实例
     //    承载（顺序处理避免同批竞态），若随 per-channel 并发跑 N 次会违反单实例假设。
     await collapseProductsOnce(dbh);
+    //    步骤 P1.5：产品中文化一次（channel-blind，design D3）。**必在塌缩之后、per-channel 候选之前**：
+    //    中文化候选 = 各 channel 推送候选精确并集（复用 selectProductCandidates 取 product_id 并集）；
+    //    UPDATE 中文列后，下方 selectProductsForChannelSafe 再调 selectProductCandidates 读到中文列。
+    //    **永不向上抛**（对称 collapseProductsOnce）：中文化失败不进熔断分母、不中止流水线、要闻段不受影响；
+    //    整步失败规模异常由 digestPendingProducts 内部 alert 单独告警（系统故障可观测）。
+    await digestPendingProducts(
+      dbh,
+      channelSenders.map((c) => c.channel),
+      alert,
+    );
     //    步骤 P2：per-channel 产品候选。候选是纯 SELECT 无写竞态、塌缩已在上面单次完成，故可并发。
     //    每 channel 候选包 try/catch（selectProductsForChannelSafe 内），失败 → 该 channel 空新品段。
     const productEntries = await Promise.all(

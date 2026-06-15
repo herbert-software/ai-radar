@@ -15,6 +15,7 @@
  * 故必须拼成一条，不可拆多条。
  */
 import { HEADLINE_MAX } from '../agents/digest/schema.js';
+import { PRODUCT_TAGLINE_MAX } from '../agents/product-digest/schema.js';
 import type { SelectedEvent } from '../selection/top-n.js';
 import type { Channel } from './targets.js';
 
@@ -493,11 +494,25 @@ function dailyTelegramBlock(e: SelectedEvent, idx: number): string {
   return `${escapeMarkdownV2(`${idx}.`)} *${title}*${headlineLine}${linkLine}`;
 }
 
-/** 单个产品块的 MarkdownV2 文本（序号 + 产品名 + 官网链接；无要点行；canonicalUrl null → 仅产品名）。 */
+/**
+ * 单个产品块的 MarkdownV2 文本（序号 + 产品名 + 简介要点行 + 官网链接）。
+ *
+ * 产品名复用 `representativeTitle`（选品映射已 name_zh ?? name、中文优先回退英文）。
+ * 简介要点行复用 `headlineZh` —— 在产品语境下该字段承载 `ai_products.tagline_zh`
+ * （选品映射 headlineZh = tagline_zh ?? null）；存在则渲染一行、不存在则省略（回退纯标题）。
+ */
 function dailyTelegramProductBlock(p: SelectedEvent, idx: number): string {
   // 产品名复用 representativeTitle（varchar(255) 有界），套 TITLE_MAX code-point 截断再转义。
   const rawName = p.representativeTitle?.trim() || '(无产品名)';
   const name = escapeMarkdownV2(truncateByCodePoint(rawName, TITLE_MAX));
+
+  // 简介要点行：headlineZh 承载 tagline_zh。tagline_zh 列无长度上限（zod cap 仅约束 LLM 写入路径），
+  // 故块内按 PRODUCT_TAGLINE_MAX（产品简介专属上限、与 schema cap 同一常量，**非 events HEADLINE_MAX**）
+  // 本地再截断一次，使「单块恒可装」自证、且口径与 schema 一致不静默丢字。
+  const tagline = p.headlineZh?.trim();
+  const taglineLine = tagline
+    ? `\n${escapeMarkdownV2(truncateByCodePoint(tagline, PRODUCT_TAGLINE_MAX))}`
+    : '';
 
   // 官网链接：canonicalUrl 存在且不超长才渲染；超长丢链接（产品名 + canonical_domain 均有界 → 单块恒可装）。
   const url = p.canonicalUrl?.trim();
@@ -512,7 +527,7 @@ function dailyTelegramProductBlock(p: SelectedEvent, idx: number): string {
     }
   }
 
-  return `${escapeMarkdownV2(`${idx}.`)} *${name}*${linkLine}`;
+  return `${escapeMarkdownV2(`${idx}.`)} *${name}*${taglineLine}${linkLine}`;
 }
 
 /**
@@ -623,11 +638,15 @@ function buildDailyFeishuCard(
     return lines.join('\n');
   };
 
-  // 单个产品块的 lark_md 内容（序号 + 产品名 + 官网链接；无要点行；null → 仅产品名）。
+  // 单个产品块的 lark_md 内容（序号 + 产品名 + 简介要点行 + 官网链接；null → 仅产品名）。
   const productContent = (p: SelectedEvent, idx: number): string => {
     const rawName = p.representativeTitle?.trim() || '(无产品名)';
     const name = escapeLarkMdText(truncateByCodePoint(rawName, FEISHU_TITLE_MAX));
     const lines: string[] = [`**${idx}. ${name}**`];
+    // 简介要点行：headlineZh 承载 tagline_zh，套 PRODUCT_TAGLINE_MAX 截断（与 Telegram 口径一致、
+    // 非 events HEADLINE_MAX）；存在则加一行、无则纯标题。
+    const tagline = p.headlineZh?.trim();
+    if (tagline) lines.push(escapeLarkMdText(truncateByCodePoint(tagline, PRODUCT_TAGLINE_MAX)));
     const url = p.canonicalUrl?.trim();
     if (url && url.length <= MAX_URL_LENGTH) {
       lines.push(`[官网](${url})`);

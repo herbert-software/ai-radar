@@ -62,13 +62,20 @@ export interface ProductCollapseOutcome {
  * `product-keys.ts`（design D7：避免纯采集器经 product-collapse 传递拉入 PG 连接池）。本文件直接 import 复用。
  */
 
+/**
+ * name 兜底链的终极占位（零信息产品名）。单一事实来源：
+ * resolveName 写入端与产品中文化候选排除端共用此常量，防字面漂移
+ * （零信息输入会诱发 LLM 幻觉译名，故中文化候选据此排除占位名产品）。
+ */
+export const UNNAMED_PRODUCT_NAME = '(unnamed product)';
+
 /** name 兜底链：产品名(title) → slug → canonical_domain → 终极占位（绝不留空，NOT NULL）。 */
 function resolveName(item: ProductRawItem, keys: ProductMergeKeys): string {
   const title = item.title?.trim();
   if (title && title.length > 0) return title.slice(0, 255);
   if (keys.productHuntSlug) return keys.productHuntSlug.slice(0, 255);
   if (keys.canonicalDomain) return keys.canonicalDomain.slice(0, 255);
-  return '(unnamed product)';
+  return UNNAMED_PRODUCT_NAME;
 }
 
 /**

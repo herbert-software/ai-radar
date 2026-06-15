@@ -1210,3 +1210,123 @@ describe.skipIf(!canRun)('runDailyWorkflow 产品段编排（7.3）', () => {
     }
   });
 });
+
+/**
+ * runDailyWorkflow 阶段 5.5 产品中文化编排集成测试（add-product-chinese-digest，design D3/D7，task 8.6）。
+ *
+ * 验证编排不变量：
+ * - 中文化在塌缩（collapseProductsOnce）之后、per-channel 候选（selectProductsForChannelSafe）之前
+ *   （调用顺序断言）。
+ * - 中文化失败**不中止流水线、不进熔断分母、要闻段不受影响、产品回退英文照常推**：seed 一个真实
+ *   未中文化产品候选，让真实 digestPendingProducts 运行 —— 其内部 summarizeProduct 走 buildModel +
+ *   defaultGenerateObject，**VITEST 守卫使真实 LLM 路径抛错**（不真调 LLM），逐次重试耗尽 →
+ *   ProductDigestFailureError → digestPendingProducts 永不向上抛吞掉 → 产品保持 name_zh NULL →
+ *   候选映射回退英文名 → 照常推送；要闻段 judge/digest 统计不受影响。
+ *
+ * 推送均注入 mock sender + 钉 channels（防误发生产飞书，memory test-no-prod-sends）。
+ * ai_products 不在 cleanup 的 TRUNCATE 内，故 seed 的产品用唯一前缀、本块 finally 显式清理。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 产品中文化编排（阶段 5.5，8.6）', () => {
+  const PROD_PREFIX = `rdw-zh-${process.pid}-`;
+
+  async function cleanupProducts() {
+    if (!pool) return;
+    await pool.query(`DELETE FROM push_records WHERE target_id LIKE $1`, [`${PROD_PREFIX}%`]);
+    await pool.query(`DELETE FROM ai_products WHERE product_id LIKE $1`, [`${PROD_PREFIX}%`]);
+  }
+
+  it('中文化在塌缩之后、per-channel 候选之前（调用顺序断言）', async () => {
+    // 三步零件全 spy：断言 collapse → digest → candidates 的相对调用顺序（design D3 位置约束）。
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    const digestSpy = vi
+      .spyOn(productDigestModule, 'digestPendingProducts')
+      .mockResolvedValue(undefined);
+    const candSpy = vi
+      .spyOn(productDigestModule, 'selectProductsForChannelSafe')
+      .mockResolvedValue([]);
+    try {
+      const items = [item({ id: 'order1', url: 'https://ex.com/o1', title: 'Order news' })];
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      expect(result.outcome).toBe('pushed');
+      // 三步均被调用，且相对顺序：collapse < digest < candidates（invocationCallOrder 单调递增）。
+      const collapseOrder = collapseSpy.mock.invocationCallOrder[0]!;
+      const digestOrder = digestSpy.mock.invocationCallOrder[0]!;
+      const candOrder = candSpy.mock.invocationCallOrder[0]!;
+      expect(collapseOrder).toBeLessThan(digestOrder);
+      expect(digestOrder).toBeLessThan(candOrder);
+      // 中文化 channel-blind 只调一次（不随 per-channel 重复）。
+      expect(digestSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      collapseSpy.mockRestore();
+      digestSpy.mockRestore();
+      candSpy.mockRestore();
+    }
+  });
+
+  it('中文化失败（VITEST 守卫模拟 LLM 不可用）不中止流水线、不进熔断分母、要闻照常、产品回退英文推', async () => {
+    await cleanupProducts();
+    // seed 一个真实未中文化产品候选（name_zh NULL、无 merge_conflict、从未 success）。
+    const pid = `${PROD_PREFIX}fallback`;
+    await pool!.query(
+      `INSERT INTO ai_products (product_id, name, canonical_domain, last_seen_at)
+       VALUES ($1, $2, $3, now())`,
+      [pid, `${PROD_PREFIX}EnglishProduct`, `${PROD_PREFIX}prod.example.com`],
+    );
+    // 塌缩 spy 为 no-op（不让真实塌缩干扰 seed 的产品）；digest / candidates **不 spy** → 走真实路径：
+    // 真实 digestPendingProducts 内 summarizeProduct → defaultGenerateObject 在 VITEST 下抛错 →
+    // 重试耗尽 → ProductDigestFailureError → 整步吞掉（永不向上抛）→ 产品保持 NULL。
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    try {
+      const items = [item({ id: 'fb1', url: 'https://ex.com/fb1', title: 'Healthy news for fallback' })];
+      const sender = okSender();
+      const alert = vi.fn();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert,
+      });
+      // 中文化失败不中止流水线：照常 pushed（要闻 + 新品两段都推）。
+      expect(result.outcome).toBe('pushed');
+      expect(sender.calls).toBe(1);
+      // 要闻段不受产品中文化失败影响：judge / digest 统计与无产品时一致（产品失败不进熔断分母）。
+      expect(result.judge).toEqual({ processed: 1, degraded: 0 });
+      expect(result.digest.degraded).toBe(0);
+      // 产品保持 name_zh NULL（中文化失败、不写库）。
+      const { rows: prodRows } = await pool!.query<{ name_zh: string | null }>(
+        `SELECT name_zh FROM ai_products WHERE product_id = $1`,
+        [pid],
+      );
+      expect(prodRows[0]!.name_zh).toBeNull();
+      // 产品仍被推送（回退英文名）：push_records 出该 product 的 success 行。
+      const { rows: pushRows } = await pool!.query<{ status: string }>(
+        `SELECT status FROM push_records WHERE target_type='product' AND target_id=$1`,
+        [pid],
+      );
+      expect(pushRows[0]?.status).toBe('success');
+    } finally {
+      collapseSpy.mockRestore();
+      await cleanupProducts();
+    }
+  });
+});

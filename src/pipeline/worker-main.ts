@@ -40,6 +40,7 @@ import {
   createWeeklyReportWorker,
 } from './weekly-report.js';
 import { isAlertScanEnabled, isWeeklyReportEnabled } from '../config/env.js';
+import { assertProductZhColumns } from './product-digest.js';
 
 /** 一条调度链的运行时句柄（worker + queue + 其复用的连接），供统一优雅关闭。 */
 interface ScheduledLane {
@@ -53,6 +54,11 @@ interface ScheduledLane {
 }
 
 async function main(): Promise<void> {
+  // ── 启动期自检（部署防假绿）：日报新品段读 ai_products 中文列，列缺失则 fail-fast，
+  //    绝不让漏迁移的生产环境靠 selectProductsForChannelSafe 把「列不存在」静默吞成空新品段。
+  //    迁移必先于代码发布（drizzle/0005_*）。在注册任何 worker 之前探针，缺列即拒绝启动。
+  await assertProductZhColumns();
+
   const lanes: ScheduledLane[] = [];
 
   // ── 链 1：日报 daily-digest（worker 复用同一 connection，shutdown 时一次 quit 即可）。

@@ -29,11 +29,18 @@ const inputSchema = {
   channel: channelEnum.optional(),
 };
 
-/** 单条已推条目（要闻段 event / 新品段 product 共用最小视图）。 */
+/**
+ * 单条已推条目（要闻段 event / 新品段 product 共用最小视图）。
+ *
+ * `tagline`：产品中文简介（来自 ai_products.tagline_zh），缺则 null；要闻段 event 恒 null
+ * （events 简介走 headlineZh 渲染、不经此字段）。**近似语义**：中文字段反映查询时
+ * ai_products 当前值（push_records 不存渲染文本快照），属既有「join 当前值还原」近似、非新缺陷。
+ */
 const digestItemSchema = z.object({
   targetId: z.string(),
   title: z.string().nullable(),
   url: z.string().nullable(),
+  tagline: z.string().nullable(),
 });
 
 /** 出参 zod raw shape（声明 outputSchema → handler 必返 structuredContent 并被 SDK 校验）。 */
@@ -113,7 +120,12 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
     ];
 
     // 5. 要闻段：join ai_news_events 还原标题 + canonical_url（orphan 自然不在查询结果里 → 跳过）。
-    const events: Array<{ targetId: string; title: string | null; url: string | null }> = [];
+    const events: Array<{
+      targetId: string;
+      title: string | null;
+      url: string | null;
+      tagline: string | null;
+    }> = [];
     if (eventIds.length > 0) {
       const rows = await db
         .select({
@@ -136,17 +148,25 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
           targetId: r.eventId,
           title: r.headlineZh ?? r.representativeTitle,
           url: urlMap.get(r.eventId) ?? null,
+          tagline: null, // 要闻段无产品简介字段；events 简介经 title(headlineZh) 还原。
         });
       }
     }
 
-    // 6. 新品段：join ai_products 还原名称 + 严格映射链接（畸形域降级 null，不裸拼）。
-    const products: Array<{ targetId: string; title: string | null; url: string | null }> = [];
+    // 6. 新品段：join ai_products 还原名称（中文译名优先）+ 中文简介 + 严格映射链接（畸形域降级 null，不裸拼）。
+    const products: Array<{
+      targetId: string;
+      title: string | null;
+      url: string | null;
+      tagline: string | null;
+    }> = [];
     if (productIds.length > 0) {
       const rows = await db
         .select({
           productId: aiProducts.productId,
           name: aiProducts.name,
+          nameZh: aiProducts.nameZh,
+          taglineZh: aiProducts.taglineZh,
           canonicalDomain: aiProducts.canonicalDomain,
         })
         .from(aiProducts)
@@ -157,8 +177,10 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
         if (!r) continue; // orphan 跳过。
         products.push({
           targetId: r.productId,
-          title: r.name,
+          // 中文译名优先、缺则回退英文 name（join 当前 ai_products 值，非推送快照、固有近似）。
+          title: r.nameZh ?? r.name,
           url: productCanonicalUrl(r.canonicalDomain),
+          tagline: r.taglineZh, // 中文简介，缺则 null。
         });
       }
     }

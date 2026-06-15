@@ -36,6 +36,13 @@
       "when": 1781179092265,
       "tag": "0004_p2_ai_products_judge_claimed_at",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1781493094760,
+      "tag": "0005_p2_ai_products_zh_cols",
+      "breakpoints": true
     }
   ]
 }

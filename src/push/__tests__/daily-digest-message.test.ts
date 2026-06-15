@@ -15,6 +15,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SelectedEvent } from '../../selection/top-n.js';
 import { renderDailyDigest, type FeishuCard } from '../message.js';
+import { PRODUCT_TAGLINE_MAX } from '../../agents/product-digest/schema.js';
 
 const MAX = 4000;
 
@@ -359,5 +360,127 @@ describe('renderDailyDigest feishu 双段渲染（7.1）', () => {
     expect(allContent).not.toContain('✨'.repeat(500));
     expect(allContent).not.toContain('[官网]');
     expect(r.text.length).toBeLessThanOrEqual(MAX);
+  });
+});
+
+/**
+ * 产品段中文简介要点行渲染（add-product-chinese-digest，design D5，task 8.4）。
+ *
+ * 中文化后产品在候选映射里 representativeTitle=name_zh、headlineZh=tagline_zh（选品映射的语境复用）。
+ * 渲染契约：headlineZh（=tagline_zh）存在则在产品名下渲染一行简介、不存在则纯标题（回退现状）；
+ * 简介行套 **PRODUCT_TAGLINE_MAX（100）** code-point 截断 —— **非 events HEADLINE_MAX（80）**，
+ * 否则 schema 允许 100 字却渲染截到 80 = 静默丢字；中文名/简介里的语法字符须正确转义。
+ */
+describe('renderDailyDigest 产品段中文简介要点行（telegram，8.4）', () => {
+  it('有 tagline_zh（headlineZh 承载）→ 产品块渲染要点行（产品名 + 简介两行）', () => {
+    const r = renderDailyDigest(
+      [],
+      [prod('p1', { representativeTitle: '中文产品名', headlineZh: '一句话中文简介', canonicalUrl: null })],
+      'telegram',
+    );
+    expect(r.productIncludedIds).toEqual(['p1']);
+    expect(r.text).toContain('中文产品名');
+    expect(r.text).toContain('一句话中文简介');
+    // 产品块（以 \n\n 分隔）含产品名 + 简介两行（无链接）。
+    const block = r.text.split('\n\n').find((b) => b.includes('中文产品名'))!;
+    expect(block.split('\n')).toHaveLength(2); // 标题行 + 简介要点行。
+  });
+
+  it('无 tagline_zh（headlineZh=null）→ 产品块纯标题（无要点行，回退现状）', () => {
+    const r = renderDailyDigest(
+      [],
+      [prod('p1', { representativeTitle: '中文产品名', headlineZh: null, canonicalUrl: null })],
+      'telegram',
+    );
+    const block = r.text.split('\n\n').find((b) => b.includes('中文产品名'))!;
+    expect(block.split('\n')).toHaveLength(1); // 仅产品名一行。
+  });
+
+  it('简介行套 PRODUCT_TAGLINE_MAX（100）截断，非 events HEADLINE_MAX（80）——80<len≤100 不被截', () => {
+    // 长度 90：> HEADLINE_MAX(80) 但 < PRODUCT_TAGLINE_MAX(100)。若误用 HEADLINE_MAX 会截成 80 + …（静默丢字）。
+    const tagline90 = '简'.repeat(90);
+    const r = renderDailyDigest(
+      [],
+      [prod('p1', { representativeTitle: '产品', headlineZh: tagline90, canonicalUrl: null })],
+      'telegram',
+    );
+    // 90 字全渲染、无省略号截断标记（产品简介专属上限是 100，不被 80 截）。
+    expect(r.text).toContain(tagline90);
+    const block = r.text.split('\n\n').find((b) => b.includes('产品'))!;
+    expect(block).not.toContain('…');
+  });
+
+  it('简介行超 PRODUCT_TAGLINE_MAX（>100）→ 按 100 code-point 截断（含省略号）', () => {
+    const tagline150 = '介'.repeat(150);
+    const r = renderDailyDigest(
+      [],
+      [prod('p1', { representativeTitle: '产品', headlineZh: tagline150, canonicalUrl: null })],
+      'telegram',
+    );
+    expect(r.text).not.toContain(tagline150); // 不整段渲染。
+    expect(r.text).toContain('…'); // 截断省略号。
+    expect(r.text.length).toBeLessThanOrEqual(MAX);
+  });
+
+  it('中文名 / 简介里的 MarkdownV2 保留字符被转义（不破坏渲染/发送）', () => {
+    const r = renderDailyDigest(
+      [],
+      [prod('p1', { representativeTitle: '名_a.b', headlineZh: '简-介.x', canonicalUrl: null })],
+      'telegram',
+    );
+    expect(r.text).toContain('名\\_a\\.b'); // 产品名转义。
+    expect(r.text).toContain('简\\-介\\.x'); // 简介转义。
+  });
+});
+
+describe('renderDailyDigest 产品段中文简介要点行（feishu，8.4）', () => {
+  it('有 tagline_zh → 飞书产品块加简介行；无则纯标题', () => {
+    const withTag = renderDailyDigest(
+      [],
+      [prod('p1', { representativeTitle: '中文产品名', headlineZh: '飞书中文简介', canonicalUrl: null })],
+      'feishu',
+    );
+    const a = parseFeishu(withTag.text);
+    expect(a.allContent).toContain('中文产品名');
+    expect(a.allContent).toContain('飞书中文简介');
+
+    const noTag = renderDailyDigest(
+      [],
+      [prod('p2', { representativeTitle: '无简介产品', headlineZh: null, canonicalUrl: null })],
+      'feishu',
+    );
+    const b = parseFeishu(noTag.text);
+    expect(b.allContent).toContain('无简介产品');
+    // 该产品块（** 标题 ** 起首）内不含额外简介行——以产品块文本只一行标题判定。
+    const prodEl = (parseFeishu(noTag.text).card.elements as Array<{ text?: { content?: string } }>)
+      .map((e) => e.text?.content ?? '')
+      .find((c) => c.includes('无简介产品'))!;
+    expect(prodEl.split('\n')).toHaveLength(1);
+  });
+
+  it('飞书简介行同 PRODUCT_TAGLINE_MAX（100）截断口径，与 Telegram 一致——80<len≤100 不被截', () => {
+    const tagline90 = '简'.repeat(90);
+    const r = renderDailyDigest(
+      [],
+      [prod('p1', { representativeTitle: '产品', headlineZh: tagline90, canonicalUrl: null })],
+      'feishu',
+    );
+    const { allContent } = parseFeishu(r.text);
+    expect(allContent).toContain(tagline90); // 90 字全渲染、不被 80 截。
+  });
+
+  it('飞书中文名含 lark_md 语法字符被转义（不误当链接语法破坏卡片）', () => {
+    const r = renderDailyDigest(
+      [],
+      [prod('p1', { representativeTitle: '名[a](b)', headlineZh: '简介x', canonicalUrl: null })],
+      'feishu',
+    );
+    const { allContent } = parseFeishu(r.text);
+    expect(allContent).toContain('名\\[a\\]\\(b\\)');
+  });
+
+  // PRODUCT_TAGLINE_MAX 是 schema cap 与渲染 cap 的单一来源常量（design D5），固定 100。
+  it('PRODUCT_TAGLINE_MAX 常量为 100（schema cap = 渲染 cap 单一来源）', () => {
+    expect(PRODUCT_TAGLINE_MAX).toBe(100);
   });
 });
