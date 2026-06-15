@@ -110,6 +110,77 @@ flowchart LR
 
 读图要点：**事实只存数据库**（🟩），去重与推送是否重复由**唯一键闸门**（🟥）裁决，LLM（🟨）只做语义判断不碰状态——这正是"确定性流程 + DB 控状态 + Agent 控语义"原则的可视化。
 
+## MCP 查询入口（在 Claude Desktop / Cursor 里用）
+
+`src/mcp/server.ts` 是一个**独立的 MCP server 进程**（stdio transport），与流水线并列、**不参与日报调度**，把情报暴露为可在 Claude Desktop / Cursor 等客户端直接调用的查询与人工干预工具。
+
+### 客户端配置（mcpServers）
+
+在客户端的 MCP 配置文件里加一项（Claude Desktop：`claude_desktop_config.json`；Cursor：`.cursor/mcp.json`）。**直接用 `tsx` 跑 `src/mcp/server.ts`，不要用 `npm run mcp`**——`npm` 的启动横幅会污染 stdout（stdio 下 stdout 是 JSON-RPC 专用通道，任何非协议内容都会让客户端解析失败）。
+
+**纯查询（最常用）——只需 `DATABASE_URL`**：
+
+```json
+{
+  "mcpServers": {
+    "ai-radar": {
+      "command": "tsx",
+      "args": ["src/mcp/server.ts"],
+      "cwd": "/绝对路径/到/ai-radar",
+      "env": {
+        "DATABASE_URL": "postgres://ai_radar:ai_radar@localhost:5432/ai_radar"
+      }
+    }
+  }
+}
+```
+
+- `command: "tsx"` 须能被客户端 PATH 找到（或写成 `npx` + `args: ["tsx", "src/mcp/server.ts"]`，或填 `tsx` 的绝对路径）。
+- `cwd` 必须是仓库根的**绝对路径**：server 用 `import 'dotenv/config'` 之外不自动找 `.env`，且模块解析依赖 cwd。
+- `env.DATABASE_URL` **必填**：缺失/畸形时 server 在 connect 之前写 stderr 报错并 `exit(1)`（启动崩，不会静默）。
+- 纯查询链零全局-env 依赖：**只配 `DATABASE_URL` 即可启动并使用全部 5 个查询工具 + 2 个标记工具**；不需要 telegram/feishu/redis/llm/product_hunt 任何 token。
+
+**要用 `push_event_now`（会真发推送）——须配齐与 worker 同的全部 required env**：
+
+`push_event_now` 的 handler 内动态 import 推送链（`dispatcher` → 全局 `parseEnv`），会校验**全部** required 变量（不止 telegram）。缺任一 → 该通道返回错误（不影响查询工具）。
+
+```json
+{
+  "mcpServers": {
+    "ai-radar": {
+      "command": "tsx",
+      "args": ["src/mcp/server.ts"],
+      "cwd": "/绝对路径/到/ai-radar",
+      "env": {
+        "DATABASE_URL": "postgres://ai_radar:ai_radar@localhost:5432/ai_radar",
+        "REDIS_URL": "redis://localhost:6379",
+        "LLM_API_KEY": "sk-or-...",
+        "LLM_MODEL": "openai/gpt-4o-mini",
+        "PRODUCT_HUNT_TOKEN": "...",
+        "TELEGRAM_BOT_TOKEN": "...",
+        "TELEGRAM_CHAT_ID": "...",
+        "FEISHU_WEBHOOK_URL": "https://open.feishu.cn/...",
+        "FEISHU_SIGN_SECRET": "..."
+      }
+    }
+  }
+}
+```
+
+> 飞书可选：未配 `FEISHU_WEBHOOK_URL` + `FEISHU_SIGN_SECRET` 时 `push_event_now` 默认只推 telegram；配齐则默认 telegram + feishu（也可用 `channel` 参数指定单通道）。
+
+### 7 个工具一览（何时用 + 关键约束）
+
+| 工具 | 何时用 | 关键约束 |
+|---|---|---|
+| `get_today_ai_digest` | 想看**今天已经推送出去**的日报（要闻段 + 新品段） | **查「已推事实」而非重跑 Top N 选择**——以 `push_records` 中今天 success 的记录还原；channel 默认取当日实际推过的所有通道（不依赖进程 env），可传 `channel` 过滤；产品链接经严格域名校验，畸形域降级为无链接（与实际已推一致）；当日未推则返回空 + 「今日尚未推送」。只读。 |
+| `search_ai_events` | 按关键词 / 时间窗 / 重要度查**历史事件** | **无 source（来源）维度**——事件表无 source 列，源统计请改用 `get_source_quality_report`；关键词走标题/摘要 ILIKE，`%`/`_` 等 LIKE 元字符按字面匹配；`limit` 默认 20、上限 100；按 `published_at` 降序分页。只读。 |
+| `search_ai_products` | 按名称 / 域名查**历史产品** | 名称或 `canonical_domain` 关键词（同 LIKE 转义）分页；链接经严格域名校验，畸形域降级为无链接。只读。 |
+| `get_source_quality_report` | 评估各**信息源**的产出与转化 | 按 source 聚合采集量 / 塌缩入事件数 / 被推送数 / 最近活跃时间；**按代表源归因**（多源塌缩事件仅计代表源）；用「被推送数」替代不可从 DB 计算的「入选 Top N 率」。只读、无入参。 |
+| `mark_event_not_relevant` | 人工把某事件**踢出后续推送候选** | 置 `should_push=false`（事件表无 metadata 列，`reason` 仅记日志/返回、不入库）；事件不存在 → 返回错误；幂等。 |
+| `mark_product_interesting` | 人工给某产品打**「有趣」标记** | 在 `ai_products.metadata` 原子 merge 写 `interesting`（含时间/备注），不新增列、不触 LLM；产品不存在 → 返回错误；幂等。 |
+| `push_event_now` | 人工**立即把某事件推送**出去（不等日报） | **会真实发送外部消息**——复用既有 `dispatchDigest` 幂等状态机（该通道已成功推过则跳过）、单段要闻 digest；需配齐全部推送相关 env（缺则该通道返回错误）；多通道时各自独立，一个失败不拖累其它。 |
+
 ## 技术栈
 
 > **采用 TypeScript**（经评估后从 `QA.md` 的 Python 默认改选,理由见 [技术栈决策](#技术栈决策为什么用-typescript-而非-qamd-的-python)）。
