@@ -44,16 +44,21 @@ async function seedProduct(args: {
   suffix: string;
   name?: string;
   canonicalDomain?: string | null;
+  githubRepo?: string | null;
+  productHuntSlug?: string | null;
   metadata?: Record<string, unknown> | null;
 }): Promise<string> {
   const productId = `${PREFIX}${args.suffix}`;
   await pool!.query(
-    `INSERT INTO ai_products (product_id, name, canonical_domain, last_seen_at, metadata)
-     VALUES ($1, $2, $3, now(), $4::jsonb)`,
+    `INSERT INTO ai_products
+       (product_id, name, canonical_domain, github_repo, product_hunt_slug, last_seen_at, metadata)
+     VALUES ($1, $2, $3, $4, $5, now(), $6::jsonb)`,
     [
       productId,
       args.name ?? `${PREFIX}${args.suffix}-name`,
       args.canonicalDomain ?? null,
+      args.githubRepo ?? null,
+      args.productHuntSlug ?? null,
       args.metadata ? JSON.stringify(args.metadata) : null,
     ],
   );
@@ -105,6 +110,43 @@ describe.skipIf(!canRun)('selectProductCandidates 候选查询（productDiscover
     const pid = await seedProduct({ suffix: 'url-port', canonicalDomain: 'example.com:8080' });
     const candidates = await selectProductCandidates('telegram', db!);
     expect(candidates.find((x) => x.eventId === pid)!.canonicalUrl).toBe('https://example.com:8080');
+  });
+
+  it('回退链 ②：canonical_domain=NULL + github_repo → canonicalUrl=https://github.com/owner/repo', async () => {
+    // 生产实锤 themartiano/luz：纯 GitHub 仓库类产品（canonical_domain 空、仅 github_repo），
+    // 候选经 resolveProductUrl 回退产出 github 链接（不再因 canonical_domain 空而丢链接）。
+    const pid = await seedProduct({
+      suffix: 'gh-repo',
+      canonicalDomain: null,
+      githubRepo: `${PREFIX}owner/repo`,
+    });
+    const candidates = await selectProductCandidates('telegram', db!);
+    const c = candidates.find((x) => x.eventId === pid)!;
+    expect(c.canonicalUrl).toBe(`https://github.com/${PREFIX}owner/repo`);
+    // 候选携带存储三键（供跨段去重对齐从内存读、不回查 DB）。
+    expect(c.productMergeKeys).toEqual({
+      canonicalDomain: null,
+      githubRepo: `${PREFIX}owner/repo`,
+      productHuntSlug: null,
+    });
+  });
+
+  it('回退链 ③：仅 product_hunt_slug → canonicalUrl=https://www.producthunt.com/posts/<slug>', async () => {
+    const slug = `${PREFIX}foo`;
+    const pid = await seedProduct({
+      suffix: 'ph-slug',
+      canonicalDomain: null,
+      githubRepo: null,
+      productHuntSlug: slug,
+    });
+    const candidates = await selectProductCandidates('telegram', db!);
+    const c = candidates.find((x) => x.eventId === pid)!;
+    expect(c.canonicalUrl).toBe(`https://www.producthunt.com/posts/${slug}`);
+    expect(c.productMergeKeys).toEqual({
+      canonicalDomain: null,
+      githubRepo: null,
+      productHuntSlug: slug,
+    });
   });
 
   it('跨天「从未以该 channel success」：曾在该 channel success 的产品被排除（不重推）', async () => {

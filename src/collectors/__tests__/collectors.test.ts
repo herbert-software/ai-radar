@@ -155,6 +155,81 @@ describe('Hacker News 映射', () => {
     expect(items.map((i) => i.sourceItemId).sort()).toEqual(['1', '3']);
     expect(logError).toHaveBeenCalled();
   });
+
+  it('collectHackerNews：帖式前缀（Show/Ask/Launch/Tell HN）在 collect 层跳过、记日志，仅普通新闻发射', async () => {
+    // id 1–4 为四类帖式帖、id 5 为普通新闻；过滤发生在 collect 层（mapHackerNewsItem 之前），
+    // map 本身不变。
+    const titles: Record<number, string> = {
+      1: 'Show HN: My AI lawn diagnosis app',
+      2: 'Ask HN: How do you test LLM apps?',
+      3: 'Launch HN: Acme (YC W26) launches',
+      4: 'Tell HN: site is down',
+      5: 'OpenAI ships X',
+    };
+    const fetchJson = vi.fn(async (url: string) => {
+      if (url.endsWith('topstories.json')) return [1, 2, 3, 4, 5];
+      const id = Number(url.match(/item\/(\d+)/)![1]);
+      return { id, title: titles[id], url: `https://x/${id}`, time: 1 };
+    });
+    const logError = vi.fn();
+    const items = await hnMod.collectHackerNews({
+      fetchJson,
+      logError,
+      maxAttempts: 1,
+    });
+    // 仅普通新闻（id=5）发射；四条帖式帖被跳过。
+    expect(items.map((i) => i.sourceItemId)).toEqual(['5']);
+    expect(items[0]!.rawType).toBe('post');
+    expect(items[0]!.source).toBe('hacker_news');
+    // 四条跳过均记日志（每条一次）。
+    expect(logError).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe('isHackerNewsNonNewsPost 纯函数（行首帖式前缀识别）', () => {
+  const PREFIXES = ['Show', 'Ask', 'Launch', 'Tell'];
+  // 各分隔符 + 大小写不敏感：HN 帖标题常见形态。
+  const SEPARATORS = [': foo', ' - foo', ' – foo', ' — foo', ' foo', ''];
+
+  for (const prefix of PREFIXES) {
+    for (const sep of SEPARATORS) {
+      const title = `${prefix} HN${sep}`;
+      it(`命中：${JSON.stringify(title)}`, () => {
+        expect(typesMod.isHackerNewsNonNewsPost(title)).toBe(true);
+      });
+    }
+  }
+
+  it('大小写不敏感（show hn / SHOW HN 均命中）', () => {
+    expect(typesMod.isHackerNewsNonNewsPost('show hn: foo')).toBe(true);
+    expect(typesMod.isHackerNewsNonNewsPost('SHOW HN: foo')).toBe(true);
+    expect(typesMod.isHackerNewsNonNewsPost('aSk Hn - bar')).toBe(true);
+  });
+
+  it('前导空白仍命中（^\\s* 锚定）', () => {
+    expect(typesMod.isHackerNewsNonNewsPost('   Show HN: foo')).toBe(true);
+  });
+
+  it('正文中部含 "Show HN" 不误命中（仅行首锚定）', () => {
+    expect(
+      typesMod.isHackerNewsNonNewsPost('Why "Show HN" matters for AI startups'),
+    ).toBe(false);
+  });
+
+  it('"Show HNx" 无词边界不误命中（\\b 要求 HN 后是词边界）', () => {
+    expect(typesMod.isHackerNewsNonNewsPost('Show HNx new product')).toBe(false);
+  });
+
+  it('空字符串 / null / undefined 返回 false（不抛）', () => {
+    expect(typesMod.isHackerNewsNonNewsPost('')).toBe(false);
+    expect(typesMod.isHackerNewsNonNewsPost(null)).toBe(false);
+    expect(typesMod.isHackerNewsNonNewsPost(undefined)).toBe(false);
+  });
+
+  it('非帖式普通标题返回 false', () => {
+    expect(typesMod.isHackerNewsNonNewsPost('OpenAI ships X')).toBe(false);
+    expect(typesMod.isHackerNewsNonNewsPost('Hacker News redesign')).toBe(false);
+  });
 });
 
 describe('GitHub 映射', () => {

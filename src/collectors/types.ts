@@ -88,6 +88,31 @@ export function contentHash(title: string, content: string | null | undefined): 
 // 自层纵深防御共用同一码点逻辑，杜绝两份正则漂移。本导出保留向后兼容（sitemap / hf-papers 仍引用）。
 export const stripUnsafeChars = sanitizeText;
 
+/**
+ * HN 帖式前缀（`Show`/`Ask`/`Launch`/`Tell` + `HN`）——行首锚定、大小写不敏感。
+ *
+ * 这四类是 HN 平台约定的**非综合新闻帖**：Show HN/Launch HN 是产品/公司发布帖、Ask HN/Tell HN
+ * 是提问/告示帖，结构上不属于「要闻」（行业新闻事件）。综合新闻流采集器（hacker-news.ts）据此把它们
+ * 排除，避免与产品发现源（show_hn）构成同一项目双段重复。
+ *
+ * **刻意比 `show-hn.ts` 的 `SHOW_HN_PREFIX_RE` 宽，二者不可「统一」**：
+ * - 本正则尾部用 `\b` 词边界，**不强制分隔符**——既要拦 `Show HN: foo` / `Ask HN - bar`，
+ *   也要拦 `Show HN` 后接空白或行尾的裸帖式标题（综合流的目标是「按帖类排除」，宁可宽）。
+ * - `SHOW_HN_PREFIX_RE` 尾部强制 `:`/`-`/`–`/`—` 及空白分隔符——因它要**剥前缀取产品名**，
+ *   必须精确切到分隔符后的产品名，宽匹配会误吞正文。
+ * 两者目标不同（排除 vs 剥离）、行为刻意分歧，勿合并。
+ */
+const HN_NON_NEWS_PREFIX_RE = /^\s*(show|ask|launch|tell)\s+hn\b/i;
+
+/**
+ * 判定 HN 原始标题是否为帖式（非综合新闻）帖——供 hacker-news.ts 综合新闻流采集器排除使用。
+ * 行首锚定（正文中部出现 "Show HN" 不误判）、大小写不敏感；null/undefined 入参返回 false（不抛）。
+ */
+export function isHackerNewsNonNewsPost(rawTitle: string | null | undefined): boolean {
+  if (rawTitle == null) return false;
+  return HN_NON_NEWS_PREFIX_RE.test(rawTitle);
+}
+
 /** 错误日志 sink 类型；默认 console.error，便于测试注入断言。 */
 export type LogError = (message: string, detail: unknown) => void;
 

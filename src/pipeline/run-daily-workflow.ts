@@ -49,6 +49,14 @@ import {
   type ScoreEventsOptions,
 } from '../agents/value-judge/score-events.js';
 import { selectTopN, type SelectedEvent } from '../selection/top-n.js';
+import {
+  suppressEventsInProducts,
+  PLATFORM_HOSTS,
+  type EventWithKeys,
+} from '../selection/cross-segment-dedup.js';
+// extractProductMergeKeys 来自 collectors/product-keys（零 db/env 纯 leaf）。run-daily 已 import
+// collectAndStore（collectors/index）→ pipeline→collectors 依赖边已存在，import 此纯 leaf 是同向良性边。
+import { extractProductMergeKeys } from '../collectors/product-keys.js';
 import { backfillPublishedAt } from '../agents/published-at-inference/backfill.js';
 import type { InferPublishedAtOptions } from '../agents/published-at-inference/index.js';
 import type { AcquireAlertLockOptions } from './alert-lock.js';
@@ -588,11 +596,62 @@ export async function runDailyWorkflow(
         .join(', ')}`,
     );
 
+    // ── 阶段 5.6：要闻段↔新品段跨段去重抑制（确定性兜底，design D3/D4）。
+    //    位置：productsByChannel 之后、早退判断之前。同一项目既在要闻段又在新品段时，从要闻段
+    //    剔除该事件、保留新品段（Show HN/Launch HN 等本质是产品，新品段是其正确归属、带官网链接与
+    //    中文简介）。对齐键 = 产品归一三键组（canonical_domain/github_repo/product_hunt_slug），复用
+    //    extractProductMergeKeys 两侧一致提取——纯程序确定性键，绝不经 LLM。
+    //
+    //    (a) 事件侧键**现提取**：对每个 pushable 事件用 canonicalUrls.get(eventId) 调
+    //        extractProductMergeKeys({url}) 提三键（事件侧只传 url，product_hunt_slug 分支不触发，
+    //        github.com 域被该函数置 null、改由 github_repo 精确对齐）。事件侧键**不做 PLATFORM_HOSTS
+    //        擦洗**（原样输出，安全性来自下方产品域集排平台 host，见 daily-intel spec）。
+    const eventsWithKeys: EventWithKeys[] = pushable.map((event) => {
+      const url = canonicalUrls.get(event.eventId) ?? null;
+      const keys = extractProductMergeKeys({ url });
+      return { event, keys };
+    });
+
+    //    (b) 产品侧键**无需现提取**：直接读全通道候选携带的**存储三键**（productMergeKeys，由
+    //        selectProductCandidates 从 ai_products 存储字段填入），构全通道并集三键集合（满足
+    //        Model B channel-blind：只要任一通道会推该产品就剔对应要闻）。**域集 MUST 用命名常量
+    //        PLATFORM_HOSTS 排除全部平台 host**——无 website 的 Show HN/PH 产品其 canonical_domain
+    //        落成平台 host（producthunt.com/gitlab.com/npmjs.com…），不排除会致该平台 host 的要闻被
+    //        mass 误抑制（design D3 一类缺陷）。repos/slugs 不排（走精确键、无平台 host 误抑制问题）。
+    const productDomains = new Set<string>();
+    const productRepos = new Set<string>();
+    const productSlugs = new Set<string>();
+    for (const products of productsByChannel.values()) {
+      for (const p of products) {
+        const k = p.productMergeKeys;
+        if (!k) continue; // 事件侧候选不带此字段；理论上产品候选恒带，防御性跳过。
+        if (k.canonicalDomain !== null && !PLATFORM_HOSTS.has(k.canonicalDomain)) {
+          productDomains.add(k.canonicalDomain);
+        }
+        if (k.githubRepo !== null) productRepos.add(k.githubRepo);
+        if (k.productHuntSlug !== null) productSlugs.add(k.productHuntSlug);
+      }
+    }
+
+    //    (c) 抑制得 pushableDeduped；后续**早退判断与 dispatch 全改用它**（被剔事件不进 dispatch 的
+    //        computePendingSet 入参 → 不写 event push_record → 保留跨天候选资格，次日不再被产品覆盖
+    //        即回要闻段，无永久漏推）。
+    const { kept: pushableDeduped, suppressedEventIds } = suppressEventsInProducts(
+      eventsWithKeys,
+      { domains: productDomains, repos: productRepos, slugs: productSlugs },
+    );
+    if (suppressedEventIds.length > 0) {
+      console.error(
+        `[pipeline] 跨段去重: 从要闻段抑制 ${suppressedEventIds.length} 条（同项目已在新品段）：` +
+          suppressedEventIds.map((id) => id.slice(0, 8)).join(', '),
+      );
+    }
+
     // ── 阶段 6：多通道推送（向所有已配置通道并发分发，单消息原子 + push_records 幂等，G6）。
-    //    早退：新闻 Top N（pushable）为空**且**所有 channel 的产品候选皆空才不推（design D6）；
-    //    仅一段空时仍推非空段（dispatchDailyDigest 内逐 channel 再判）。
+    //    早退：新闻 Top N（**抑制后** pushableDeduped）为空**且**所有 channel 的产品候选皆空才不推
+    //    （design D6）；仅一段空时仍推非空段（dispatchDailyDigest 内逐 channel 再判）。
     if (
-      pushable.length === 0 &&
+      pushableDeduped.length === 0 &&
       [...productsByChannel.values()].every((p) => p.length === 0)
     ) {
       // 新闻 Top N 空（摘要分母 = 0 或全被剔除）且所有 channel 产品候选亦空 → 无可推，正常结束
@@ -632,10 +691,10 @@ export async function runDailyWorkflow(
 
     // 向**所有已配置通道并发分发**（daily-intel-pipeline / feishu-push）。channelSenders 已在阶段 4
     // 解析（与 selectTopN 候选共用同一通道集）。各通道走 dispatcher 的**双段**状态机
-    // dispatchDailyDigest（要闻段 = pushable，新品段 = productsByChannel.get(channel)；待发集合各按
-    // per-channel 跨天「从未 success」判定）——一条「AI Radar 每日情报」含要闻 + 新品两段、各自幂等。
+    // dispatchDailyDigest（要闻段 = pushableDeduped〔跨段抑制后〕，新品段 = productsByChannel.get(channel)；
+    // 待发集合各按 per-channel 跨天「从未 success」判定）——一条「AI Radar 每日情报」含要闻 + 新品两段、各自幂等。
     console.error(
-      `[pipeline] 推送: 待发要闻 ${pushable.length} 条，向 ${channelSenders.length} 个通道并发分发：` +
+      `[pipeline] 推送: 待发要闻 ${pushableDeduped.length} 条（跨段抑制后），向 ${channelSenders.length} 个通道并发分发：` +
         channelSenders.map((c) => c.channel).join(', '),
     );
 
@@ -646,7 +705,7 @@ export async function runDailyWorkflow(
     const settled = await Promise.allSettled(
       channelSenders.map(({ channel, sender }) =>
         dispatchDailyDigest(
-          pushable,
+          pushableDeduped,
           productsByChannel.get(channel) ?? [],
           { now, sender, channel },
           dbh,

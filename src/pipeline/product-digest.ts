@@ -35,6 +35,7 @@ import {
   collapseUncollapsedProductRawItems,
   UNNAMED_PRODUCT_NAME,
 } from '../collectors/product-collapse.js';
+import { resolveProductUrl } from '../collectors/product-keys.js';
 import {
   summarizeProduct,
   ProductDigestFailureError,
@@ -141,9 +142,12 @@ export async function selectProductCandidates(
       // 中文展示列（中文化前置步骤写入；NULL = 未中文化 → 映射回退英文 name / 无要点）。
       nameZh: aiProducts.nameZh,
       taglineZh: aiProducts.taglineZh,
-      // 链接来源：ai_products 无 url 列，仅 canonical_domain（裸域，product-collapse 写入端
-      // 规范化为无 scheme/path）。映射 canonicalUrl = 'https://' + canonical_domain（见下）。
+      // 链接来源（回退链）：ai_products 无 url 列；三键 canonical_domain → github_repo →
+      // product_hunt_slug 经 resolveProductUrl 回退产出 canonicalUrl（见下映射）。三键同时供
+      // daily-intel-pipeline 跨段去重对齐（候选携带 productMergeKeys，从内存读、不回查 DB）。
       canonicalDomain: aiProducts.canonicalDomain,
+      githubRepo: aiProducts.githubRepo,
+      productHuntSlug: aiProducts.productHuntSlug,
       lastSeenAt: aiProducts.lastSeenAt,
     })
     .from(aiProducts)
@@ -166,23 +170,14 @@ export async function selectProductCandidates(
   // target_id=product_id 在 dispatcher 内由 e.eventId 承载，representativeTitle 改中文不污染
   // 推送幂等四元组。
   return rows.map((r) => {
-    // canonical_domain 为裸域或 host:port → 'https://' + domain。extractCanonicalDomain 用
-    // new URL(url).host 提取，host 合法可含端口（如 example.com:8080），故不能用 `:` 一刀切。
-    // 用 URL 试构造校验：保留合法带端口域，仍挡 scheme/path/凭据/空白等畸形 → 降级 null
-    // （绝不产生 https://https://… 或坏链接）；domain NULL/空 也降级 null → 渲染回退纯产品名。
-    const d = r.canonicalDomain;
-    let canonicalUrl: string | null = null;
-    if (d && !/\s/.test(d) && !d.includes('://')) {
-      try {
-        const u = new URL(`https://${d}`);
-        // host === d 保证 d 是纯 host（裸域或 host:port），含 path/凭据等畸形则不等 → 降级 null。
-        if (u.host === d && u.pathname === '/' && !u.search && !u.hash) {
-          canonicalUrl = `https://${d}`;
-        }
-      } catch {
-        /* 畸形 → 保持 null */
-      }
-    }
+    // 链接回退链（design D5）：canonical_domain → github_repo → product_hunt_slug，
+    // 每级畸形落下一级、皆空/畸形 → null（渲染回退纯产品名，绝不渲染坏链接）。
+    // 域级严格校验、github 两段校验、slug 含 `/` 或空白判畸形均收口在 resolveProductUrl 内。
+    const canonicalUrl = resolveProductUrl(
+      r.canonicalDomain,
+      r.githubRepo,
+      r.productHuntSlug,
+    );
     return {
       eventId: r.productId,
       representativeTitle: r.nameZh ?? r.name,
@@ -191,6 +186,13 @@ export async function selectProductCandidates(
       canonicalUrl,
       publishedAt: null,
       rankScore: 0,
+      // 跨段去重对齐键载体：携带**存储三键**（非 canonicalUrl 渲染域），供 daily-intel-pipeline
+      // 从内存候选直接读、不回查 DB。事件侧候选不填此字段（保持共享候选类型可空）。
+      productMergeKeys: {
+        canonicalDomain: r.canonicalDomain,
+        githubRepo: r.githubRepo,
+        productHuntSlug: r.productHuntSlug,
+      },
     };
   });
 }

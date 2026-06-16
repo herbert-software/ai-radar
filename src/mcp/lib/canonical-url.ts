@@ -5,14 +5,16 @@
  *   ① loadCanonicalUrls —— event 经 `representative_raw_item_id → raw_items.canonical_url`
  *      读已规范化的原文 url（采集期已规范化、此处不再现场校验；缺则 null）。
  *      复刻 `src/pipeline/run-daily-workflow.ts:loadCanonicalUrls`（私有非导出，不 import）。
- *   ② productCanonicalUrl —— product 的 `canonical_domain` 现拼 `https://` + **严格 URL 校验**
- *      （new URL 校验 host===裸域、无 path/search/hash/凭据，畸形降级 null，绝不裸拼）。
- *      复刻 `src/pipeline/product-digest.ts:selectProductCandidates` 内联映射。
+ *   ② productCanonicalUrl —— product 的 `canonical_domain` 经 `resolveProductUrl(domain,null,null)`
+ *      委托产链接（域校验单一 SOT 在 collectors/product-keys.ts，畸形降级 null、绝不裸拼）；
+ *      入参 github/slug 恒 null → 仅认 canonical_domain（search_ai_products 历史检索口径不变）。
  *
- * **不 import pipeline 文件**：它们 top-level import 全局 env，会崩纯查询。只 import schema.ts（零 env）。
+ * **不 import pipeline 文件**：它们 top-level import 全局 env，会崩纯查询。只 import schema.ts（零 env）
+ * 与 collectors/product-keys.ts（零 env/db 纯 leaf，仅依赖 dedup/normalize 的 crypto/emoji/opencc）。
  */
 import { inArray } from 'drizzle-orm';
 import { aiNewsEvents, rawItems } from '../../db/schema.js';
+import { resolveProductUrl } from '../../collectors/product-keys.js';
 import type { McpDb } from '../db.js';
 
 /**
@@ -61,26 +63,17 @@ export async function loadCanonicalUrls(
 }
 
 /**
- * product `canonical_domain → canonicalUrl` 严格映射（复刻 product-digest 内联）。
+ * product `canonical_domain → canonicalUrl` 严格映射（**search_ai_products 专用，仅认 canonical_domain**）。
  *
- * canonical_domain 为裸域或 host:port → `https://` + domain；用 new URL 试构造校验：
- * host 须等于裸域（保留合法带端口域，仍挡 scheme/path/凭据/空白等畸形）、pathname==='/'、
- * 无 search/hash；任一不满足或 domain NULL/空/含空白/含 `://` → 降级 null（绝不产生坏链接）。
+ * 委托 `resolveProductUrl(domain, null, null)`：域校验单一 SOT 在 `collectors/product-keys.ts`
+ * （domainToUrl，畸形降级 null、绝不裸拼），避免 search 与 get_today 域校验谓词漂移。
+ * **入参 github/slug 恒 null** → 行为与既有「仅认 canonical_domain」**完全一致**（不会因 search 检索
+ * 拿到 github/PH 回退链接）：search_ai_products 是历史检索、无「忠实于已推」义务，故保留域-only 口径。
+ * get_today 则直接调 resolveProductUrl 三键回退（忠实还原已推），二者口径差异是两契约的合理差异。
  *
  * @param domain ai_products.canonical_domain（裸域，可空）。
  * @returns      合法时 `https://domain`，畸形/缺失时 null。
  */
 export function productCanonicalUrl(domain: string | null): string | null {
-  const d = domain;
-  if (d && !/\s/.test(d) && !d.includes('://')) {
-    try {
-      const u = new URL(`https://${d}`);
-      if (u.host === d && u.pathname === '/' && !u.search && !u.hash) {
-        return `https://${d}`;
-      }
-    } catch {
-      /* 畸形 → 保持 null */
-    }
-  }
-  return null;
+  return resolveProductUrl(domain, null, null);
 }

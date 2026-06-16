@@ -119,3 +119,79 @@ export function extractProductMergeKeys(input: ProductKeyInput): ProductMergeKey
     productHuntSlug: slug,
   };
 }
+
+/**
+ * 由 `canonical_domain` 严格构造 `https://<domain>`（裸域 / host:port），畸形降级 null。
+ *
+ * `ai_products.canonical_domain` 是无 scheme/path 的裸域（product-collapse 写入端规范化），
+ * 但历史/异常数据可能含 scheme / path / 空白 → 须严格校验防拼出坏链接（如 `https://https://…`）。
+ * 校验：不含空白、不含 `://`，且 `new URL('https://'+d)` 试构造后 `host===d`（保留合法带端口域，
+ * 如 `example.com:8080`，仍挡 path/凭据/空白等畸形）、`pathname==='/'`、无 search/hash。
+ *
+ * 此为「域→URL 域校验」的单一 SOT：`resolveProductUrl` 的第①级与
+ * `mcp/lib/canonical-url.ts:productCanonicalUrl` 均经它，避免 search 与 get_today 域校验谓词漂移。
+ */
+function domainToUrl(domain: string | null | undefined): string | null {
+  const d = domain;
+  if (d && !/\s/.test(d) && !d.includes('://')) {
+    try {
+      const u = new URL(`https://${d}`);
+      if (u.host === d && u.pathname === '/' && !u.search && !u.hash) {
+        return `https://${d}`;
+      }
+    } catch {
+      /* 畸形 → 保持 null */
+    }
+  }
+  return null;
+}
+
+/**
+ * 产品官网链接回退链（确定性纯函数，design D5）。push 与 MCP get_today 共用一份。
+ *
+ * 解决「纯 GitHub 仓库类产品（`canonical_domain` 空、仅 `github_repo`）在新品段丢官网链接」
+ * （生产实锤 `themartiano/luz`）。按优先级回退、每级畸形即落下一级、皆空/畸形 → null：
+ *   ① `canonical_domain` → `https://<domain>`（沿用 domainToUrl 的严格畸形校验）。
+ *   ② `github_repo`（归一 `owner/name`、恰两段非空）→ `https://github.com/<owner>/<name>`。
+ *   ③ `product_hunt_slug`（**含 `/` 或空白即判畸形、落 null**，不 `%2F` 编码后强拼）
+ *      → `https://www.producthunt.com/posts/<slug>`。
+ *
+ * **零 env/db/config 依赖**（与 extractProductMergeKeys 同 leaf）：产出的 URL 仅供**渲染/还原**，
+ * **不**参与跨段去重对齐（后者用 ai_products 存储三键字段，见 daily-intel-pipeline）。
+ *
+ * @param canonicalDomain  ai_products.canonical_domain（裸域，可空）。
+ * @param githubRepo       ai_products.github_repo（`owner/name`，可空）。
+ * @param productHuntSlug  ai_products.product_hunt_slug（PH 原生 slug，可空）。
+ * @returns                合法时回退链产出的 URL，皆空/畸形时 null（渲染降级纯产品名）。
+ */
+export function resolveProductUrl(
+  canonicalDomain: string | null | undefined,
+  githubRepo: string | null | undefined,
+  productHuntSlug: string | null | undefined,
+): string | null {
+  // ① canonical_domain（沿用严格畸形校验，畸形落下一级）。
+  const domainUrl = domainToUrl(canonicalDomain);
+  if (domainUrl) return domainUrl;
+
+  // ② github_repo：恰 `owner/name` 两段且各非空才拼，否则落下一级（防 `github.com//`、`/x` 等）。
+  const repo = asString(githubRepo);
+  if (repo) {
+    const segments = repo.split('/');
+    if (
+      segments.length === 2 &&
+      segments[0]!.trim().length > 0 &&
+      segments[1]!.trim().length > 0 &&
+      !/\s/.test(repo)
+    ) {
+      return `https://github.com/${repo}`;
+    }
+  }
+
+  // ③ product_hunt_slug：含 `/` 或空白即判畸形、落 null（不 `%2F` 编码后强拼）；通过则直接拼。
+  const slug = asString(productHuntSlug);
+  if (slug && !slug.includes('/') && !/\s/.test(slug)) {
+    return `https://www.producthunt.com/posts/${slug}`;
+  }
+
+  return null;
+}

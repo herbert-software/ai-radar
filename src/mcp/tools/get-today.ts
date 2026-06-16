@@ -4,9 +4,12 @@
  * 以 `push_records`（push_date=今天〔MCP env PUSH_TIMEZONE〕、status='success'）为准还原已推内容，
  * **不重跑 selectTopN**：channel 默认取库中当日实际有 success 的 distinct channel（不依赖进程
  * env 的 isFeishuEnabled），可传 channel 过滤；按 target_type join ai_news_events（要闻段）/
- * ai_products（新品段）；event url 经 MCP loadCanonicalUrls（缺则省略）、product 链接经 MCP
- * productCanonicalUrl 严格映射（畸形降级 null、不裸拼）；orphan 跳过；当日无 success → 空 +
- * 文本「今日尚未推送」。
+ * ai_products（新品段）；event url 经 MCP loadCanonicalUrls（缺则省略）、product 链接经
+ * **product-digest 同一 `resolveProductUrl` 回退链**（`canonical_domain` → `github_repo` →
+ * `product_hunt_slug`，含 URL/段校验、畸形降级 null、不裸拼），忠实于实际已推内容——否则
+ * github-only/PH-only 产品「推时有链接、查时无链接」；orphan 跳过；当日无 success → 空 +
+ * 文本「今日尚未推送」。**仅 get_today 改回退链**（其有「忠实于已推」不变量）；search_ai_products
+ * 保留既有 `productCanonicalUrl`（canonical_domain-only，历史检索无忠实义务）。
  *
  * 输出契约（design D5）：声明 outputSchema + handler 返回 structuredContent（DTO，handler 内 zod
  * parse）+ 向后兼容 content 文本（JSON.stringify(dto)）。annotations.readOnlyHint:true。
@@ -19,7 +22,8 @@ import { channelEnum, TARGET_TYPE, type Channel } from '../../push/targets.js';
 import { aiNewsEvents, aiProducts, pushRecords } from '../../db/schema.js';
 import { getContext } from '../context.js';
 import { getPushDate } from '../lib/push-date.js';
-import { loadCanonicalUrls, productCanonicalUrl } from '../lib/canonical-url.js';
+import { loadCanonicalUrls } from '../lib/canonical-url.js';
+import { resolveProductUrl } from '../../collectors/product-keys.js';
 import { toIsError } from '../lib/errors.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { McpToolDescriptor } from './types.js';
@@ -156,7 +160,9 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
       }
     }
 
-    // 6. 新品段：join ai_products 还原名称（中文译名优先）+ 中文简介 + 严格映射链接（畸形域降级 null，不裸拼）。
+    // 6. 新品段：join ai_products 还原名称（中文译名优先）+ 中文简介 + 链接回退链（忠实于已推）。
+    //    SELECT 须取三键 canonical_domain/github_repo/product_hunt_slug，否则换 resolveProductUrl
+    //    仍会因入参缺失丢 github-only/PH-only 产品的链接。
     const products: Array<{
       targetId: string;
       title: string | null;
@@ -171,6 +177,8 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
           nameZh: aiProducts.nameZh,
           taglineZh: aiProducts.taglineZh,
           canonicalDomain: aiProducts.canonicalDomain,
+          githubRepo: aiProducts.githubRepo,
+          productHuntSlug: aiProducts.productHuntSlug,
         })
         .from(aiProducts)
         .where(inArray(aiProducts.productId, productIds));
@@ -182,7 +190,9 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
           targetId: r.productId,
           // 中文译名优先、缺则回退英文 name（join 当前 ai_products 值，非推送快照、固有近似）。
           title: r.nameZh ?? r.name,
-          url: productCanonicalUrl(r.canonicalDomain),
+          // 与 push 同一 resolveProductUrl 回退链：canonical_domain → github_repo →
+          // product_hunt_slug，畸形降级 null、不裸拼，忠实于实际已推内容。
+          url: resolveProductUrl(r.canonicalDomain, r.githubRepo, r.productHuntSlug),
           tagline: r.taglineZh, // 中文简介，缺则 null。
         });
       }

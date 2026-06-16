@@ -11,6 +11,7 @@
 import { env } from '../config/env.js';
 import {
   defaultLogError,
+  isHackerNewsNonNewsPost,
   withRetry,
   type CollectedItem,
   type LogError,
@@ -116,6 +117,16 @@ export async function collectHackerNews(
       const raw = result.value as HackerNewsItem | null;
       // 过滤 null（已删/不存在）、deleted、dead 的条目。
       if (!raw || raw.deleted || raw.dead || raw.id == null) return;
+      // 按原始 title 行首前缀排除 Show/Ask/Launch/Tell HN 帖式帖（源身份净化）：这些是 HN 平台约定的
+      // 非综合新闻帖（产品/公司发布、提问/告示），不应以 news 身份进要闻段，否则与产品发现源 show_hn
+      // 构成同一项目双段重复。判定按 title（HN item.type 不区分 Show/Ask HN，均为 story）。
+      if (isHackerNewsNonNewsPost(raw.title)) {
+        logError('hn 帖式前缀（Show/Ask/Launch/Tell HN）跳过不发射（非综合新闻帖）', {
+          id: raw.id,
+          title: raw.title,
+        });
+        return;
+      }
       items.push(mapHackerNewsItem(raw));
     } else {
       logError(`hn item 最终失败（已跳过）：${targetIds[idx]}`, result.reason);

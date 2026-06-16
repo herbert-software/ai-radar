@@ -1628,3 +1628,284 @@ describe.skipIf(!canRun)('runDailyWorkflow 语义去重 + 知识库接线（组 
     expect(Number(rows[0]!.n)).toBe(0);
   });
 });
+
+/**
+ * runDailyWorkflow 要闻段↔新品段跨段去重抑制集成测试
+ * （add-cross-segment-dedup-and-hn-purify 组 C，tasks 2.4/2.5，design D3/D4）。
+ *
+ * 验证编排接线（纯函数键比对已在 src/selection/__tests__/cross-segment-dedup.test.ts 单测）：
+ * - 2.4 幂等 + 唯一约束：事件 canonical_url 域 = 某产品 canonical_domain → 要闻段剔该事件、
+ *   该 event 无 push_records 行（不写 event 命名空间）、新品段含该产品按 target_type='product' 正常写。
+ * - 2.5 跨天候选资格 / 早退 / Model B：① 被剔事件次日产品不再候选时回要闻段推送、表头 X 取抑制后数；
+ *   ② 全要闻段被抑制 + 新品非空 → 不早退、只推新品段；③ 产品仅 telegram 候选时抑制对两通道一致（并集）。
+ *
+ * 真实 selectProductsForChannelSafe（不 spy）→ 候选携带存储三键 productMergeKeys，供编排层构产品键集。
+ * collapseProductsOnce spy 为 no-op（不触真实产品塌缩、不干扰 seed 的 ai_products）。
+ * ai_products / 其 push_records 不在 cleanup 的 TRUNCATE 内，故 seed 用唯一前缀、本块 finally 显式清理。
+ * 推送均注入 mock sender + 钉 channels（防误发生产飞书，memory test-no-prod-sends）。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 跨段去重抑制（组 C，2.4/2.5）', () => {
+  const PROD_PREFIX = `rdw-xseg-${process.pid}-`;
+
+  /** seed 一条 ai_products（直插，绕过塌缩）；canonical_domain/github_repo 任填。 */
+  async function seedProduct(args: {
+    suffix: string;
+    canonicalDomain?: string | null;
+    githubRepo?: string | null;
+  }): Promise<string> {
+    const productId = `${PROD_PREFIX}${args.suffix}`;
+    await pool!.query(
+      `INSERT INTO ai_products (product_id, name, canonical_domain, github_repo, last_seen_at)
+       VALUES ($1, $2, $3, $4, now())`,
+      [
+        productId,
+        `${PROD_PREFIX}${args.suffix}-name`,
+        args.canonicalDomain ?? null,
+        args.githubRepo ?? null,
+      ],
+    );
+    return productId;
+  }
+
+  async function cleanupProducts() {
+    if (!pool) return;
+    await pool.query(`DELETE FROM push_records WHERE target_id LIKE $1`, [`${PROD_PREFIX}%`]);
+    await pool.query(`DELETE FROM ai_products WHERE product_id LIKE $1`, [`${PROD_PREFIX}%`]);
+  }
+
+  it('2.4 同域同项目同进要闻与新品 → 要闻段剔除、event 无 push_record、产品照常写 product 行', async () => {
+    await cleanupProducts();
+    // 产品 canonical_domain 与事件 canonical_url 域一致（grassdx 类同域双段重复）。
+    const domain = `grassdx-${process.pid}.example.com`;
+    const pid = await seedProduct({ suffix: 'same-domain', canonicalDomain: domain });
+    // 塌缩 no-op（不干扰 seed 的产品）；候选走真实路径（携带 productMergeKeys）。
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    try {
+      // 事件 URL 域 = 产品域 → 跨段抑制命中。另造一条无关事件验证不被误剔。
+      const items = [
+        item({ id: 'xseg-hit', url: `https://${domain}/show`, title: 'Vet AI lawn (Show HN ish)' }),
+        item({ id: 'xseg-keep', url: 'https://unrelated-news.example.com/x', title: 'Unrelated real news' }),
+      ];
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      expect(result.outcome).toBe('pushed');
+      expect(sender.calls).toBe(1);
+
+      // 被抑制事件的 event_id：经 canonical_url 域命中 → 不应有 event push_record。
+      // 先取两事件 event_id（按 representative_title 标记区分）。
+      const evRows = await pool!.query<{ event_id: string; title: string }>(
+        `SELECT event_id, representative_title AS title FROM ai_news_events`,
+      );
+      const hitEvent = evRows.rows.find((r) => r.title.includes('Vet AI lawn'))!;
+      const keepEvent = evRows.rows.find((r) => r.title.includes('Unrelated real news'))!;
+      expect(hitEvent).toBeTruthy();
+      expect(keepEvent).toBeTruthy();
+
+      // 被剔事件**无 event push_record**（不写 event 命名空间，保跨天候选资格）。
+      const hitRecs = await pool!.query<{ n: string }>(
+        `SELECT count(*) AS n FROM push_records WHERE target_type='event' AND target_id=$1`,
+        [hitEvent.event_id],
+      );
+      expect(Number(hitRecs.rows[0]!.n)).toBe(0);
+
+      // 未被剔事件正常写 event success。
+      const keepRecs = await pool!.query<{ status: string }>(
+        `SELECT status FROM push_records WHERE target_type='event' AND target_id=$1`,
+        [keepEvent.event_id],
+      );
+      expect(keepRecs.rows[0]?.status).toBe('success');
+
+      // 产品按 target_type='product' 正常写 success（UNIQUE(target_type,target_id,channel,push_date) 不冲突）。
+      const prodRecs = await pool!.query<{ status: string }>(
+        `SELECT status FROM push_records WHERE target_type='product' AND target_id=$1`,
+        [pid],
+      );
+      expect(prodRecs.rows[0]?.status).toBe('success');
+    } finally {
+      collapseSpy.mockRestore();
+      await cleanupProducts();
+    }
+  });
+
+  it('2.5① 被剔事件次日产品不再候选时回要闻段推送（无永久漏推）、表头取抑制后实发数', async () => {
+    await cleanupProducts();
+    const domain = `crossday-${process.pid}.example.com`;
+    const pid = await seedProduct({ suffix: 'cross-day', canonicalDomain: domain });
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    const url = `https://${domain}/post`;
+    try {
+      // Day 1：事件与产品同域 → 事件被抑制、不写 event push_record；产品 success。
+      const s1 = okSender();
+      const r1 = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning([item({ id: 'cd1', url, title: 'Cross day suppressed' })]) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender: s1,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      // 唯一事件被抑制 + 产品非空 → 不早退、推一条（只新品段）；表头要闻数为 0（抑制后实发）。
+      expect(r1.outcome).toBe('pushed');
+      expect(s1.calls).toBe(1);
+      const evRow = await pool!.query<{ event_id: string }>(`SELECT event_id FROM ai_news_events`);
+      const eventId = evRow.rows[0]!.event_id;
+      // 被剔事件无 event push_record（保跨天候选资格）。
+      const d1EventRecs = await pool!.query<{ n: string }>(
+        `SELECT count(*) AS n FROM push_records WHERE target_type='event' AND target_id=$1`,
+        [eventId],
+      );
+      expect(Number(d1EventRecs.rows[0]!.n)).toBe(0);
+      // 产品 Day1 success。
+      const d1ProdRecs = await pool!.query<{ status: string }>(
+        `SELECT status FROM push_records WHERE target_type='product' AND target_id=$1`,
+        [pid],
+      );
+      expect(d1ProdRecs.rows[0]?.status).toBe('success');
+
+      // Day 2：产品已 success（一生一次）→ 不再是候选 → 产品键集空 → 事件不再被抑制 → 回要闻段推送。
+      const NOW_DAY2 = new Date(NOW.getTime() + 24 * 60 * 60 * 1000);
+      const s2 = okSender();
+      const r2 = await runDailyWorkflow({
+        now: NOW_DAY2,
+        dbh: db!,
+        // 同 URL 重新抓到（不同 source_item_id）→ 塌缩进既有事件（published_at 已非 NULL、仍在窗口）。
+        collect: { collectors: collectorsReturning([item({ id: 'cd1b', url, title: 'Cross day recover' })]) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender: s2,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      expect(r2.outcome).toBe('pushed');
+      expect(s2.calls).toBe(1);
+      // 事件 Day2 回要闻段、正常写 event success（无永久漏推）。
+      const d2EventRecs = await pool!.query<{ status: string }>(
+        `SELECT status FROM push_records WHERE target_type='event' AND target_id=$1`,
+        [eventId],
+      );
+      expect(d2EventRecs.rows[0]?.status).toBe('success');
+    } finally {
+      collapseSpy.mockRestore();
+      await cleanupProducts();
+    }
+  });
+
+  it('2.5② 全要闻段被抑制 + 新品非空 → 按 pushableDeduped 不早退、只推新品段', async () => {
+    await cleanupProducts();
+    // 两个产品域，分别对齐两条（即全部）要闻事件 → pushableDeduped 为空、但产品候选非空。
+    const dom1 = `allsup1-${process.pid}.example.com`;
+    const dom2 = `allsup2-${process.pid}.example.com`;
+    const pid1 = await seedProduct({ suffix: 'allsup-1', canonicalDomain: dom1 });
+    const pid2 = await seedProduct({ suffix: 'allsup-2', canonicalDomain: dom2 });
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    try {
+      const items = [
+        item({ id: 'as1', url: `https://${dom1}/a`, title: 'All suppressed one' }),
+        item({ id: 'as2', url: `https://${dom2}/b`, title: 'All suppressed two' }),
+      ];
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      // 全要闻被抑制（pushableDeduped 空）但新品非空 → 不早退、推一条（只新品段）。
+      expect(result.outcome).toBe('pushed');
+      expect(sender.calls).toBe(1);
+      // 无 event push_record（两条都被剔，皆不写 event 命名空间）。
+      const evRecs = await pool!.query<{ n: string }>(
+        `SELECT count(*) AS n FROM push_records WHERE target_type='event'`,
+      );
+      expect(Number(evRecs.rows[0]!.n)).toBe(0);
+      // 两产品均按 target_type='product' 正常写 success。
+      const prodRecs = await pool!.query<{ target_id: string; status: string }>(
+        `SELECT target_id, status FROM push_records WHERE target_type='product' AND target_id LIKE $1`,
+        [`${PROD_PREFIX}%`],
+      );
+      expect(prodRecs.rows.find((r) => r.target_id === pid1)?.status).toBe('success');
+      expect(prodRecs.rows.find((r) => r.target_id === pid2)?.status).toBe('success');
+    } finally {
+      collapseSpy.mockRestore();
+      await cleanupProducts();
+    }
+  });
+
+  it('2.5③ 产品仅 telegram 候选（feishu 已 success）→ 抑制用并集口径、对两通道一致', async () => {
+    await cleanupProducts();
+    const domain = `unionscope-${process.pid}.example.com`;
+    const pid = await seedProduct({ suffix: 'union', canonicalDomain: domain });
+    // 预置：该产品已在 **feishu** success（任一 push_date）→ feishu 候选排除它、仅 telegram 候选。
+    await pool!.query(
+      `INSERT INTO push_records (target_type, target_id, channel, push_date, status, pushed_at)
+       VALUES ('product', $1, 'feishu', '2099-03-01', 'success', now())`,
+      [pid],
+    );
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    try {
+      const url = `https://${domain}/x`;
+      const tg = okSender();
+      const fs = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning([item({ id: 'us1', url, title: 'Union scope event' })]) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        channels: ['telegram', 'feishu'],
+        senders: { telegram: tg, feishu: fs },
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      expect(result.outcome).toBe('pushed');
+
+      // 并集口径：产品在 telegram 候选（feishu 不在）→ channel-blind 要闻段对该事件抑制对两通道一致：
+      // 该 event 在**两个通道**都不写 event push_record（不是只在 telegram 剔、feishu 留）。
+      const evRows = await pool!.query<{ event_id: string }>(`SELECT event_id FROM ai_news_events`);
+      const eventId = evRows.rows[0]!.event_id;
+      const evRecs = await pool!.query<{ channel: string }>(
+        `SELECT channel FROM push_records WHERE target_type='event' AND target_id=$1`,
+        [eventId],
+      );
+      expect(evRecs.rows).toHaveLength(0); // 两通道皆无 event 行（并集抑制一致）。
+
+      // 产品：telegram 候选 → telegram 写 product success；feishu 已 success（预置 2099-03-01），
+      // 当日 feishu 不再候选 → 当日不再新增 feishu 产品行（沿用预置那条）。
+      const prodTg = await pool!.query<{ n: string }>(
+        `SELECT count(*) AS n FROM push_records WHERE target_type='product' AND target_id=$1 AND channel='telegram' AND status='success'`,
+        [pid],
+      );
+      expect(Number(prodTg.rows[0]!.n)).toBe(1);
+    } finally {
+      collapseSpy.mockRestore();
+      await cleanupProducts();
+    }
+  });
+});

@@ -89,16 +89,20 @@ async function seedEvent(args: {
   return rows[0]!.eventId;
 }
 
-/** 造一条 product（含 canonical_domain），返回 product_id（DB 生成）。 */
+/** 造一条 product（含 canonical_domain / 可选 github_repo / product_hunt_slug），返回 product_id（DB 生成）。 */
 async function seedProduct(args: {
   name: string;
   canonicalDomain: string | null;
+  githubRepo?: string | null;
+  productHuntSlug?: string | null;
 }): Promise<string> {
   const rows = await db!
     .insert(aiProducts)
     .values({
       name: args.name,
       canonicalDomain: args.canonicalDomain,
+      githubRepo: args.githubRepo ?? null,
+      productHuntSlug: args.productHuntSlug ?? null,
     })
     .returning({ productId: aiProducts.productId });
   return rows[0]!.productId;
@@ -130,11 +134,12 @@ function structured<T = Record<string, unknown>>(res: CallToolResult): T {
 
 async function cleanup() {
   if (!pool) return;
-  // push_records 绑到本套件 event/product → 经 dedup_key/canonical_domain 反查清理。
+  // push_records 绑到本套件 event/product → 经 dedup_key/canonical_domain/name 反查清理
+  // （name 反查覆盖 canonical_domain=NULL 的 github-only/PH-only 产品，其 push_records 否则漏清）。
   await pool.query(
     `DELETE FROM push_records WHERE target_id IN
        (SELECT event_id FROM ai_news_events WHERE dedup_key LIKE $1)
-        OR target_id IN (SELECT product_id FROM ai_products WHERE canonical_domain LIKE $2)`,
+        OR target_id IN (SELECT product_id FROM ai_products WHERE canonical_domain LIKE $2 OR name LIKE $1)`,
     [`${SRC}%`, `${DOMP}%`],
   );
   await pool.query(`DELETE FROM ai_news_events WHERE dedup_key LIKE $1`, [`${SRC}%`]);
@@ -251,6 +256,27 @@ describe.skipIf(!canRun)('get_today_ai_digest（查已推事实）', () => {
     const dto = structured<{ events: Array<{ targetId: string }> }>(res);
     expect(res.isError).not.toBe(true);
     expect(dto.events.find((e) => e.targetId === evId)).toBeUndefined(); // orphan 跳过。
+  });
+
+  it('github-only 产品（canonical_domain=NULL + github_repo）→ get_today 经回退链还原 github 链接（忠实于已推）', async () => {
+    // 生产实锤 themartiano/luz：纯 GitHub 仓库类产品 push 时经 resolveProductUrl 渲染出 github
+    // 链接；get_today 须用同一回退链还原（取 github_repo/product_hunt_slug），否则「推时有链接、
+    // 查时无链接」。校验 get_today 不丢链接、与已推一致。
+    const repo = `${SRC}owner/repo`;
+    const ghProduct = await seedProduct({
+      name: `${SRC}GithubOnly`,
+      canonicalDomain: null,
+      githubRepo: repo,
+    });
+    await seedPush({ targetType: 'product', targetId: ghProduct, channel: 'telegram' });
+
+    const res = (await getTodayTool.handler({}, {})) as CallToolResult;
+    const dto = structured<{
+      products: Array<{ targetId: string; title: string | null; url: string | null }>;
+    }>(res);
+    const p = dto.products.find((x) => x.targetId === ghProduct);
+    expect(p).toBeDefined();
+    expect(p!.url).toBe(`https://github.com/${repo}`); // 回退到 github 链接、不因 canonical_domain 空丢链接。
   });
 });
 

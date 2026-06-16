@@ -175,6 +175,11 @@ export const REALTIME_NEWS_SOURCES: readonly CollectorSource[] = [
  *
  * 与 `REALTIME_NEWS_SOURCES`（见上）对称的手工维护字面量；`show_hn` 与 `product_hunt` 同属产品源。
  * 有意不归属任一子集的源（如 arXiv 仅日报全集沉淀）不出现在这两个子集里。
+ *
+ * **跨段去重耦合（回引 `PLATFORM_HOSTS`，design D3）**：新增产品源时，若其**无 website 兜底 URL**
+ * 的 host 是「URL 路径而非子域标识产品」的平台 host（如 `github.com`/`producthunt.com`/`npmjs.com`），
+ * MUST 同步把该 host 加入 `src/selection/cross-segment-dedup.ts` 的 `PLATFORM_HOSTS` 常量——否则该平台
+ * host 的要闻会被跨段去重 mass 误抑制（该常量构建产品域集时剔除其中的 host，见 daily-intel-pipeline）。
  */
 export const PRODUCT_SOURCES: readonly CollectorSource[] = [
   'product_hunt',

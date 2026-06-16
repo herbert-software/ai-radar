@@ -54,6 +54,18 @@ export interface SelectedEvent {
   publishedAt: Date | null;
   /** 程序计算的组合分（保留供可观测/日志，不入库）。 */
   rankScore: number;
+  /**
+   * 产品归一三键（`canonical_domain`/`github_repo`/`product_hunt_slug`），**仅产品候选携带**
+   * （selectProductCandidates 从 ai_products 存储字段填入），供 daily-intel-pipeline 跨段去重
+   * 从内存候选直接读、不回查 DB。**事件侧候选不填**（保持 undefined）——与 headlineZh 在产品
+   * 语境复用为 tagline 同范式：共享候选类型上的 product-only 可选字段。跨段抑制用**存储三键**而非
+   * resolveProductUrl 渲染的 canonicalUrl（后者引入的平台 host 渲染域不污染抑制键，见 design D5）。
+   */
+  productMergeKeys?: {
+    canonicalDomain: string | null;
+    githubRepo: string | null;
+    productHuntSlug: string | null;
+  };
 }
 
 /** Top N 选择的可注入参数。 */
