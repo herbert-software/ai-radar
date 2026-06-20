@@ -12,7 +12,7 @@
  * 关键守卫：所有用例注入 generateObjectFn mock，绝不触达默认真实 LLM 路径
  * （llm-client.ts 的 VITEST 守卫亦会兜底，但此处显式注入）。
  */
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 // mineExperience 经 ../index.js 间接 import env（启动期校验，缺关键变量即 throw）。
 // 单元测试不依赖真实 key，注入占位 env（仅需非空字符串/合法 URL）后再动态 import，
@@ -20,6 +20,27 @@ import { beforeAll, describe, expect, it, vi } from 'vitest';
 let mineExperience: typeof import('../index.js').mineExperience;
 let ExperienceMiningFailureError: typeof import('../index.js').ExperienceMiningFailureError;
 let experienceCardSchema: typeof import('../schema.js').experienceCardSchema;
+
+// 捕获原始 env，afterAll 还原——防 beforeAll 设的占位（尤其 DATABASE_URL/REDIS_URL）泄漏到
+// 同 worker 后续测试，使其 DB-gated `skipIf(!databaseUrl)` 误判为可跑（test-order leakage）。
+const ENV_KEYS = [
+  'DATABASE_URL',
+  'REDIS_URL',
+  'LLM_API_KEY',
+  'LLM_MODEL',
+  'LLM_BASE_URL',
+  'TELEGRAM_BOT_TOKEN',
+  'TELEGRAM_CHAT_ID',
+] as const;
+const ORIGINAL_ENV = new Map(ENV_KEYS.map((k) => [k, process.env[k]]));
+
+afterAll(() => {
+  for (const k of ENV_KEYS) {
+    const orig = ORIGINAL_ENV.get(k);
+    if (orig === undefined) delete process.env[k];
+    else process.env[k] = orig;
+  }
+});
 
 beforeAll(async () => {
   // 用 ||= 而非 ??=：空串 env（已定义但为空）也覆盖为占位，否则 env.ts 的 .min(1) 会让本

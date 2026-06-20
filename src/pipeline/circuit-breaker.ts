@@ -105,7 +105,7 @@ export function classifySystemFailure(
       kind: 'all-unprocessable',
       reason:
         '本轮采集返回 > 0 但新闻类可处理条目数为 0（全部新闻条目 unprocessable，' +
-        '或仅有 product/paper 非新闻条目），提示采集器采空或归一函数故障。',
+        '或仅有 product/paper/experience 非新闻条目），提示采集器采空或归一函数故障。',
     };
   }
   return { alert: false, kind: 'none', reason: null };
