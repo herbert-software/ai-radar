@@ -41,8 +41,15 @@ export { kbIngestionMetadataSchema, type KbIngestionMetadata } from './schema.js
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
 
-/** 知识库准入闸阈值（复用 long_term_value >= 70 不变量；列在 env 暂无，硬钉常量与 QA §13.1 一致）。 */
-const KB_ADMISSION_FLOOR = 70;
+/**
+ * 知识库准入闸阈值（复用 long_term_value >= 70 不变量；列在 env 暂无，硬钉常量与 QA §13.1 一致）。
+ *
+ * **单一来源（add-ai-blogger-experience-mining，design D5 / spec）**：本常量是全仓库唯一的 `70`
+ * 准入闸。事件链 runKbIngestion、经验链 KB 准入 runExperienceKbIngestion 与实践锦囊推送候选
+ * （pipeline/experience-chain）三处共同 `import` 本常量，**禁止任一处写字面量 70**（否则违背
+ * 「单一 70」不变量、埋「改 KB 闸为 75 但推送仍 70」的口径分裂）。
+ */
+export const KB_ADMISSION_FLOOR = 70;
 
 /** 一轮 KB 入库的统计结果（供编排/可观测）。 */
 export interface KbIngestionResult {

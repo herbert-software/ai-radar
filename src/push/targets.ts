@@ -7,17 +7,24 @@
  * target_type 推送入口）统一引用本处常量，**禁止散落字面量**。新增 target_type/channel
  * 必须先扩此处枚举再使用。
  *
- * 本期（P2）权威全集（spec platform-foundation 显式声明）：
- * - `target_type` = `{event, product, alert, weekly}`
- *   —— `paper`/`repo` 不在本期（arXiv 论文仅采集沉淀、不推送）；`alert`/`weekly` 是 P2
- *      相对 QA §8.6 注释的有意新增（实时告警 / 周报各需独立幂等命名空间）。
+ * 权威全集（spec platform-foundation 显式声明）：
+ * - `target_type` = `{event, product, alert, weekly, experience}`
+ *   —— `paper`/`repo` 不在范围（arXiv 论文仅采集沉淀、不推送）；`alert`/`weekly` 是 P2
+ *      相对 QA §8.6 注释的有意新增（实时告警 / 周报各需独立幂等命名空间）；`experience`
+ *      是 add-ai-blogger-experience-mining 新增（AI 博主经验的实践锦囊推送需独立幂等命名空间）。
  * - `channel` = `{telegram, feishu}`
  *   —— Telegram 必配、飞书可选。
  */
 import { z } from 'zod';
 
-/** 推送目标类型枚举（本期权威全集）。 */
-export const targetTypeEnum = z.enum(['event', 'product', 'alert', 'weekly']);
+/** 推送目标类型枚举（权威全集）。 */
+export const targetTypeEnum = z.enum([
+  'event',
+  'product',
+  'alert',
+  'weekly',
+  'experience',
+]);
 /** 推送通道枚举（本期权威全集）。 */
 export const channelEnum = z.enum(['telegram', 'feishu']);
 
@@ -32,6 +39,7 @@ export const TARGET_TYPE = {
   product: 'product',
   alert: 'alert',
   weekly: 'weekly',
+  experience: 'experience',
 } as const satisfies Record<TargetType, TargetType>;
 
 export const CHANNEL = {

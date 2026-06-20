@@ -67,7 +67,9 @@ import {
 import type { SummarizeOptions } from '../agents/digest/index.js';
 import {
   dispatchDailyDigest,
+  dispatchDigest,
   type DailyDispatchResult,
+  type DispatchResult,
   type MessageSender,
 } from '../push/dispatcher.js';
 import {
@@ -75,9 +77,19 @@ import {
   digestPendingProducts,
   selectProductsForChannelSafe,
 } from './product-digest.js';
+import {
+  runExperienceMiningOnce,
+  runExperienceKbIngestion,
+  selectExperiencesForChannel,
+  type RunExperienceMiningOptions,
+  type RunExperienceKbIngestionOptions,
+  type SelectExperiencesOptions,
+  type ExperienceMiningResult,
+  type ExperienceKbIngestionResult,
+} from './experience-chain.js';
 import { createTelegramSender } from '../push/telegram.js';
 import { createFeishuSender } from '../push/feishu.js';
-import { CHANNEL, type Channel } from '../push/targets.js';
+import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 import { isFeishuEnabled } from '../config/env.js';
 import {
   acquireDigestLock,
@@ -182,6 +194,21 @@ export interface RunDailyWorkflowOptions {
    * `now` 由本编排注入（候选 push_date 与 push 阶段同源）。
    */
   kb?: Omit<RunKbIngestionOptions, 'now'>;
+  /**
+   * 实践锦囊段提炼选项（透传给 runExperienceMiningOnce；add-ai-blogger-experience-mining 组 E 5.2）。
+   * 注入 mock mineExperienceFn / mineOptions 等，使测试不真调经验提炼 LLM。channel-blind 每批只跑一次。
+   */
+  experienceMining?: RunExperienceMiningOptions;
+  /**
+   * 实践锦囊 KB 沉淀选项（透传给 runExperienceKbIngestion；channel-blind、早退之前执行，防 KB stranding）。
+   * 注入 store 桩 / logError 等；`now` 由本编排注入（eventDate NULL 回退当日 pushDate，与 push 同源）。
+   */
+  experienceKb?: Omit<RunExperienceKbIngestionOptions, 'now'>;
+  /**
+   * 实践锦囊推送候选选项（透传给 selectExperiencesForChannel；limit / windowDays）。
+   * `now` 由本编排注入（recency 窗口与 push_date 同源）。
+   */
+  experienceSelect?: Omit<SelectExperiencesOptions, 'now'>;
 }
 
 /** 工作流结束状态（供 worker / 可观测 / 测试断言）。 */
@@ -227,6 +254,17 @@ export interface RunDailyWorkflowResult {
    * 未执行（如早退 / 未抢到锁）时为 undefined。
    */
   kb?: KbIngestionResult;
+  /**
+   * 实践锦囊段提炼统计（**仅可观测**，绝不影响 outcome / 熔断；组 E 5.2）。
+   * 提炼 channel-blind 每批只跑一次、失败隔离永不向上抛、不计入 judge/digest 熔断分母。
+   * 未执行（如未抢到锁提前返回）时为 undefined。
+   */
+  experienceMining?: ExperienceMiningResult;
+  /**
+   * 实践锦囊 KB 沉淀统计（**仅可观测**；channel-blind、在早退之前执行防 KB stranding）。
+   * 失败隔离永不向上抛、不计入熔断。未执行时为 undefined。
+   */
+  experienceKb?: ExperienceKbIngestionResult;
 }
 
 /** 把 Top N 选中事件补齐 canonical_url（供摘要降级回退到 URL）。 */
@@ -647,16 +685,68 @@ export async function runDailyWorkflow(
       );
     }
 
+    // ── 阶段 5.7：实践锦囊段（add-ai-blogger-experience-mining，design D6）——产品段之后、早退判断之前，
+    //    在日报锁内执行（搭 daily-digest:{push_date} 锁便车，不新增 queue/cron/独立锁）。三段顺序钉死：
+    //      ① runExperienceMiningOnce（channel-blind 单跑：提炼 + 写 ai_experiences，每批只跑一次）
+    //      ② runExperienceKbIngestion（channel-blind KB 沉淀，**必在早退之前**——防 KB stranding：
+    //         经验入 KB 不以已推送为前提，push-empty 与 KB-empty 是不同集合，放早退之后会漏沉淀新 ≥70 卡片）
+    //      ③ per-channel selectExperiencesForChannel 展开推送候选
+    //    提炼/KB 沉淀**每批只跑一次**（不 per-channel 重复），失败隔离永不向上抛（不拖垮日报）——
+    //    runExperienceMiningOnce / runExperienceKbIngestion 内部已逐条隔离、整步永不抛，此处直接调用。
+    //
+    //    步骤① 提炼一次（channel-blind）。
+    const experienceMiningResult = await runExperienceMiningOnce(
+      { ...options.experienceMining },
+      dbh,
+    );
+    console.error(
+      `[pipeline] 实践锦囊提炼: 候选 ${experienceMiningResult.candidates} 条, 提炼写库 ${experienceMiningResult.mined} 条, ` +
+        `提炼降级 ${experienceMiningResult.miningFailed} 条, 写库失败 ${experienceMiningResult.storeFailed} 条（失败隔离、不计入熔断）`,
+    );
+    //    步骤② KB 沉淀一次（channel-blind，**早退之前**）。now 注入使 eventDate NULL 回退当日 pushDate 与 push 同源。
+    const experienceKbResult = await runExperienceKbIngestion(
+      { now, ...options.experienceKb },
+      dbh,
+    );
+    console.error(
+      `[pipeline] 实践锦囊 KB 沉淀: 候选 ${experienceKbResult.candidates} 条, 入库 ${experienceKbResult.ingested} 条, ` +
+        `认领跳过 ${experienceKbResult.skippedClaimed} 条, 写入失败 ${experienceKbResult.storeFailed} 条（失败隔离、不计入熔断）`,
+    );
+    //    步骤③ per-channel 推送候选（纯 SELECT 无写竞态，可并发；提炼/KB 已在上面单次完成）。
+    //    selectExperiencesForChannel 内已含 long_term_value >= KB_ADMISSION_FLOOR + recency 窗口 +
+    //    「从未以该 channel success」anti-join + Top N 排序（组 D 实现，此处只调用不重写谓词）。
+    const experienceEntries = await Promise.all(
+      channelSenders.map(
+        async ({ channel }): Promise<[Channel, SelectedEvent[]]> => [
+          channel,
+          await selectExperiencesForChannel(channel, dbh, {
+            now,
+            ...options.experienceSelect,
+          }),
+        ],
+      ),
+    );
+    const experiencesByChannel = new Map<Channel, SelectedEvent[]>(
+      experienceEntries,
+    );
+    console.error(
+      `[pipeline] 实践锦囊段: ${channelSenders
+        .map((c) => `${c.channel}=${(experiencesByChannel.get(c.channel) ?? []).length}`)
+        .join(', ')}`,
+    );
+
     // ── 阶段 6：多通道推送（向所有已配置通道并发分发，单消息原子 + push_records 幂等，G6）。
-    //    早退：新闻 Top N（**抑制后** pushableDeduped）为空**且**所有 channel 的产品候选皆空才不推
-    //    （design D6）；仅一段空时仍推非空段（dispatchDailyDigest 内逐 channel 再判）。
+    //    早退（三元，design D6 命门）：新闻 Top N（**抑制后** pushableDeduped）空 **∧** 所有 channel
+    //    的产品候选皆空 **∧** 所有 channel 的经验候选皆空才不推；任一段非空都不早退（防纯经验日漏推——
+    //    无新闻无产品但有高价值经验时仍须推实践锦囊）。仅部分段空时仍推非空段（各 dispatch 内逐 channel 再判）。
     if (
       pushableDeduped.length === 0 &&
-      [...productsByChannel.values()].every((p) => p.length === 0)
+      [...productsByChannel.values()].every((p) => p.length === 0) &&
+      [...experiencesByChannel.values()].every((x) => x.length === 0)
     ) {
-      // 新闻 Top N 空（摘要分母 = 0 或全被剔除）且所有 channel 产品候选亦空 → 无可推，正常结束
-      // （不告警、不中止）。仅一段空不在此早退（落到下方逐 channel dispatch 推非空段）。
-      console.error(`[pipeline] 推送: 新闻与产品候选皆空 → skipped-no-candidates`);
+      // 新闻 Top N 空（摘要分母 = 0 或全被剔除）且所有 channel 产品候选、经验候选亦空 → 无可推，正常
+      // 结束（不告警、不中止）。仅部分段空不在此早退（落到下方逐 channel dispatch 推非空段）。
+      console.error(`[pipeline] 推送: 新闻、产品与经验候选皆空 → skipped-no-candidates`);
       return {
         outcome: 'skipped-no-candidates',
         pushDate,
@@ -668,6 +758,8 @@ export async function runDailyWorkflow(
         alerted,
         publishedAtBackfill: backfillStats,
         ...(semanticResult ? { semantic: semanticResult } : {}),
+        experienceMining: experienceMiningResult,
+        experienceKb: experienceKbResult,
       };
     }
 
@@ -702,15 +794,27 @@ export async function runDailyWorkflow(
     // ='failed' 或 dispatch 自身抛错）只记录该 channel 的 failed、绝不拖垮另一通道——另一通道
     // 照常完成推送。全部 settle 后再统一汇总（成功通道已写 success，失败通道已写 failed）。
     // 产品段 productsByChannel 在阶段 5.5 **算一次**，此处直接复用 .get(channel)、不重算。
+    //
+    // 每通道分发**两条独立消息**：① 日报双段（要闻 + 新品，dispatchDailyDigest）；② 实践锦囊
+    // （经验候选，dispatchDigest + targetType='experience'，与 event/product/alert/weekly 各自独立
+    // 幂等命名空间、互不挤占）。任一条失败 → 该 channel 视为失败、整 job 抛错触发重试（重试时
+    // computePendingSet 排除已 success 条目、只补未发，幂等安全；experience 候选 anti-join 同理跨天/同日不重推）。
     const settled = await Promise.allSettled(
-      channelSenders.map(({ channel, sender }) =>
-        dispatchDailyDigest(
+      channelSenders.map(async ({ channel, sender }): Promise<ChannelDispatch> => {
+        const daily = await dispatchDailyDigest(
           pushableDeduped,
           productsByChannel.get(channel) ?? [],
           { now, sender, channel },
           dbh,
-        ).then((dispatch): ChannelDispatch => ({ channel, dispatch })),
-      ),
+        );
+        // 实践锦囊单段推送（experience 候选可能为空 → dispatchDigest 返回 'skipped'、不发消息）。
+        const experience = await dispatchDigest(
+          experiencesByChannel.get(channel) ?? [],
+          { now, sender, channel, targetType: TARGET_TYPE.experience },
+          dbh,
+        );
+        return { channel, dispatch: daily, experience };
+      }),
     );
 
     const failedChannels: string[] = [];
@@ -718,10 +822,17 @@ export async function runDailyWorkflow(
     settled.forEach((res, idx) => {
       const channel = channelSenders[idx]!.channel;
       if (res.status === 'fulfilled') {
-        const { dispatch } = res.value;
-        console.error(`[pipeline] 推送[${channel}]: outcome=${dispatch.outcome}`);
-        if (dispatch.outcome === 'failed') failedChannels.push(channel);
-        if (dispatch.outcome === 'sent') anySent = true;
+        const { dispatch, experience } = res.value;
+        console.error(
+          `[pipeline] 推送[${channel}]: 日报 outcome=${dispatch.outcome}, 实践锦囊 outcome=${experience.outcome}`,
+        );
+        // 任一段 failed → 该 channel failed；任一段 sent → 该 channel 有实发（anySent）。
+        if (dispatch.outcome === 'failed' || experience.outcome === 'failed') {
+          failedChannels.push(channel);
+        }
+        if (dispatch.outcome === 'sent' || experience.outcome === 'sent') {
+          anySent = true;
+        }
       } else {
         // dispatch 抛错（如渲染/DB 异常）：该通道视为失败、隔离，不拖垮另一通道。
         const reason =
@@ -780,6 +891,8 @@ export async function runDailyWorkflow(
       publishedAtBackfill: backfillStats,
       ...(semanticResult ? { semantic: semanticResult } : {}),
       ...(kbResult ? { kb: kbResult } : {}),
+      experienceMining: experienceMiningResult,
+      experienceKb: experienceKbResult,
     };
   } finally {
     await lock.release();
@@ -805,10 +918,13 @@ function withDefaultArxivCursor(
   return { ...base, arxiv: { cursor: createLookbackArxivCursorStore() } };
 }
 
-/** 单通道分发结果（供 Promise.allSettled 汇总）。汇总仅读 dispatch.outcome。 */
+/** 单通道分发结果（供 Promise.allSettled 汇总）。汇总读日报双段 dispatch.outcome + 实践锦囊 experience.outcome。 */
 interface ChannelDispatch {
   channel: Channel;
+  /** 日报双段（要闻 + 新品）分发结果。 */
   dispatch: DailyDispatchResult;
+  /** 实践锦囊单段（experience）分发结果（候选空时 outcome='skipped'）。 */
+  experience: DispatchResult;
 }
 
 /**

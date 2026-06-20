@@ -52,11 +52,11 @@ const STATUS_PENDING = 'pending';
 const STATUS_SUCCESS = 'success';
 const STATUS_FAILED = 'failed';
 
-/** 入库一条事件所需的全部已校验数据（元数据 + embedding + 目标四元组的 target 部分）。 */
+/** 入库一条目标所需的全部已校验数据（元数据 + embedding + 目标四元组的 target 部分）。 */
 export interface KbStoreItem {
-  /** 目标实体类型（本期仅 event）。 */
+  /** 目标实体类型（event / experience 等，泛化于 TargetType）。 */
   targetType: TargetType;
-  /** 目标实体标识（event_id）。 */
+  /** 目标实体标识（event_id / experience id 等，对应 targetType）。 */
   targetId: string;
   /** 知识摘要 Agent 产出的元数据。 */
   kbTitle: string;

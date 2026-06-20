@@ -234,6 +234,70 @@ describe('renderDigest 按 channel 分派（两层渲染，4.4）', () => {
   });
 });
 
+describe("renderDigest targetType='experience' 实践锦囊渲染（组 E 5.1）", () => {
+  /** 经验卡片视图：representativeTitle 承载 headline_zh、summaryZh 承载摘要正文（组 D 映射口径）。 */
+  function exp(id: string, overrides: Partial<SelectedEvent> = {}): SelectedEvent {
+    return {
+      eventId: id,
+      representativeTitle: `要点-${id}`,
+      summaryZh: `摘要正文-${id}`,
+      headlineZh: `要点-${id}`,
+      canonicalUrl: 'https://blogger.example.com/a',
+      publishedAt: null,
+      rankScore: 90,
+      ...overrides,
+    };
+  }
+
+  it('telegram：标题=headline_zh、要点行=summary_zh（显式渲染，不被回退链屏蔽）+ 实践锦囊表头 + 来源链接', () => {
+    const events = [exp('x1'), exp('x2')];
+    const rendered = renderDigest(events, 'telegram', 'experience');
+    expect(rendered.channel).toBe('telegram');
+    expect(rendered.includedIds).toEqual(['x1', 'x2']);
+    // 实践锦囊专属表头（非「每日情报」）。
+    expect(rendered.text).toContain('AI Radar 实践锦囊');
+    // 标题=headline_zh（representativeTitle 承载），要点行=summary_zh 显式渲染（关键：summary 不被屏蔽）。
+    // MarkdownV2 转义会把 `-` 转 `\-`，故断言转义后形态。
+    expect(rendered.text).toContain('要点\\-x1');
+    expect(rendered.text).toContain('摘要正文\\-x1');
+    // 来源链接（experience 用「来源」而非「原文」；URL 段不转义 `-`）。
+    expect(rendered.text).toContain('[来源](https://blogger.example.com/a)');
+    // 与要闻段渲染分流：不出现「每日情报」表头。
+    expect(rendered.text).not.toContain('AI Radar 每日情报');
+  });
+
+  it('feishu：每条经验渲染为 div(lark_md)，含 summary_zh 正文 + 来源文字链，表头为实践锦囊', () => {
+    const events = [exp('y1')];
+    const rendered = renderDigest(events, 'feishu', 'experience');
+    expect(rendered.channel).toBe('feishu');
+    if (rendered.channel !== 'feishu') throw new Error('unreachable');
+    expect(rendered.includedIds).toEqual(['y1']);
+    const parsed = JSON.parse(rendered.text) as { card: FeishuCard };
+    expect(parsed.card.header.title.content).toContain('AI Radar 实践锦囊');
+    const el = parsed.card.elements[0] as { text: { content: string } };
+    expect(el.text.content).toContain('要点-y1'); // 标题=headline_zh。
+    expect(el.text.content).toContain('摘要正文-y1'); // 摘要正文显式渲染。
+    expect(el.text.content).toContain('[来源](https://blogger.example.com/a)');
+  });
+
+  it('summary_zh 缺失 → 仅渲染要点+来源（不报错、不渲染空要点行）', () => {
+    const events = [exp('z1', { summaryZh: null })];
+    const rendered = renderDigest(events, 'telegram', 'experience');
+    expect(rendered.includedIds).toEqual(['z1']);
+    expect(rendered.text).toContain('要点\\-z1'); // MarkdownV2 转义后形态。
+    expect(rendered.text).toContain('[来源]');
+    // summary 缺失：不渲染空摘要行（仅表头 + 序号标题 + 来源）。
+    expect(rendered.text).not.toContain('摘要正文');
+  });
+
+  it("默认 targetType（缺省）仍走要闻段渲染（向后兼容：renderDigest 两参不变）", () => {
+    const events = [ev('e1')];
+    const rendered = renderDigest(events, 'telegram');
+    expect(rendered.text).toContain('AI Radar 每日情报');
+    expect(rendered.text).not.toContain('实践锦囊');
+  });
+});
+
 describe('buildFeishuCard 飞书 JSON 卡片渲染（5.2 / 5.6）', () => {
   it('每条事件渲染为一个 div(lark_md)：标题 + 要点 + 文字链跳转（不依赖回调）', () => {
     const events = [

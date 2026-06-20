@@ -118,6 +118,9 @@ describe.skipIf(!databaseUrl)('Show HN 端到端：collectAndStore 采集入库 
       arxiv: { fetchText: emptyText },
       hfPapers: { fetchJson: emptyJson },
       sitemap: { fetchText: emptyText },
+      // blogger 源（add-ai-blogger-experience-mining）：空 feed 桩，真实 collector + 空 fetch，
+      // 避免真实网络/env BLOGGER_FEEDS 访问、不污染本产品端到端断言。
+      blogger: { fetchFeed: emptyFeed },
       // 产品两源：真实 collectProductHunt / collectShowHn + stub fetch（端到端覆盖）。
       productHunt: { fetchGraphql: phFetchGraphql },
       showHn: {

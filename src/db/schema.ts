@@ -13,10 +13,11 @@
  *
  * 受限表集不变量（spec「数据库 Schema 可迁移」/「ai_products 产品表可迁移」）：
  * P2 解禁并新建 `ai_products`（产品发现硬规则合并所需）；P3 解禁并新建 `kb_documents` /
- * `kb_ingestion_records`（本地表知识库 + 入库幂等日志）；仍禁止定义其余三张表
- * （item_event_relations / item_product_relations / ai_tools / task_patterns）——
- * 事件-产品关系表 P3 改用 `ai_news_events.merged_into` tombstone 替代、不建关系表；
- * 工具/任务模式表留待 P5 顾问期提案再加。
+ * `kb_ingestion_records`（本地表知识库 + 入库幂等日志）；add-ai-blogger-experience-mining
+ * 解禁并新建 `ai_experiences`（AI 博主经验卡片所需，见 blogger-experience-mining spec）；
+ * 仍禁止定义其余三张表（item_event_relations / item_product_relations / ai_tools /
+ * task_patterns）——事件-产品关系表 P3 改用 `ai_news_events.merged_into` tombstone 替代、
+ * 不建关系表；工具/任务模式表留待 P5 顾问期提案再加。
  */
 import { sql } from 'drizzle-orm';
 import {
@@ -314,6 +315,73 @@ export const kbIngestionRecords = pgTable(
       table.targetType,
       table.targetId,
       table.kbProvider,
+    ),
+  ],
+);
+
+/**
+ * AI 博主经验卡片表（add-ai-blogger-experience-mining，design D7 / spec
+ * blogger-experience-mining「经验卡片实体表与确定性去重幂等」）。
+ *
+ * 与新闻/产品/论文链并行的「实践经验」进料：经验提炼 Agent 对 `source='blogger'` +
+ * `raw_type='experience'` 的 raw_items 产出结构化卡片落本表；高价值（>=70）入 KB，
+ * 每日「实践锦囊」段内联日报推送。
+ *
+ * id 不变量（design D7 / spec）：与 event_id/product_id 同口径——不透明 surrogate key，
+ * VARCHAR(128)（与 push_records.target_id 一致，使 `target_id=id` 互引类型相容；同一卡片
+ * 在 push 幂等命名空间与 KB 幂等命名空间用同一 target_id），DB 默认 `gen_random_uuid()::text`。
+ *
+ * 去重不变量（design D4 / spec）：唯一键 = `canonical_source_url`（经验行规范化来源 URL，
+ * NOT NULL）+ `UNIQUE(canonical_source_url)`，由经验链 `ON CONFLICT (canonical_source_url)`
+ * 收敛——**纯程序键 + DB 唯一约束，绝不由 LLM 判定是否重复**。同一来源（同视频/博文、同
+ * watch URL）即便经不同 feed 采到不同 raw_item（`source_item_id` 不同），也因
+ * `canonical_source_url` 相同而收敛为一行。不用 `raw_item_id` 作唯一键（拦不住跨 feed）。
+ *
+ * `representative_raw_item_id` 存为 provenance（裸 bigint，**对齐既有零 FK 惯例**——
+ * 既有 ai_news_events/ai_products 的 representative_raw_item_id 是裸 bigint 无外键；本表
+ * 取 NOT NULL，因每张卡片必有 provenance raw_item）。
+ *
+ * `long_term_value`（0..100）由提炼 Agent 产出并 Zod `int().min(0).max(100)` 约束，兼作 KB
+ * 准入闸（>=KB_ADMISSION_FLOOR）与实践锦囊推送排序键——不另设 importance_score。**不加 DB
+ * CHECK(0..100)**：有意对齐基线零-CHECK 惯例（全库 *_score 均无 CHECK），0..100 边界唯一防线
+ * 是提炼 Agent 的 Zod 校验（合规于「Agent 输出必 Zod 校验」不变量）。
+ *
+ * `published_at`（可空）取自 raw_items，供实践锦囊推送 recency 窗口；NULL 卡片仅入 KB 不进推送
+ * （recency 窗口对 NULL 求假，design D6）。
+ *
+ * **无向量列、无二级索引**（对齐基线惯例——全库零 secondary index，数据量小排序顺序扫足够，
+ * 未来慢了再单独 forward-only 迁移加索引；UNIQUE(canonical_source_url) 自带索引已够去重 ON CONFLICT）。
+ */
+export const aiExperiences = pgTable(
+  'ai_experiences',
+  {
+    // 不透明 surrogate key：DB 默认 gen_random_uuid()::text 生成（与 event_id/product_id 同口径）。
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    // 去重唯一键：经验行 raw_items.canonical_url，ON CONFLICT 冲突目标。
+    canonicalSourceUrl: text('canonical_source_url').notNull(),
+    // provenance 回指 raw_items.id（裸 bigint 无外键，对齐基线零 FK 惯例；每卡片必有故 NOT NULL）。
+    representativeRawItemId: bigint('representative_raw_item_id', {
+      mode: 'bigint',
+    }).notNull(),
+    // 结构化经验字段（提炼 Agent 产出）。
+    scenario: text('scenario'),
+    tools: jsonb('tools'),
+    techniques: text('techniques'),
+    applicability: text('applicability'),
+    // 长期价值分（0..100，Zod 约束；KB 准入闸 + 实践锦囊排序键，不另设 importance_score）。
+    longTermValue: integer('long_term_value').notNull(),
+    // 推送展示文本。
+    headlineZh: text('headline_zh'),
+    summaryZh: text('summary_zh'),
+    // 发布时间（取自 raw_items，供推送 recency 窗口；NULL → 仅入 KB 不进推送）。
+    publishedAt: timestamp('published_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    unique('ai_experiences_canonical_source_url_key').on(
+      table.canonicalSourceUrl,
     ),
   ],
 );

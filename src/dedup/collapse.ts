@@ -285,13 +285,18 @@ export async function collapseRawItems(
  * - 崩溃后补塌缩：INSERT 成功但塌缩前崩溃的 raw_item collapsed 仍为 false，下次必被扫到补塌缩
  *   （即便其 source_item_id 重复导致再次入库被 DO NOTHING 跳过、不在 insertedIds）。
  *
- * **类型路由（P2，dedup-and-normalization MODIFIED）**：查询层排除 `raw_type='product'`（PH）与
- * `raw_type='paper'`（arXiv），防产品/论文条目污染新闻事件流或被双重消费。排除条件用
- * **`raw_type IS DISTINCT FROM 'product' AND raw_type IS DISTINCT FROM 'paper'`**（而非 NOT IN）：
+ * **类型路由（P2 + add-ai-blogger-experience-mining，dedup-and-normalization MODIFIED）**：查询层
+ * 排除 `raw_type='product'`（PH）、`raw_type='paper'`（arXiv）与 `raw_type='experience'`（blogger
+ * 经验源），防产品/论文/经验条目污染新闻事件流或被双重消费。排除条件用
+ * **`raw_type IS DISTINCT FROM 'product' AND ... 'paper' AND ... 'experience'`**（而非 NOT IN）：
  * `raw_type` 列可空，`NULL NOT IN (...)` 求值为 NULL 会**放行** NULL 行；`IS DISTINCT FROM` 使
  * NULL 被当作新闻类纳入塌缩，保持 P1「news/repo/post/NULL 等其余值一律进事件流」行为不回退。
- * 产品行由产品塌缩成功后置 collapsed=true；论文行入库即置 collapsed=true（仅沉淀、无下游消费），
- * 故被排除的 product/paper 行不停在 collapsed=false 被每轮无界重扫。
+ * 产品行由产品塌缩成功后置 collapsed=true；论文行入库即置 collapsed=true（仅沉淀、无下游消费）；
+ * 经验行入库即置 collapsed=true（由经验链按 canonical_source_url 反连接消费，见 pipeline/experience-chain），
+ * 故被排除的 product/paper/experience 行不停在 collapsed=false 被每轮无界重扫。
+ *
+ * 一处覆盖日报链与实时告警链两条共用此入口的塌缩链（design D4 第二道隔离）。
+ * **前向护栏**：新增任何 raw_type 必须同步显式决定它属哪条塌缩链（加入本排除集或由对应链置 collapsed=true）。
  *
  * 每条塌缩后置 collapsed=true（见 collapseRawItem），故 source_count 贡献恰好一次（幂等）。
  * 顺序处理（塌缩依赖 dedup_key 唯一键冲突语义，顺序执行避免同批自冲突竞态）。
@@ -304,7 +309,8 @@ export async function collapseUncollapsedRawItems(
   dbh: DbLike = defaultDb,
 ): Promise<CollapseOutcome[]> {
   // 选出尚未塌缩、未被前一轮标记 unprocessable、且为**新闻类**的 raw_items（id 升序，先到先建代表）。
-  // 类型路由（P2）：用 IS DISTINCT FROM 排除 product/paper，NULL raw_type 视作新闻纳入（保 P1 行为）。
+  // 类型路由（P2 + 经验源）：用 IS DISTINCT FROM 排除 product/paper/experience，NULL raw_type 视作
+  // 新闻纳入（保 P1 行为）。一处覆盖日报链与告警链两条共用此入口的塌缩链。
   const pending = await dbh
     .select({
       id: rawItems.id,
@@ -320,6 +326,7 @@ export async function collapseUncollapsedRawItems(
         eq(rawItems.collapsed, false),
         sql`${rawItems.rawType} IS DISTINCT FROM 'product'`,
         sql`${rawItems.rawType} IS DISTINCT FROM 'paper'`,
+        sql`${rawItems.rawType} IS DISTINCT FROM 'experience'`,
       ),
     )
     .orderBy(rawItems.id);

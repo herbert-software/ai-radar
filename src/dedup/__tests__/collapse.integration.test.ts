@@ -518,6 +518,44 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     }
   });
 
+  it('类型路由：experience 条目不被塌缩入口扫到（不产生 ai_news_events，组 D 4.1）', async () => {
+    const ts = Date.now();
+    // experience（blogger 经验源）行：有可归一化的 url/title，若未排除会塌缩成 event。
+    const experienceId = await seedTypedRawItem({
+      sourceItemId: `route-experience-${ts}`,
+      url: `https://example.com/blogger/post-${ts}`,
+      title: 'Some experience post',
+      rawType: 'experience',
+    });
+    // 对照：一条 news 行（应正常进事件流）。
+    const newsId = await seedTypedRawItem({
+      sourceItemId: `route-exp-news-${ts}`,
+      url: `https://example.com/exp-news-${ts}`,
+      title: 'Some news beside experience',
+      rawType: 'news',
+    });
+
+    const outcomes = await collapseUncollapsedRawItems(db!);
+    const scanned = new Set(outcomes.map((o) => o.rawItemId));
+    // experience 被查询层排除 → 不在本轮塌缩结果里。
+    expect(scanned.has(experienceId)).toBe(false);
+    // news 行正常被扫到塌缩。
+    expect(scanned.has(newsId)).toBe(true);
+
+    // 不为 experience 产生任何 ai_news_events 行。
+    const { rows: evRows } = await pool!.query(
+      `SELECT 1 FROM ai_news_events WHERE representative_raw_item_id = $1`,
+      [experienceId.toString()],
+    );
+    expect(evRows).toHaveLength(0);
+
+    // 清理 news 行产生的 event。
+    const newsOutcome = outcomes.find((o) => o.rawItemId === newsId)!;
+    if (newsOutcome.dedupKey) {
+      await db!.delete(schema.aiNewsEvents).where(sql`dedup_key = ${newsOutcome.dedupKey}`);
+    }
+  });
+
   it('NULL raw_type 视作新闻类纳入塌缩（IS DISTINCT FROM，保 P1 行为）', async () => {
     const ts = Date.now();
     // 不设 raw_type（NULL）：必须仍被当作新闻塌缩成 event。

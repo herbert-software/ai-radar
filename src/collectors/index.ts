@@ -44,6 +44,10 @@ import {
   type SitemapCollectorOptions,
 } from './sitemap.js';
 import {
+  collectBlogger,
+  type BloggerCollectorOptions,
+} from './blogger.js';
+import {
   storeCollectedItems,
   type StoreOptions,
   type StoreResult,
@@ -64,6 +68,7 @@ export { collectProductHunt } from './product-hunt.js';
 export { collectShowHn } from './show-hn.js';
 export { collectHfPapers } from './hf-papers.js';
 export { collectSitemaps } from './sitemap.js';
+export { collectBlogger } from './blogger.js';
 export { storeCollectedItems } from './store.js';
 
 /** 单个源在本轮采集中可用的注入选项（按 source 路由）。 */
@@ -76,6 +81,7 @@ export interface PerSourceOptions {
   showHn?: ShowHnCollectorOptions;
   hfPapers?: HfPapersCollectorOptions;
   sitemap?: SitemapCollectorOptions;
+  blogger?: BloggerCollectorOptions;
 }
 
 /** registry 单项契约（design D1）：标记 source + 无参可调的 collect 闭包。 */
@@ -104,6 +110,7 @@ export interface CollectAllOptions extends PerSourceOptions {
     showHn?: (opts?: ShowHnCollectorOptions) => Promise<CollectedItem[]>;
     hfPapers?: (opts?: HfPapersCollectorOptions) => Promise<CollectedItem[]>;
     sitemap?: (opts?: SitemapCollectorOptions) => Promise<CollectedItem[]>;
+    blogger?: (opts?: BloggerCollectorOptions) => Promise<CollectedItem[]>;
   };
 }
 
@@ -149,6 +156,13 @@ export function buildRegistry(
       source: 'sitemap',
       collect: () => (c.sitemap ?? collectSitemaps)(options.sitemap),
     },
+    {
+      // AI 博主经验链（add-ai-blogger-experience-mining，design D1）：消费 BLOGGER_FEEDS，
+      // 由 mapBloggerItem 产出 source='blogger'/raw_type='experience'/collapsed=true。
+      // 在日报全集采集；**有意不归 REALTIME_NEWS_SOURCES/PRODUCT_SOURCES 任一子集**（见下两常量护栏）。
+      source: 'blogger',
+      collect: () => (c.blogger ?? collectBlogger)(options.blogger),
+    },
   ];
 }
 
@@ -161,6 +175,8 @@ export function buildRegistry(
  * 决定归属哪个子集（或有意不归属任一子集，如 arXiv 仅日报全集沉淀、无实时/产品消费）——否则会被静默
  * 排除出实时/产品链。`show_hn` **有意不在此子集**：实时告警消费 ai_news_events，product 不进事件塌缩
  * → 天然不进告警评分链（真正的告警隔离闸是 `raw_type='product'` 路由，非子集成员资格）。
+ * `blogger` **有意不在此子集**（add-ai-blogger-experience-mining，design D1）：经验链仅日报内联消费，
+ * 无实时告警消费（真正的隔离闸是 `raw_type='experience'` 路由 + `collapsed=true` 沉淀，非子集成员资格）。
  */
 export const REALTIME_NEWS_SOURCES: readonly CollectorSource[] = [
   'rss',
@@ -174,7 +190,7 @@ export const REALTIME_NEWS_SOURCES: readonly CollectorSource[] = [
  * 塌缩进 ai_products（链路显式闭合，不依赖跨 workflow 隐式时序）。
  *
  * 与 `REALTIME_NEWS_SOURCES`（见上）对称的手工维护字面量；`show_hn` 与 `product_hunt` 同属产品源。
- * 有意不归属任一子集的源（如 arXiv 仅日报全集沉淀）不出现在这两个子集里。
+ * 有意不归属任一子集的源（如 arXiv 仅日报全集沉淀、`blogger` 仅经验链日报内联消费）不出现在这两个子集里。
  *
  * **跨段去重耦合（回引 `PLATFORM_HOSTS`，design D3）**：新增产品源时，若其**无 website 兜底 URL**
  * 的 host 是「URL 路径而非子域标识产品」的平台 host（如 `github.com`/`producthunt.com`/`npmjs.com`），

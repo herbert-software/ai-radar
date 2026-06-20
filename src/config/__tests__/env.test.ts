@@ -437,6 +437,89 @@ describe('parseEnv —— P3 语义去重 + 知识库 embedding 配置（add-sem
   });
 });
 
+describe('parseEnv —— BLOGGER_FEEDS / EXPERIENCE_TEXT_MAX_CHARS（add-ai-blogger-experience-mining，任务 1.3）', () => {
+  it('BLOGGER_FEEDS 复用 url|vendor 解析为 {url, vendor}[]，去空白', () => {
+    const source = {
+      ...validEnv(),
+      BLOGGER_FEEDS:
+        ' https://blog.example/feed|simonw , https://www.youtube.com/feeds/videos.xml?channel_id=UCxx| ,, ',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.BLOGGER_FEEDS).toEqual([
+      { url: 'https://blog.example/feed', vendor: 'simonw' },
+      {
+        url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxx',
+        vendor: null,
+      },
+    ]);
+  });
+
+  it('空 BLOGGER_FEEDS → 空数组', () => {
+    const env = parseEnv({ ...validEnv(), BLOGGER_FEEDS: '' } as NodeJS.ProcessEnv);
+    expect(env.BLOGGER_FEEDS).toEqual([]);
+  });
+
+  it('缺省（未设置）BLOGGER_FEEDS → 空数组', () => {
+    const env = parseEnv(validEnv()); // validEnv 不含 BLOGGER_FEEDS。
+    expect(env.BLOGGER_FEEDS).toEqual([]);
+  });
+
+  it('BLOGGER_FEEDS 旧裸 URL 格式（无 |）启动即报错', () => {
+    const source = {
+      ...validEnv(),
+      BLOGGER_FEEDS: 'https://legacy.example/feed.xml',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('EXPERIENCE_TEXT_MAX_CHARS 缺省 → 默认 2000（镜像 EMBEDDING_TEXT_MAX_CHARS）', () => {
+    const env = parseEnv(validEnv());
+    expect(env.EXPERIENCE_TEXT_MAX_CHARS).toBe(2000);
+  });
+
+  it('EXPERIENCE_TEXT_MAX_CHARS 自定义合法值（"4000"）生效', () => {
+    const source = {
+      ...validEnv(),
+      EXPERIENCE_TEXT_MAX_CHARS: '4000',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.EXPERIENCE_TEXT_MAX_CHARS).toBe(4000);
+    expect(typeof env.EXPERIENCE_TEXT_MAX_CHARS).toBe('number');
+  });
+
+  it('EXPERIENCE_TEXT_MAX_CHARS 非正（"0"）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      EXPERIENCE_TEXT_MAX_CHARS: '0',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('EXPERIENCE_TEXT_MAX_CHARS 负数（"-1"）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      EXPERIENCE_TEXT_MAX_CHARS: '-1',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('EXPERIENCE_TEXT_MAX_CHARS 非整（"3.5"）→ 报错（int 校验）', () => {
+    const source = {
+      ...validEnv(),
+      EXPERIENCE_TEXT_MAX_CHARS: '3.5',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('EXPERIENCE_TEXT_MAX_CHARS NaN（"abc"）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      EXPERIENCE_TEXT_MAX_CHARS: 'abc',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+});
+
 describe('parseEnv —— HF_PAPERS_MAX_PER_RUN 校验（add-tier1-ai-sources，FIX-6）', () => {
   it('合法值（"30"）coerce 为 number 30', () => {
     const source = {

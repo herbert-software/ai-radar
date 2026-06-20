@@ -14,8 +14,9 @@
  * - 「系统级故障」告警以**采集/规范化层**为准（非 judge 分母）：①采集返回条数 = 0
  *   （**registry 全部源**失败，P2 由 P1「三源」扩为 registry 注册的全部源）或 ②采集返回 > 0
  *   但**新闻类可处理条目数 = 0**（全部新闻条目 unprocessable）→ 告警。
- * - **分母只统计新闻类**（P2，daily-intel-pipeline MODIFIED）：`raw_type IN ('product','paper')`
- *   的产品/论文条目**不计入**新闻类可处理数（它们不进事件塌缩）——否则某轮仅 arXiv 返回 paper、
+ * - **分母只统计新闻类**（P2，daily-intel-pipeline MODIFIED；add-ai-blogger-experience-mining 起含 experience）：
+ *   `raw_type IN ('product','paper','experience')` 的产品/论文/经验条目**不计入**新闻类可处理数
+ *   （它们不进事件塌缩）——否则某轮仅 arXiv 返回 paper、
  *   新闻源全空时 paper 会掩盖新闻真空使告警失灵。新闻类可处理数含「塌缩进既有新闻事件」者，
  *   故全命中既有新闻事件的正常无新闻日不告警；唯有「全部新闻条目 unprocessable 或无新闻条目」才告警。
  * - **本告警仅适用于日报工作流（runDailyWorkflow）**：实时告警高频链（全源 0 是常态）不套用本判定
@@ -60,7 +61,7 @@ export interface CollectStats {
   collectedCount: number;
   /**
    * **新闻类**可处理条目数：能构造 dedup_key、塌缩进**新闻事件**（含进既有新闻事件）的条目数。
-   * = 本轮新闻类塌缩中 unprocessable=false 的条数（塌缩查询已排除 raw_type product/paper）。
+   * = 本轮新闻类塌缩中 unprocessable=false 的条数（塌缩查询已排除 raw_type product/paper/experience）。
    *
    * **与 store.processableCount 的语义区分（必须分清）**：store 的 processableCount 统计**全部**
    * 采集条目（含 product/paper）中能构造 canonical_url/title_hash 者，是通用「可入库」口径；
@@ -104,7 +105,7 @@ export function classifySystemFailure(
       kind: 'all-unprocessable',
       reason:
         '本轮采集返回 > 0 但新闻类可处理条目数为 0（全部新闻条目 unprocessable，' +
-        '或仅有 product/paper 非新闻条目），提示采集器采空或归一函数故障。',
+        '或仅有 product/paper/experience 非新闻条目），提示采集器采空或归一函数故障。',
     };
   }
   return { alert: false, kind: 'none', reason: null };

@@ -360,7 +360,8 @@ GitHub，`Promise.allSettled` 容错）→ URL/标题归一 + `dedup_key` 硬去
 此外 P1 需在 `.env` 补齐（见 [`.env.example`](./.env.example) 各项注释）：
 
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`：必填，否则启动即报错（推送目标）。
-- `RSS_FEEDS`：逗号分隔的真实 feed URL（留空则不采 RSS；三源全空会触发系统级故障告警、无内容可推）。
+- `RSS_FEEDS`：逗号分隔的真实 feed URL（**新闻链**，`url|vendor` 格式；留空则不采 RSS；三源全空会触发系统级故障告警、无内容可推）。
+- `BLOGGER_FEEDS`：策划 AI 博主 feed（**经验链**，同 `url|vendor` 格式；留空则不采）。与 `RSS_FEEDS` 用途区分：`RSS_FEEDS` 走 `source='rss'`/`raw_type='news'` 的日报/告警新闻链追时效；`BLOGGER_FEEDS` 走 `source='blogger'`/`raw_type='experience'` 的独立经验链，经「经验提炼 Agent」沉淀可复用实战经验（≥70 价值闸入知识库 + 实践锦囊推送），两条链以两硬字段隔离、互不混入。`.env.example` 含「实战子集」示例，完整 49 源清单见 [`openspec/changes/add-ai-blogger-experience-mining/feeds.md`](./openspec/changes/add-ai-blogger-experience-mining/feeds.md)。
 - `GITHUB_TOKEN`：可选，提升 GitHub API 速率上限（留空匿名调用受更严限流）。
 - `TOP_N` / `RANK_WEIGHT_*` / `IMPORTANCE_FLOOR` / `DEGRADE_ABORT_RATIO` /
   `FIRST_SEEN_WINDOW_DAYS` / `PUSH_TIMEZONE`：均有默认值，按需覆盖。

@@ -384,6 +384,7 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
     const sources = registry.map((e) => e.source).sort();
     expect(sources).toEqual([
       'arxiv',
+      'blogger',
       'github',
       'hacker_news',
       'hugging_face_papers',

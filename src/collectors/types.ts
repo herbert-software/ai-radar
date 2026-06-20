@@ -26,6 +26,11 @@ import { sanitizeText } from './sanitize.js';
  *   URL 后 per-article 取 og: 标签，rawType='news' 进日报；`source` 为通用机制类、具体 lab 由
  *   metadata.vendor 区分（与 RSS 的 source='rss'+vendor 同范式，可扩展到其他有 sitemap 的 lab）。
  * 下游路由一律按 raw_type 不按 source（混用机制类 rss/sitemap 与平台类 arxiv/product_hunt）。
+ *
+ * AI 博主经验链（add-ai-blogger-experience-mining，design D1）新增 `blogger`：策划 AI 博主 feed
+ * （博客/Substack/YouTube 频道 RSS）经独立 `BLOGGER_FEEDS` 接入，落 `raw_items` 时由 `mapBloggerItem`
+ * 产出 `source='blogger'` + `raw_type='experience'` 两硬字段 + `collapsed=true`，与新闻链按 raw_type 隔离。
+ * **有意不归属 `REALTIME_NEWS_SOURCES`/`PRODUCT_SOURCES` 任一子集**（经验链仅日报内联消费，无实时/产品消费）。
  */
 export type CollectorSource =
   | 'rss'
@@ -35,7 +40,8 @@ export type CollectorSource =
   | 'product_hunt'
   | 'show_hn'
   | 'hugging_face_papers'
-  | 'sitemap';
+  | 'sitemap'
+  | 'blogger';
 
 /**
  * 统一采集输出结构（对齐 QA §10.1）。

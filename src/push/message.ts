@@ -17,7 +17,7 @@
 import { HEADLINE_MAX } from '../agents/digest/schema.js';
 import { PRODUCT_TAGLINE_MAX } from '../agents/product-digest/schema.js';
 import type { SelectedEvent } from '../selection/top-n.js';
-import type { Channel } from './targets.js';
+import { TARGET_TYPE, type Channel, type TargetType } from './targets.js';
 
 /** Telegram 单条消息长度上限（保守取 4000，留余量给 Markdown 转义）。 */
 const MAX_MESSAGE_LENGTH = 4000;
@@ -401,6 +401,137 @@ export function buildWeeklyFeishuCard(item: WeeklySelectedEvent): FeishuRendered
   };
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// 实践锦囊渲染（add-ai-blogger-experience-mining，design D6，组 E 5.1）
+//
+// 一条「AI Radar 实践锦囊」= 若干经验卡片（target_type='experience'）。与要闻段的区别仅在
+// **语义字段映射**：经验卡片的 `representativeTitle` 承载 headline_zh（一句话要点，作粗体标题），
+// `summaryZh` 承载经验摘要正文（作要点行，而非要闻段「headline→summary 回退链」）；故须**显式**
+// 渲染 summary_zh，否则要闻段 resolveHeadlineText 会因 headlineZh 已作标题而把 summary 屏蔽掉。
+// canonical_source_url 作来源链接（去 utm 后可点击）。复用 dispatcher 的「待发→pending→原子送达→
+// success/failed + includedIds 截断顺延」机制（只是渲染分支不同），不另写漂移状态机。
+// ──────────────────────────────────────────────────────────────────────────
+
+/** 实践锦囊卡片摘要正文渲染期截断上限（按 code point；防超长 summary 撑爆单条消息）。 */
+const EXPERIENCE_SUMMARY_MAX = HEADLINE_MAX * 2;
+
+/** 单个经验卡片块的 MarkdownV2 文本（序号 + 要点(粗体) + 摘要正文 + 来源链接）。 */
+function experienceTelegramBlock(e: SelectedEvent, idx: number): string {
+  // 标题 = representativeTitle（承载 headline_zh ?? scenario）；渲染期 code-point 截断后转义。
+  const rawTitle = e.representativeTitle?.trim() || '(无要点)';
+  const title = escapeMarkdownV2(truncateByCodePoint(rawTitle, TITLE_MAX));
+
+  // 要点行 = summary_zh（经验摘要正文）。显式取 summaryZh（非 resolveHeadlineText 回退链——经验
+  // 卡片的 headlineZh 已作标题，沿用回退链会把 summary 屏蔽）。块内按 EXPERIENCE_SUMMARY_MAX 截断。
+  const summary = e.summaryZh?.trim();
+  const summaryLine = summary
+    ? `\n${escapeMarkdownV2(truncateByCodePoint(summary, EXPERIENCE_SUMMARY_MAX))}`
+    : '';
+
+  // 来源链接：canonical_source_url 用专用 URL 转义器；缺失/超长则丢弃（仅渲染要点+摘要），保证单块恒可发。
+  const url = e.canonicalUrl?.trim();
+  let linkLine = '';
+  if (url) {
+    if (url.length <= MAX_URL_LENGTH) {
+      linkLine = `\n[来源](${escapeMarkdownV2Url(url)})`;
+    } else {
+      console.error(
+        `[push] experience canonical_url 超长（${url.length} 字符 > ${MAX_URL_LENGTH}），丢弃链接仅渲染要点+摘要。id=${e.eventId}`,
+      );
+    }
+  }
+
+  return `${escapeMarkdownV2(`${idx}.`)} *${title}*${summaryLine}${linkLine}`;
+}
+
+/**
+ * 拼一条实践锦囊 Telegram 消息（MarkdownV2）。复用 buildDigestMessage 的「按块累加遇超限即停 +
+ * 截断脚注」截断语义；每块块内已按 TITLE_MAX/EXPERIENCE_SUMMARY_MAX/MAX_URL_LENGTH 有界（单块恒可装）。
+ */
+function buildExperienceMessage(events: readonly SelectedEvent[]): {
+  text: string;
+  parseMode: 'MarkdownV2';
+  includedIds: string[];
+} {
+  const header = `*AI Radar 实践锦囊* \\(${escapeMarkdownV2(String(events.length))}\\)`;
+  const blocks = events.map((e, i) => experienceTelegramBlock(e, i + 1));
+
+  const footerFor = (remaining: number): string =>
+    `\n\n${escapeMarkdownV2(`…另有 ${remaining} 条未展示`)}`;
+  const footerReserve = footerFor(blocks.length).length;
+
+  let text = header;
+  let included = 0;
+  const includedIds: string[] = [];
+  for (let i = 0; i < blocks.length; i += 1) {
+    const next = `${text}\n\n${blocks[i]!}`;
+    const reserve = i < blocks.length - 1 ? footerReserve : 0;
+    if (next.length + reserve > MAX_MESSAGE_LENGTH) break;
+    text = next;
+    included += 1;
+    includedIds.push(events[i]!.eventId);
+  }
+  if (included < blocks.length) {
+    text += footerFor(blocks.length - included);
+  }
+
+  return { text, parseMode: 'MarkdownV2', includedIds };
+}
+
+/**
+ * 实践锦囊飞书卡片渲染。每条经验渲染为一个 div(lark_md)：
+ * 「**序号 要点** \n 摘要正文 \n [来源](url)」——跳转走文字链、不依赖回调（同要闻段约束）。
+ * 摘要正文显式取 summaryZh（非要闻段回退链）；canonical_source_url 缺失则不渲染链接行。
+ */
+function buildExperienceFeishuCard(
+  events: readonly SelectedEvent[],
+): FeishuRendered {
+  const elements: unknown[] = [];
+  const includedIds: string[] = [];
+
+  for (let i = 0; i < events.length && includedIds.length < FEISHU_MAX_BLOCKS; i += 1) {
+    const e = events[i]!;
+
+    const rawTitle = e.representativeTitle?.trim() || '(无要点)';
+    const title = escapeLarkMdText(truncateByCodePoint(rawTitle, FEISHU_TITLE_MAX));
+    const lines: string[] = [`**${i + 1}. ${title}**`];
+
+    const summary = e.summaryZh?.trim();
+    if (summary) {
+      lines.push(escapeLarkMdText(truncateByCodePoint(summary, EXPERIENCE_SUMMARY_MAX)));
+    }
+
+    const url = e.canonicalUrl?.trim();
+    if (url && url.length <= MAX_URL_LENGTH) {
+      lines.push(`[来源](${url})`);
+    } else if (url) {
+      console.error(
+        `[push] feishu experience canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染要点+摘要。id=${e.eventId}`,
+      );
+    }
+
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } });
+    includedIds.push(e.eventId);
+  }
+
+  const card: FeishuCard = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: `AI Radar 实践锦囊 (${includedIds.length})` },
+      template: 'green',
+    },
+    elements,
+  };
+
+  return {
+    channel: 'feishu',
+    text: JSON.stringify({ card }),
+    parseMode: 'MarkdownV2',
+    includedIds,
+    card,
+  };
+}
+
 /**
  * 「按 channel 渲染」分派层（第二层）。把待发集合（第一层「选 Top N 渲染数据」的产物）按
  * 目标 channel 分派到对应渲染器。所有 channel 渲染结果都带 `includedIds`——dispatcher 据此
@@ -409,13 +540,18 @@ export function buildWeeklyFeishuCard(item: WeeklySelectedEvent): FeishuRendered
  * **周报分支**：待发集合若为「单条周报汇总条目」（带 weeklyItems，见 isWeeklySummary），按 channel
  * 走周报渲染器展开「本周要闻 + 本周新品」列表（复用各条已落库 headline/summary，不触 LLM）；
  * includedIds 恒为 [iso_week]，整份周报原子送达（dispatcher 状态机不变）。
+ *
+ * **实践锦囊分支**：`targetType='experience'` 时走经验卡片渲染器（标题=headline_zh、要点行=summary_zh、
+ * 来源链接）——dispatcher 调用时传入 targetType，渲染分支不同但状态机口径与其它 target_type 一致。
  */
 export type RenderedDigest = TelegramRendered | FeishuRendered;
 
 export function renderDigest(
   events: readonly SelectedEvent[],
   channel: Channel,
+  targetType: TargetType = TARGET_TYPE.event,
 ): RenderedDigest {
+  const isExperience = targetType === TARGET_TYPE.experience;
   const weekly = isWeeklySummary(events) ? events[0] : null;
   switch (channel) {
     case 'telegram': {
@@ -423,11 +559,16 @@ export function renderDigest(
         const { text, parseMode, includedIds } = buildWeeklyTelegramMessage(weekly);
         return { channel: 'telegram', text, parseMode, includedIds };
       }
-      const { text, parseMode, includedIds } = buildDigestMessage(events);
+      const { text, parseMode, includedIds } = isExperience
+        ? buildExperienceMessage(events)
+        : buildDigestMessage(events);
       return { channel: 'telegram', text, parseMode, includedIds };
     }
     case 'feishu':
-      return weekly ? buildWeeklyFeishuCard(weekly) : buildFeishuCard(events);
+      if (weekly) return buildWeeklyFeishuCard(weekly);
+      return isExperience
+        ? buildExperienceFeishuCard(events)
+        : buildFeishuCard(events);
     default: {
       // 穷尽性检查：channelEnum 新增成员而本处未加分支时编译期报错（防遗漏渲染分支）。
       const exhaustive: never = channel;

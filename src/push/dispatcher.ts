@@ -5,12 +5,13 @@
  * 职责：算待发集合 → 事务内为无记录者 INSERT pending（ON CONFLICT DO NOTHING）→
  * 按 channel 渲染一条消息发送 → 单消息原子：成功整批 success / 失败整批 failed（留 error_message）。
  *
- * **(target_type, channel) 双向泛化（P2）**：状态机对所有 target_type ∈ {event,product,alert,weekly}
- * 与 channel ∈ {telegram,feishu} 一致，由调用方传入幂等四元组的 `targetType`/`channel`（默认
- * `event`/`telegram` 向后兼容 P1 调用）。后续产品/告警/周报推送只需以各自的 target_type+channel
- * 调用本 dispatch 核心，**不必再编辑本文件**；不同 target_type 的「候选谓词」差异在各自的
- * selection 查询里表达（候选窗口跨天排除，见 top-n），dispatch 只承载「待发集合同日 success 排除
- * + pending → 原子送达 → success/failed」状态机。
+ * **(target_type, channel) 双向泛化（P2）**：状态机对所有 target_type ∈ {event,product,alert,
+ * weekly,experience} 与 channel ∈ {telegram,feishu} 一致，由调用方传入幂等四元组的
+ * `targetType`/`channel`（默认 `event`/`telegram` 向后兼容 P1 调用）。后续产品/告警/周报/实践锦囊
+ * 推送只需以各自的 target_type+channel 调用本 dispatch 核心，**不必再编辑本文件**；不同 target_type
+ * 的「候选谓词」差异在各自的 selection 查询里表达（候选窗口跨天排除，见 top-n / experience-chain），
+ * dispatch 只承载「待发集合同日 success 排除 + pending → 原子送达 → success/failed」状态机。
+ * `experience` 的渲染分支由 renderDigest 据传入的 targetType 路由（要点=headline_zh、正文=summary_zh）。
  *
  * 关键不变量（绝不可违背）：
  * - 幂等四元组：`target_type, target_id, channel, push_date`（targetType/channel 参数化，禁写死）；
@@ -169,7 +170,7 @@ export async function dispatchDigest(
   // 2. 按 channel 渲染一条消息发送（单消息原子，发送在事务外——避免长外部调用占着 DB 事务/锁）。
   //    只对 includedIds（实际拼进消息、未被截断丢弃的事件）改状态；被截断者保持 pending，
   //    下次运行因仍属待发集合而重新拼入消息（天然分批跨次发完），避免被误标 success 永久漏推。
-  const rendered = renderDigest(pending, channel);
+  const rendered = renderDigest(pending, channel, targetType);
   const { includedIds } = rendered;
 
   if (includedIds.length === 0) {

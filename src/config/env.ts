@@ -255,6 +255,11 @@ const envSchema = z.object({
   // 带 vendor 标记的 RSS feed 配置：逗号分隔多个 `url|vendor` 条目（vendor 可空），
   // 解析为 {url, vendor}[]；旧裸 URL 格式（无 `|`）启动即报错（design D2）。可为空（空则该源不采）。
   RSS_FEEDS: rssFeedList,
+  // 策划 AI 博主 feed（add-ai-blogger-experience-mining，design D1）：复用 `rssFeedList` 的
+  // `url|vendor` 解析（同 RSS_FEEDS 语义、同破坏性约束），解析为 {url, vendor}[]。独立于 RSS_FEEDS——
+  // 经验链以 `source='blogger'` + `raw_type='experience'` 两硬字段隔离，**不**混入新闻链。
+  // 可为空（空 → 空数组，该源不采）；非空时每条须为新格式 `url|vendor`（旧裸 URL 启动即报错）。
+  BLOGGER_FEEDS: rssFeedList,
   // GitHub API token，用于提额（带 token 提速率上限）；可空，空则匿名调用受更严限流。
   GITHUB_TOKEN: z.string().default(''),
   // Product Hunt Developer Token（只读，无需交互 OAuth）：产品发现采集器用它调 GraphQL。
@@ -348,6 +353,12 @@ const envSchema = z.object({
   // 语义去重总开关（design「迁移计划·回滚」）：'on' 启用语义合并阶段；'off' 跳过、退回硬去重态。
   // 默认 'on'。仅日报链调用语义层（告警链恒走硬去重快路径，不受此开关影响）。
   SEMANTIC_DEDUP_ENABLED: z.enum(['on', 'off']).default('on'),
+
+  // --- AI 博主经验提炼（add-ai-blogger-experience-mining，design 风险/权衡）---
+  // 经验提炼前对超长 transcript/博文的截断字符数（**镜像 EMBEDDING_TEXT_MAX_CHARS**）：
+  // 防长文本 token 爆。提炼 Agent 取 raw_item content 摘录（截断到此值）后调 generateObject。
+  // 非法值（NaN/负/0/小数）启动即报错（守 env 不变量，裸读 process.env 会绕过校验）。
+  EXPERIENCE_TEXT_MAX_CHARS: z.coerce.number().int().positive().default(2000),
 })
   // 飞书配置完整性跨字段校验（feishu-push 5.1）：
   // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；
