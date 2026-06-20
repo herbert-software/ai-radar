@@ -44,7 +44,7 @@ jobs:
 
       - name: Derive image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/ai-radar
           # latest=false 关掉 metadata-action 默认的 latest=auto：否则推 v* semver tag 时会自动
