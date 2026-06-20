@@ -1,0 +1,44 @@
+# dependabot 升级 npm 依赖时常漏写嵌套的按平台 optional 包（@esbuild/*-arm64 等），
+# 导致严格的 `npm ci` 报 "Missing ... from lock file"。此 job 在 dependabot PR 上
+# 用 `npm install --package-lock-only` 补全 lockfile 并推回分支，CI 随之转绿。
+name: Dependabot lockfile sync
+
+# 用 pull_request_target 才能拿到可写 token（dependabot 触发的 pull_request 是只读）。
+# 仅 --package-lock-only（不装 node_modules、不跑任何脚本），不执行 PR 代码，安全。
+on:
+  pull_request_target:
+    paths:
+      - package.json
+      - package-lock.json
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Sync lockfile
+        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+
+      - name: Commit & push if changed
+        run: |
+          if ! git diff --quiet package-lock.json; then
+            git config user.name 'github-actions[bot]'
+            git config user.email 'github-actions[bot]@users.noreply.github.com'
+            git add package-lock.json
+            git commit -m 'build(deps): 同步 package-lock.json（补全缺失的 optional 平台包）'
+            git push
+          fi
