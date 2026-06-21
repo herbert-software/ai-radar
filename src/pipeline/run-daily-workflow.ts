@@ -436,7 +436,7 @@ export async function runDailyWorkflow(
       console.error(
         `[pipeline] 语义去重: 处理 ${semanticResult.processed} 条, ` +
           `高相似合并 ${semanticResult.highAutoMerged} 条, LLM 确认合并 ${semanticResult.llmConfirmedMerged} 条, ` +
-          `LLM 不合并 ${semanticResult.llmNotMerged} 条, 异常跳过 ${semanticResult.skippedError} 条, ` +
+          `LLM 不合并 ${semanticResult.llmNotMerged} 条, 护栏否决 ${semanticResult.vetoedByGuard} 条, 异常跳过 ${semanticResult.skippedError} 条, ` +
           `embedding(候选 ${semanticResult.embedding.candidates}/嵌入 ${semanticResult.embedding.embedded}/失败 ${semanticResult.embedding.failed})（不计入熔断）`,
       );
     } else {

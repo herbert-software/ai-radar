@@ -192,4 +192,103 @@ describe.skipIf(!databaseUrl)('semanticMergeEvents 编排（embed/judge 注入�
     expect((await fetchEvent(older))!.merged_into).toBeNull();
     expect((await fetchEvent(newer))!.merged_into).toBeNull();
   });
+
+  // ── 护栏接线（harden-semantic-dedup-merge-precision）：纯函数已单测，此处验证注入 semanticMergeEvents 的行为。
+
+  it('护栏：high-auto 高相似但 token 不同 → 否决、不合并、计数', async () => {
+    const ts = Date.now();
+    const r1 = await seedRaw(`gv-1-${ts}`, 'o1 content');
+    const r2 = await seedRaw(`gv-2-${ts}`, 'o3-mini content');
+    const older = await seedEvent({ dedupKey: `${SOURCE}-gv-older-${ts}`, title: 'OpenAI o1 system card', firstSeenAt: new Date('2026-06-01T00:00:00Z'), rawItemId: r1 });
+    const newer = await seedEvent({ dedupKey: `${SOURCE}-gv-newer-${ts}`, title: 'OpenAI o3-mini system card', firstSeenAt: new Date('2026-06-02T00:00:00Z'), rawItemId: r2 });
+    // 两者同向量（互余弦 1.0）→ high-auto；token 集 {1} vs {3} 不同 → 护栏否决。
+    const embedManyFn = (async (args: { values: string[] }) =>
+      ({ embeddings: args.values.map(() => vec(0.99)) })) as never;
+    // 记录式 judge 桩：被调用即置位（judgeCalled 直证未被调用，不依赖抛错/降级语义）。
+    let judgeCalled = false;
+    const recordingJudge = (async () => { judgeCalled = true; return { object: { same_event: false, same_product: false, reason: 'judge must not be called' } }; }) as never;
+    const result = await semanticMergeEvents(
+      {
+        thisRoundEventIds: [older, newer],
+        embedding: { embed: { embedManyFn, logError: () => {} }, windowDays: 3650, logError: () => {} },
+        search: { windowDays: 3650, highThreshold: 0.88, llmThreshold: 0.82 },
+        judge: { generateObjectFn: recordingJudge },
+        logError: () => {},
+      },
+      db!,
+    );
+    expect(result.vetoedByGuard).toBeGreaterThanOrEqual(1);
+    expect(result.highAutoMerged).toBe(0);
+    expect(judgeCalled).toBe(false); // high-auto 路本就不调 judge + 护栏否决 → judge 从未被调用
+    expect((await fetchEvent(older))!.merged_into).toBeNull();
+    expect((await fetchEvent(newer))!.merged_into).toBeNull();
+  });
+
+  it('护栏：灰区 token 不同 → 前置否决、不调 LLM（记录式 judge 桩证明从未被调用）', async () => {
+    const ts = Date.now();
+    const r1 = await seedRaw(`gz-1-${ts}`, 'mistral 3 content');
+    const r2 = await seedRaw(`gz-2-${ts}`, 'mistral 3.1 content');
+    const older = await seedEvent({ dedupKey: `${SOURCE}-gz-older-${ts}`, title: 'Mistral Small 3 release', firstSeenAt: new Date('2026-06-01T00:00:00Z'), rawItemId: r1 });
+    const newer = await seedEvent({ dedupKey: `${SOURCE}-gz-newer-${ts}`, title: 'Mistral Small 3.1 release', firstSeenAt: new Date('2026-06-02T00:00:00Z'), rawItemId: r2 });
+    // 互余弦 0.99 落灰区 (0.82, 0.995]；token 集 {3} vs {3.1} 不同。护栏在 judge 之前否决。
+    const embedManyFn = (async (args: { values: string[] }) =>
+      ({ embeddings: args.values.map((v) => (v.includes('3.1') ? vec(0.99) : vec(1.0))) })) as never;
+    // 记录式 judge 桩：被调用即置位。**直证**护栏前置否决=judge 从未被调用——不能靠 skippedError，
+    // 因 judgeSameEvent 吞错降级返回 sameEvent:false 而不抛，护栏缺失时 skippedError 仍为 0（不判别）。
+    let judgeCalled = false;
+    const recordingJudge = (async () => { judgeCalled = true; return { object: { same_event: false, same_product: false, reason: 'guard must veto before LLM' } }; }) as never;
+    const result = await semanticMergeEvents(
+      {
+        thisRoundEventIds: [older, newer],
+        embedding: { embed: { embedManyFn, logError: () => {} }, windowDays: 3650, logError: () => {} },
+        search: { windowDays: 3650, highThreshold: 0.995, llmThreshold: 0.82 },
+        judge: { generateObjectFn: recordingJudge },
+        logError: () => {},
+      },
+      db!,
+    );
+    expect(judgeCalled).toBe(false); // 直证：灰区 token 不同 → 护栏前置否决、judge 从未被调用
+    expect(result.vetoedByGuard).toBeGreaterThanOrEqual(1);
+    expect(result.llmConfirmedMerged).toBe(0);
+    expect(result.llmNotMerged).toBe(0); // 护栏缺失则 judge 降级 sameEvent:false → 此处会 =1（判别断言）
+    expect((await fetchEvent(older))!.merged_into).toBeNull();
+    expect((await fetchEvent(newer))!.merged_into).toBeNull();
+  });
+
+  it('护栏：否决最高相似候选后 continue（不 break），仍合并更低相似的真同事件候选', async () => {
+    const ts = Date.now();
+    const rq = await seedRaw(`cnb-q-${ts}`, 'gpt 5.5 query content');
+    const rv = await seedRaw(`cnb-v-${ts}`, 'gpt 5.3 variant content');
+    const rs = await seedRaw(`cnb-s-${ts}`, 'gpt 5.5 same content');
+    // query 06-03；variant 06-01（最高相似但 token 不同→被否决）；same 06-02（略低相似但 token 一致→应合并）。
+    const query = await seedEvent({ dedupKey: `${SOURCE}-cnb-q-${ts}`, title: 'GPT-5.5 launch query', firstSeenAt: new Date('2026-06-03T00:00:00Z'), rawItemId: rq });
+    const variant = await seedEvent({ dedupKey: `${SOURCE}-cnb-v-${ts}`, title: 'GPT-5.3 launch variant', firstSeenAt: new Date('2026-06-01T00:00:00Z'), rawItemId: rv });
+    const same = await seedEvent({ dedupKey: `${SOURCE}-cnb-s-${ts}`, title: 'GPT-5.5 launch same', firstSeenAt: new Date('2026-06-02T00:00:00Z'), rawItemId: rs });
+    // 向量（按标题标记映射，顺序无关）：query=base[1,0]、variant=vec(0.99)、same=vec(0.97)。
+    // sim(query,variant)=0.99 > sim(query,same)=0.97 > 0.88 → 均 high-auto；judge 桩抛错（high-auto 不应调）。
+    // 护栏：query{5.5}↔variant{5.3} 否决、query{5.5}↔same{5.5} 放行 → 终态 query 并入 same（较早存活）、variant 独立。
+    const embedManyFn = (async (args: { values: string[] }) =>
+      ({ embeddings: args.values.map((v) => (v.includes('variant') ? vec(0.99) : v.includes('same') ? vec(0.97) : vec(1.0))) })) as never;
+    let judgeCalled = false;
+    const recordingJudge = (async () => { judgeCalled = true; return { object: { same_event: false, same_product: false, reason: 'high-auto must not call judge' } }; }) as never;
+    const result = await semanticMergeEvents(
+      {
+        thisRoundEventIds: [query, variant, same],
+        embedding: { embed: { embedManyFn, logError: () => {} }, windowDays: 3650, logError: () => {} },
+        search: { windowDays: 3650, highThreshold: 0.88, llmThreshold: 0.82 },
+        judge: { generateObjectFn: recordingJudge },
+        logError: () => {},
+      },
+      db!,
+    );
+    // 依赖候选「相似度降序」契约（searchSimilarCandidates，距离升序）：先遇高相似 variant（被否决）、
+    // 后遇 same（token 一致、合并）——正是 continue-not-break 要验的路径；若该排序契约变，本用例需同步调整。
+    // 终态与处理顺序无关：token 一致的 (query,same) 合并、存活=较早 same；version-variant 始终被否决保持独立。
+    expect(result.vetoedByGuard).toBeGreaterThanOrEqual(1);
+    expect(result.highAutoMerged).toBeGreaterThanOrEqual(1);
+    expect(judgeCalled).toBe(false); // 全 high-auto 路 → judge 不应被调用
+    expect((await fetchEvent(query))!.merged_into).toBe(same); // 较低相似但 token 一致者被合并；若 continue 误改 break 则此处为 null
+    expect((await fetchEvent(variant))!.merged_into).toBeNull(); // 最高相似但 token 不同者被否决、独立
+    expect((await fetchEvent(same))!.merged_into).toBeNull(); // 存活者
+  });
 });

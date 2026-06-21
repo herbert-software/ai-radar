@@ -39,6 +39,7 @@ import {
   type SemanticJudgeOptions,
 } from './semantic-judge.js';
 import { mergeEvents, type MergeTier } from './merge-events.js';
+import { shouldVetoMerge } from './merge-guard.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
@@ -57,6 +58,8 @@ export interface SemanticMergeResult {
   llmNotMerged: number;
   /** 因逐事件异常被跳过（保留独立、不中止）的次数。 */
   skippedError: number;
+  /** 因确定性精度护栏（两侧标题数字/版本 token 集不同）否决合并的次数。 */
+  vetoedByGuard: number;
 }
 
 export interface SemanticMergeOptions {
@@ -164,6 +167,7 @@ export async function semanticMergeEvents(
   let llmConfirmedMerged = 0;
   let llmNotMerged = 0;
   let skippedError = 0;
+  let vetoedByGuard = 0;
 
   for (const ev of pending) {
     try {
@@ -200,6 +204,16 @@ export async function semanticMergeEvents(
           break;
         }
 
+        // 合并前确定性精度护栏：两侧标题数字/版本 token 集不同即否决该候选（high-auto 与
+        // llm-confirmed 两路前置、优先于阈值分流与 LLM；灰区 token 不同的对直接否决、不调 LLM 省成本）。
+        // candTitle 复用给灰区 judge，省一次 DB 往返。
+        const candTitle = await loadTitle(dbh, cand.eventId);
+        if (shouldVetoMerge(ev.representativeTitle, candTitle)) {
+          vetoedByGuard += 1;
+          // continue（不 break）：高相似度的版本变体邻居不应埋掉更低相似度的真同事件候选。
+          continue;
+        }
+
         let mergeTier: MergeTier;
         let reason: string | undefined;
 
@@ -211,7 +225,7 @@ export async function semanticMergeEvents(
             {
               titleA: ev.representativeTitle ?? '',
               contentA: ev.content,
-              titleB: await loadTitle(dbh, cand.eventId),
+              titleB: candTitle,
               contentB: await loadContent(dbh, cand.eventId),
             },
             options.judge,
@@ -257,6 +271,7 @@ export async function semanticMergeEvents(
     llmConfirmedMerged,
     llmNotMerged,
     skippedError,
+    vetoedByGuard,
   };
 }
 

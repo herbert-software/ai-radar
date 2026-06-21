@@ -18,12 +18,14 @@
 | **P0** | 地基 / Walking skeleton | 1 周 | W1 | 06-16 ~ 06-22 | TS+Hono+Drizzle 脚手架、docker-compose(pg+redis)、核心表 migration、`.env.example`、CI、一次 Zod 校验的真实 LLM 调用 | — | `docker compose up` 起得来；migration 落表；健康检查通过；`generateObject` 跑通一次 |
 | **P1** ✅ | 最小情报流（**首个真上线**） | 2–3 周 | W2 ~ W4 | 06-23 ~ 07-13 | RSS + HN/GitHub 三源、`raw_items` 入库、**硬去重**、Value Judge(Zod)、中文摘要、**Telegram 单通道 + 幂等**、BullMQ 每日任务 | P0 | **退出标准达成**（见下「P1 退出标准达成」）：每日定时推 Top N（BullMQ cron + `runDailyWorkflow`）；同一天同一条不重复（`push_records` 幂等 + 单例锁）；带 utm 的 URL 被归一为同一条（URL 归一 + `dedup_key` 塌缩） |
 | **P2** ✅ | 扩源 + 双通道 + 产品发现 | 3–4 周 | W5 ~ W8 | 07-14 ~ 08-10 | 一线大厂官方 RSS（OpenAI/DeepMind/HuggingFace，T1）/Product Hunt/arXiv collector、飞书通道、`ai_products` 表 + **硬规则产品合并**、实时重大发布告警、周报。**Reddit 经鉴权/限流调研移出关键路径**（条款风险，详见 `expand-sources-dual-channel-products` 提案非目标）；Meta/Anthropic 无原生 RSS 的 HTML 抓取列 T2 次批（Mistral 经实测有原生 RSS，已随后续扩源接入，连同 Microsoft AI） | P1 | **退出标准达成**（见下「P2 退出标准达成」）：双通道均不重复推；每日产品发现推送；实时告警跑通；周报跑通 |
-| **P3** | 语义去重 + 知识库 | 3–4 周 | W9 ~ W12 | 08-11 ~ 09-07 | pgvector embedding 去重 + LLM 二次判断、`ai_news_events` 事件合并、KB 入库（本地表 → Dify HTTP）、只入 `long_term_value≥70` | P2 + 真实数据积累 | 中英文同一事件被识别为一条；阈值经真实数据调过；KB 可检索 |
-| **P4** | MCP 查询入口 | 1.5–2 周 | W9 ~ W11（与 P3 并行） | 08-11 ~ 08-24 | MCP server：`get_today_ai_digest` / `search_ai_events` / `search_ai_products` / `mark_*` / `push_event_now` | P2 | 从 Claude/Cursor 查到当日日报与历史 |
+| **P3** ✅ | 语义去重 + 知识库 | 3–4 周 | W9 ~ W12 | 08-11 ~ 09-07 | pgvector embedding 去重 + LLM 二次判断、`ai_news_events` 事件合并、KB 入库（本地表 → Dify HTTP）、只入 `long_term_value≥70` | P2 + 真实数据积累 | **退出标准达成**（见下「P3 退出标准达成」，阈值实测复校列为持续运营动作）：中英文同一事件被识别为一条；KB 可检索 |
+| **P4** ✅ | MCP 查询入口 | 1.5–2 周 | W9 ~ W11（与 P3 并行） | 08-11 ~ 08-24 | MCP server：`get_today_ai_digest` / `search_ai_events` / `search_ai_products` / `mark_*` / `push_event_now` | P2 | **退出标准达成**（见下「P4 退出标准达成」）：从 Claude/Cursor 查到当日日报与历史 |
 | **P5** | AI 工具选型顾问 | 3–5 周 | W13 ~ W17 | 09-08 ~ 10-12 | `ai_tools` + `task_patterns` 表、规则召回、RAG 证据、LLM 解释、`recommend_ai_tools_for_task`（可拆 5a 数据+规则 / 5b RAG+解释 / 5c 暴露） | P3 + P4 + 数据积累 | "内部知识库选 Dify/RAGFlow/FastGPT" 能给出首选/备选/不推荐/落地步骤 |
 | **P6** | Web 控制台（可选，延后） | 按需 | — | — | 前后端同 TS、复用 Zod schema 的人工干预面板 | P4 | — |
 
 **关键路径**：P0 → P1 → P2 → P3 → P5 ≈ **13–17 周（约 3.5–4 个月）** 到完整顾问；**首个可用版本约第 4 周末（7 月中）** 上线。
+
+> **进度（截至 2026-06-21）**：**P0–P4 关键路径全部落地**，外加 roadmap 外的「AI 博主经验挖掘」链（归档 `add-ai-blogger-experience-mining`，新增 `ai_experiences` 表 + 独立经验链 `source='blogger'`/`raw_type='experience'`，≥70 价值闸入知识库 + 实践锦囊推送）。**下一步 P5（AI 工具选型顾问）**，建议先拆 5a（`ai_tools` + `task_patterns` 表 + 规则召回，其余 5b/5c 依赖它）。唯一未结的退出标准是 P3 语义阈值的真实数据复校（接线就位、取 QA §9.2 起点默认，列为持续运营动作，见下「P3 退出标准达成」）。
 
 ## P1 退出标准达成
 
@@ -58,6 +60,28 @@
 > 验证：本地 `docker compose up -d`（postgres pgvector + redis healthy）+ `npm run migrate` **连续两次重跑**验证迁移幂等（含 `ai_products` forward-only 0004 + `judge_claimed_at`；第二次无新 SQL，journal 维持 5 条已应用、结构无变化）后，全量 vitest **287 测试全绿、0 skip**（连真实 pg+redis 实跑不 skip）；`npx tsc --noEmit` 0 错、`npm run lint` 0 错。
 > CI（`.github/workflows/ci.yml`）带 postgres(pgvector) + redis services，注入全部必填 env 占位（含 `PRODUCT_HUNT_TOKEN`），迁移幂等与上述不变量测试在 CI 路径内实跑。
 > **真实鉴权/配额勘验**（PH Developer Token 拉一次 + 剩余复杂度点、arXiv OAI-PMH 拉一次确认 ≥3s 不被 429、飞书 webhook 发一条测试卡片）需真实凭据 + 外网、**无法在本环境复现**，交付用户本地用真实凭据执行（结果作 artifact 附 PR）；持续节流/退避逻辑已由单测（注入桩）覆盖。
+
+## P3 退出标准达成
+
+`add-semantic-dedup-and-store-hardening` + `add-cross-segment-dedup-and-hn-purify` 两提案已实现并归档；语义去重与本地表知识库均落地，迁移 `0006_p3_vector_kb` 接线（pgvector 扩展 + `ai_news_events.embedding vector(1536)` / `merged_into varchar(128)` 两列 + `kb_documents` / `kb_ingestion_records` 两表）。
+
+| 退出标准 | 状态 | 实现与证据 |
+|---|---|---|
+| 中英文同一事件被识别为一条 | ✅ 已实现 | pgvector 向量召回 + 分层判定：`cosine_sim > SEMANTIC_DEDUP_HIGH` 直接合并（high-auto，不调 LLM）/ 灰区 `LLM < sim ≤ HIGH` 交 LLM 二次判断 / 否则不合并；合并经 `ai_news_events.merged_into` tombstone（替代事件-产品关系表）。模块：`src/dedup/{embedding,semantic-search,semantic-judge,semantic-merge,merge-events}.ts`；跨切片去重 + HN 提纯见 `add-cross-segment-dedup-and-hn-purify`。 |
+| 阈值经真实数据调过 | 🟡 接线就位，复校待运营 | 阈值为 QA §9.2 起点默认（`SEMANTIC_DEDUP_HIGH=0.88` / `SEMANTIC_DEDUP_LLM=0.82`，env 可调，`src/config/env.ts` 注明「非实测调优」），分层判定全程可工作；**真实数据复校是持续运营动作、尚未做**，roadmap 已为其留迭代回合，不按「写完即完成」记。 |
+| KB 可检索 | ✅ 已实现（本地表先行） | 只入 `long_term_value≥70` 精选（Zod 钉死 `int().min(0).max(100)` 防越界绕闸），幂等两表原子写入 `kb_documents` + `kb_ingestion_records`（`UNIQUE(target_type,target_id,kb_provider)`），`kb_provider='custom'` 本地表，含 `embedding vector(1536)` 列可作向量检索。Dify HTTP 作后续可替换黑盒消费、本期未接（符合 roadmap「本地表 → Dify HTTP」分步口径）。模块：`src/kb/{ingestion-agent,store,schema}.ts`。 |
+
+> 迁移证据：`src/db/__tests__/p3-vector-kb-migration.integration.test.ts` 断言 `0006_p3_vector_kb` 启用 vector 扩展、`ai_news_events` 补 `embedding`/`merged_into` 两列、新建知识库两表及入库幂等唯一约束。
+
+## P4 退出标准达成
+
+`add-mcp-query-server` 提案已实现并归档。
+
+| 退出标准 | 状态 | 实现与证据 |
+|---|---|---|
+| 从 Claude/Cursor 查到当日日报与历史 | ✅ 已实现 | 独立 MCP server 进程（stdio transport，`src/mcp/server.ts`），与流水线并列、**不参与日报调度**；暴露 7 工具（5 查询 + 2 标记 + `push_event_now`）：`get_today_ai_digest` / `search_ai_events` / `search_ai_products` / `mark_*` / `push_event_now`。客户端配置（Claude Desktop / Cursor，直接 `tsx` 跑 `src/mcp/server.ts` 防 stdout 污染）见 README「MCP 查询入口」。 |
+
+> `recommend_ai_tools_for_task` 属 P5（工具选型顾问），本期不含——schema 仍禁建 `ai_tools` / `task_patterns`。
 
 ## 排序依据
 
