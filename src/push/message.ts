@@ -99,6 +99,44 @@ export interface TelegramRendered {
   includedIds: string[];
 }
 
+/**
+ * 通用「按块累加遇超限即停 + 截断脚注」装配器（digest/experience 共用）。
+ * 给定表头与逐块预渲染文本，逐块累加（每块前置 `\n\n`）；超 MAX_MESSAGE_LENGTH（含非末块的脚注
+ * 预留）即停并追加「…另有 N 条未展示」脚注。返回实际拼进消息的事件 id（保持入参顺序）。
+ *
+ * 截断脚注「…另有 N 条未展示」。N 最多为全部条数，按最坏长度预留空间，
+ * 保证一旦触发截断、追加脚注后**仍不超** MAX_MESSAGE_LENGTH（脚注本身也必须可发送，
+ * 否则恰在 spec 依赖的截断兜底路径上发送失败）。
+ */
+function assembleTelegramMessage(
+  header: string,
+  blocks: readonly string[],
+  events: readonly SelectedEvent[],
+): { text: string; parseMode: 'MarkdownV2'; includedIds: string[] } {
+  const footerFor = (remaining: number): string =>
+    `\n\n${escapeMarkdownV2(`…另有 ${remaining} 条未展示`)}`;
+  const footerReserve = footerFor(blocks.length).length;
+
+  // 按事件块逐个累加，超出上限即停止并标注剩余条数（不切半条，保证可发送）。
+  let text = header;
+  let included = 0;
+  const includedIds: string[] = [];
+  for (let i = 0; i < blocks.length; i += 1) {
+    const next = `${text}\n\n${blocks[i]!}`;
+    // 非末块时预留脚注空间：本块之后还有剩余块，可能要追加截断脚注。
+    const reserve = i < blocks.length - 1 ? footerReserve : 0;
+    if (next.length + reserve > MAX_MESSAGE_LENGTH) break;
+    text = next;
+    included += 1;
+    includedIds.push(events[i]!.eventId);
+  }
+  if (included < blocks.length) {
+    text += footerFor(blocks.length - included);
+  }
+
+  return { text, parseMode: 'MarkdownV2', includedIds };
+}
+
 export function buildDigestMessage(events: readonly SelectedEvent[]): {
   text: string;
   parseMode: 'MarkdownV2';
@@ -142,31 +180,7 @@ export function buildDigestMessage(events: readonly SelectedEvent[]): {
     );
   }
 
-  // 截断脚注「…另有 N 条未展示」。N 最多为全部条数，按最坏长度预留空间，
-  // 保证一旦触发截断、追加脚注后**仍不超** MAX_MESSAGE_LENGTH（脚注本身也必须可发送，
-  // 否则恰在 spec 依赖的截断兜底路径上发送失败）。
-  const footerFor = (remaining: number): string =>
-    `\n\n${escapeMarkdownV2(`…另有 ${remaining} 条未展示`)}`;
-  const footerReserve = footerFor(blocks.length).length;
-
-  // 按事件块逐个累加，超出上限即停止并标注剩余条数（不切半条，保证可发送）。
-  let text = header;
-  let included = 0;
-  const includedIds: string[] = [];
-  for (let i = 0; i < blocks.length; i += 1) {
-    const next = `${text}\n\n${blocks[i]!}`;
-    // 非末块时预留脚注空间：本块之后还有剩余块，可能要追加截断脚注。
-    const reserve = i < blocks.length - 1 ? footerReserve : 0;
-    if (next.length + reserve > MAX_MESSAGE_LENGTH) break;
-    text = next;
-    included += 1;
-    includedIds.push(events[i]!.eventId);
-  }
-  if (included < blocks.length) {
-    text += footerFor(blocks.length - included);
-  }
-
-  return { text, parseMode: 'MarkdownV2', includedIds };
+  return assembleTelegramMessage(header, blocks, events);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -229,35 +243,26 @@ export interface FeishuRendered {
  *
  * @returns 卡片对象、序列化 text、parseMode 占位、includedIds（实际拼进卡片的事件 id）。
  */
-export function buildFeishuCard(events: readonly SelectedEvent[]): FeishuRendered {
+/**
+ * 通用飞书卡片装配器（digest/experience 共用）：逐块（最多 FEISHU_MAX_BLOCKS 个）调 `renderBlock`
+ * 取该块 lark_md 内容、包成 `div`，再套统一卡片 envelope（config/header/template/elements）。
+ * 表头标题由调用方传入（已含实发计数占位由 envelope 用 includedIds 填）；只在装配差异处（标题/模板色/
+ * 逐块渲染）分流，骨架不重复。
+ */
+function assembleFeishuCard(
+  events: readonly SelectedEvent[],
+  headerTitle: (count: number) => string,
+  template: string,
+  renderBlock: (e: SelectedEvent, idx: number) => string,
+): FeishuRendered {
   const elements: unknown[] = [];
   const includedIds: string[] = [];
 
   for (let i = 0; i < events.length && includedIds.length < FEISHU_MAX_BLOCKS; i += 1) {
     const e = events[i]!;
-
-    const rawTitle = e.representativeTitle?.trim() || '(无标题)';
-    const title = escapeLarkMdText(truncateByCodePoint(rawTitle, FEISHU_TITLE_MAX));
-
-    const lines: string[] = [`**${i + 1}. ${title}**`];
-
-    const headlineText = resolveHeadlineText(e);
-    if (headlineText) lines.push(escapeLarkMdText(headlineText));
-
-    // 文字链跳转（不依赖回调）：canonical_url 缺失则不渲染链接行。
-    const url = e.canonicalUrl?.trim();
-    if (url && url.length <= MAX_URL_LENGTH) {
-      // 链接文本「原文」无特殊字符；URL 直接置于括号内（飞书按原样跳转）。
-      lines.push(`[原文](${url})`);
-    } else if (url) {
-      console.error(
-        `[push] feishu: canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染标题+要点。eventId=${e.eventId}`,
-      );
-    }
-
     elements.push({
       tag: 'div',
-      text: { tag: 'lark_md', content: lines.join('\n') },
+      text: { tag: 'lark_md', content: renderBlock(e, i + 1) },
     });
     includedIds.push(e.eventId);
   }
@@ -265,8 +270,8 @@ export function buildFeishuCard(events: readonly SelectedEvent[]): FeishuRendere
   const card: FeishuCard = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `AI Radar 每日情报 (${includedIds.length})` },
-      template: 'blue',
+      title: { tag: 'plain_text', content: headerTitle(includedIds.length) },
+      template,
     },
     elements,
   };
@@ -278,6 +283,36 @@ export function buildFeishuCard(events: readonly SelectedEvent[]): FeishuRendere
     includedIds,
     card,
   };
+}
+
+export function buildFeishuCard(events: readonly SelectedEvent[]): FeishuRendered {
+  return assembleFeishuCard(
+    events,
+    (count) => `AI Radar 每日情报 (${count})`,
+    'blue',
+    (e, idx) => {
+      const rawTitle = e.representativeTitle?.trim() || '(无标题)';
+      const title = escapeLarkMdText(truncateByCodePoint(rawTitle, FEISHU_TITLE_MAX));
+
+      const lines: string[] = [`**${idx}. ${title}**`];
+
+      const headlineText = resolveHeadlineText(e);
+      if (headlineText) lines.push(escapeLarkMdText(headlineText));
+
+      // 文字链跳转（不依赖回调）：canonical_url 缺失则不渲染链接行。
+      const url = e.canonicalUrl?.trim();
+      if (url && url.length <= MAX_URL_LENGTH) {
+        // 链接文本「原文」无特殊字符；URL 直接置于括号内（飞书按原样跳转）。
+        lines.push(`[原文](${url})`);
+      } else if (url) {
+        console.error(
+          `[push] feishu: canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染标题+要点。eventId=${e.eventId}`,
+        );
+      }
+
+      return lines.join('\n');
+    },
+  );
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -456,26 +491,7 @@ function buildExperienceMessage(events: readonly SelectedEvent[]): {
   const header = `*AI Radar 实践锦囊* \\(${escapeMarkdownV2(String(events.length))}\\)`;
   const blocks = events.map((e, i) => experienceTelegramBlock(e, i + 1));
 
-  const footerFor = (remaining: number): string =>
-    `\n\n${escapeMarkdownV2(`…另有 ${remaining} 条未展示`)}`;
-  const footerReserve = footerFor(blocks.length).length;
-
-  let text = header;
-  let included = 0;
-  const includedIds: string[] = [];
-  for (let i = 0; i < blocks.length; i += 1) {
-    const next = `${text}\n\n${blocks[i]!}`;
-    const reserve = i < blocks.length - 1 ? footerReserve : 0;
-    if (next.length + reserve > MAX_MESSAGE_LENGTH) break;
-    text = next;
-    included += 1;
-    includedIds.push(events[i]!.eventId);
-  }
-  if (included < blocks.length) {
-    text += footerFor(blocks.length - included);
-  }
-
-  return { text, parseMode: 'MarkdownV2', includedIds };
+  return assembleTelegramMessage(header, blocks, events);
 }
 
 /**
@@ -486,50 +502,32 @@ function buildExperienceMessage(events: readonly SelectedEvent[]): {
 function buildExperienceFeishuCard(
   events: readonly SelectedEvent[],
 ): FeishuRendered {
-  const elements: unknown[] = [];
-  const includedIds: string[] = [];
+  return assembleFeishuCard(
+    events,
+    (count) => `AI Radar 实践锦囊 (${count})`,
+    'green',
+    (e, idx) => {
+      const rawTitle = e.representativeTitle?.trim() || '(无要点)';
+      const title = escapeLarkMdText(truncateByCodePoint(rawTitle, FEISHU_TITLE_MAX));
+      const lines: string[] = [`**${idx}. ${title}**`];
 
-  for (let i = 0; i < events.length && includedIds.length < FEISHU_MAX_BLOCKS; i += 1) {
-    const e = events[i]!;
+      const summary = e.summaryZh?.trim();
+      if (summary) {
+        lines.push(escapeLarkMdText(truncateByCodePoint(summary, EXPERIENCE_SUMMARY_MAX)));
+      }
 
-    const rawTitle = e.representativeTitle?.trim() || '(无要点)';
-    const title = escapeLarkMdText(truncateByCodePoint(rawTitle, FEISHU_TITLE_MAX));
-    const lines: string[] = [`**${i + 1}. ${title}**`];
+      const url = e.canonicalUrl?.trim();
+      if (url && url.length <= MAX_URL_LENGTH) {
+        lines.push(`[来源](${url})`);
+      } else if (url) {
+        console.error(
+          `[push] feishu experience canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染要点+摘要。id=${e.eventId}`,
+        );
+      }
 
-    const summary = e.summaryZh?.trim();
-    if (summary) {
-      lines.push(escapeLarkMdText(truncateByCodePoint(summary, EXPERIENCE_SUMMARY_MAX)));
-    }
-
-    const url = e.canonicalUrl?.trim();
-    if (url && url.length <= MAX_URL_LENGTH) {
-      lines.push(`[来源](${url})`);
-    } else if (url) {
-      console.error(
-        `[push] feishu experience canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染要点+摘要。id=${e.eventId}`,
-      );
-    }
-
-    elements.push({ tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } });
-    includedIds.push(e.eventId);
-  }
-
-  const card: FeishuCard = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: `AI Radar 实践锦囊 (${includedIds.length})` },
-      template: 'green',
+      return lines.join('\n');
     },
-    elements,
-  };
-
-  return {
-    channel: 'feishu',
-    text: JSON.stringify({ card }),
-    parseMode: 'MarkdownV2',
-    includedIds,
-    card,
-  };
+  );
 }
 
 /**

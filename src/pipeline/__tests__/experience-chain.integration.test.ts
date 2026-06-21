@@ -259,8 +259,7 @@ describe.skipIf(!databaseUrl)('经验链编排（组 D 不变量）', () => {
     await runExperienceMiningOnce({ mineExperienceFn: mine, logError: noop }, db!);
 
     // 批内去重：同 URL 一轮只提炼一次（只调一次 LLM）。
-    const callsForUrl = mine.mock.calls.filter(() => true).length;
-    expect(callsForUrl).toBe(1);
+    expect(mine.mock.calls.length).toBe(1);
     // ON CONFLICT 收敛：该 URL 仅一行卡片。
     expect(await countExperiences(url)).toBe(1);
 

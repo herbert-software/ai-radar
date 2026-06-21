@@ -210,20 +210,14 @@ export async function runExperienceMiningOnce(
         options.mineOptions,
       );
     } catch (e) {
-      if (e instanceof ExperienceMiningFailureError) {
-        result.miningFailed += 1;
-        logError(
-          `经验提炼降级（不写 ai_experiences，继续下一条）：${c.canonicalUrl}`,
-          e,
-        );
-      } else {
-        // 非降级信号的系统级异常：同样隔离、不向上抛（保护日报）。
-        result.miningFailed += 1;
-        logError(
-          `经验提炼系统级失败（不写 ai_experiences，继续下一条）：${c.canonicalUrl}`,
-          e,
-        );
-      }
+      // 降级信号与系统级异常动作相同（统计 + 记日志 + 跳过下一条，隔离保护日报）；仅日志文案区分。
+      result.miningFailed += 1;
+      const reason =
+        e instanceof ExperienceMiningFailureError ? '提炼降级' : '提炼系统级失败';
+      logError(
+        `经验${reason}（不写 ai_experiences，继续下一条）：${c.canonicalUrl}`,
+        e,
+      );
       continue;
     }
 
@@ -300,9 +294,7 @@ async function logSkippedNullUrlExperiences(
 export interface RunExperienceKbIngestionOptions {
   /** 参考时刻，决定 eventDate NULL 回退的当日 pushDate（默认当前时刻，与 dispatcher 同源）。 */
   now?: Date;
-  /** kb_provider，默认 'custom'（本地表）。 */
-  kbProvider?: string;
-  /** 透传给 storeKbDocument 的选项（logError 等；kbProvider 由本编排统一注入）。 */
+  /** 透传给 storeKbDocument 的选项（logError 等；kbProvider 由本编排统一注入 KB_PROVIDER_CUSTOM）。 */
   store?: Omit<KbStoreOptions, 'kbProvider'>;
   /** 错误/信息日志 sink，默认 console.error。 */
   logError?: LogError;
@@ -340,13 +332,13 @@ interface ExperienceKbCandidate {
  * AND `target_type='experience'`、**不要求已推送**（经验入 KB 不以已推送为前提；push-empty 与 KB-empty
  * 是不同集合——某天 ≥70 卡片昨天已推、push 候选空但今天有新 ≥70 卡片仍须入 KB）。
  *
- * 直接以卡片字段组**完整 10 字段 KbStoreItem** → storeKbDocument（kbProvider='custom' 经 options
- * 传入）+ kb_ingestion_records 幂等。**跳过 KB 摘要 Agent 重算**。失败隔离、**永不向上抛**。
+ * 直接以卡片字段组**完整 10 字段 KbStoreItem** → storeKbDocument（kbProvider 固定注入
+ * KB_PROVIDER_CUSTOM）+ kb_ingestion_records 幂等。**跳过 KB 摘要 Agent 重算**。失败隔离、**永不向上抛**。
  *
  * **前置约束**：依赖调用方持 `daily-digest:{push_date}` 单例锁、channel-blind 单跑（design D6）；
  * 且必须在 runDailyWorkflow 无候选早退**之前**调用（防 KB stranding，接线由组 E 5.2 负责）。
  *
- * @param options 注入 now（决定 eventDate NULL 回退当日）/ store / logError / kbProvider。
+ * @param options 注入 now（决定 eventDate NULL 回退当日）/ store / logError。
  * @param dbh     db 句柄（默认全局 db）。storeKbDocument 内部自起事务，dbh 应为顶层 db 实例。
  */
 export async function runExperienceKbIngestion(
@@ -354,7 +346,6 @@ export async function runExperienceKbIngestion(
   dbh: DbLike = defaultDb,
 ): Promise<ExperienceKbIngestionResult> {
   const pushDate = getPushDate(options.now);
-  const kbProvider = options.kbProvider ?? KB_PROVIDER_CUSTOM;
   const logError =
     options.logError ??
     ((message, detail) =>
@@ -388,7 +379,7 @@ export async function runExperienceKbIngestion(
                 and(
                   eq(kbIngestionRecords.targetType, TARGET_TYPE.experience),
                   eq(kbIngestionRecords.targetId, aiExperiences.id),
-                  eq(kbIngestionRecords.kbProvider, kbProvider),
+                  eq(kbIngestionRecords.kbProvider, KB_PROVIDER_CUSTOM),
                   eq(kbIngestionRecords.status, 'success'),
                 ),
               ),
@@ -430,7 +421,7 @@ export async function runExperienceKbIngestion(
           // 跳过 embedding 生成（经验链不调 embedTexts；列可空，供未来检索）。
           embedding: null,
         },
-        { ...options.store, kbProvider },
+        { ...options.store, kbProvider: KB_PROVIDER_CUSTOM },
         dbh,
       );
 
