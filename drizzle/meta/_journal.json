@@ -57,6 +57,13 @@
       "when": 1781972085787,
       "tag": "0007_p_blogger_ai_experiences",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1782301525857,
+      "tag": "0008_special_gladiator",
+      "breakpoints": true
     }
   ]
 }
