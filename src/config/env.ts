@@ -359,6 +359,47 @@ const envSchema = z.object({
   // 防长文本 token 爆。提炼 Agent 取 raw_item content 摘录（截断到此值）后调 generateObject。
   // 非法值（NaN/负/0/小数）启动即报错（守 env 不变量，裸读 process.env 会绕过校验）。
   EXPERIENCE_TEXT_MAX_CHARS: z.coerce.number().int().positive().default(2000),
+
+  // ─── Model Radar 5b（add-model-radar-ingestion-freshness）保鲜回路调度 ───
+  // 各调度链总开关，默认 'false'（打磨期关闭；worker-main 不注册对应 BullMQ 链，仿 ALERT_SCAN_ENABLED）。
+  // 待 seed 录入 + 真实源勘验后改 'true' 启用。
+  MR_EVENT_REVIEW_ENABLED: z.enum(['true', 'false']).default('false'),
+  MR_SCRAPE_ENABLED: z.enum(['true', 'false']).default('false'),
+  MR_STALENESS_ENABLED: z.enum(['true', 'false']).default('false'),
+
+  // 事件流触发复核（design D8）：cron 在日报产出事件之后错峰。
+  // **MR_EVENT_REVIEW_WINDOW_DAYS 必须 >=1**（`positive()` 拒 0/负）——0 会令
+  // startOfDayInTimeZone(now, windowDays-1)=明天 00:00、候选闭区间空集 → 静默停打标（design D8）。
+  MR_EVENT_REVIEW_CRON: z.string().min(1).default('23 8 * * *'),
+  MR_EVENT_REVIEW_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
+  MR_EVENT_REVIEW_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  MR_EVENT_REVIEW_WINDOW_DAYS: z.coerce.number().int().positive().default(1),
+
+  // 三档抓取（design D10–D15）：http 日级 / browser 周级 cron 错峰。
+  MR_SCRAPE_HTTP_CRON: z.string().min(1).default('13 9 * * *'),
+  MR_SCRAPE_BROWSER_CRON: z.string().min(1).default('17 9 * * 1'),
+  MR_SCRAPE_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
+  MR_SCRAPE_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  // 抓取裸请求可识别 UA（design D12，无凭据仅此头；守 robots 礼貌）。
+  MR_SCRAPE_USER_AGENT: z
+    .string()
+    .min(1)
+    .default('ai-radar-model-radar/1.0 (+https://github.com/HerbertGao/ai-radar; pricing-change-detector)'),
+  // 单次抓取 fetch 超时毫秒 / 最大重定向跳数（SSRF 每跳重验 D10）/ 最大响应体字节（防 OOM D11）。
+  MR_SCRAPE_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
+  MR_SCRAPE_MAX_REDIRECTS: z.coerce.number().int().nonnegative().default(3),
+  MR_SCRAPE_MAX_RESPONSE_BYTES: z.coerce.number().int().positive().default(2_000_000),
+
+  // 抓取快照临时存储（design D13，best-effort 证据、不入 mr_*）：目录 / TTL 毫秒 / 总字节上限（janitor 扫删）。
+  MR_SNAPSHOT_DIR: z.string().min(1).default('.mr-snapshots'),
+  MR_SNAPSHOT_TTL_MS: z.coerce.number().int().positive().default(604_800_000),
+  MR_SNAPSHOT_MAX_TOTAL_BYTES: z.coerce.number().int().positive().default(100_000_000),
+
+  // 陈旧度排程（design D9）：cron + last_checked 超阈值天数（默认 30；markChecked 掩盖窗口 = 此值）。
+  MR_STALENESS_CRON: z.string().min(1).default('43 9 * * *'),
+  MR_STALENESS_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
+  MR_STALENESS_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  MR_STALENESS_THRESHOLD_DAYS: z.coerce.number().int().positive().default(30),
 })
   // 飞书配置完整性跨字段校验（feishu-push 5.1）：
   // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；
@@ -462,4 +503,15 @@ export function isWeeklyReportEnabled(e: Env = env): boolean {
 
 export function isAlertScanEnabled(e: Env = env): boolean {
   return e.ALERT_SCAN_ENABLED === 'true';
+}
+
+/** Model Radar 5b 各调度链是否启用（默认禁用；worker-main 据此决定是否注册对应 BullMQ 链）。 */
+export function isMrEventReviewEnabled(e: Env = env): boolean {
+  return e.MR_EVENT_REVIEW_ENABLED === 'true';
+}
+export function isMrScrapeEnabled(e: Env = env): boolean {
+  return e.MR_SCRAPE_ENABLED === 'true';
+}
+export function isMrStalenessEnabled(e: Env = env): boolean {
+  return e.MR_STALENESS_ENABLED === 'true';
 }

@@ -35,17 +35,23 @@ export const mrCategorySchema = z.enum([
 /** 源抓取策略（design D9，3 值）。 */
 export const mrFetchStrategySchema = z.enum(['http', 'browser', 'manual']);
 
-/** 币种（design D4/D5，大写 ISO 4217）。5b 扩集；列类型为 varchar(3) 而非 text。 */
-export const mrCurrencySchema = z.enum(['CNY', 'USD']);
+/**
+ * 币种（design D4/D5，大写 ISO 4217）。列类型为 varchar(3) 而非 text。
+ * 5b 全桶录入扩集（扩值不改语义，仍是 varchar(3) 内的 ISO 4217 大写——含欧元区订阅）。
+ */
+export const mrCurrencySchema = z.enum(['CNY', 'USD', 'EUR']);
 
 /**
- * 额度类型（design D1，桶2 样例集）。`credit`/`fast_pass` 等留 5b 全桶入库随录入扩。
+ * 额度类型（design D1）。5b 全桶录入扩集（扩值不改语义，仍是有限值集枚举闸）：
+ * `credit` = Token Plan 通用积分额度；`fast_pass` = IDE会员/Coding Plan 快速通道额度。
  * `none` = 不限（恰一行 {limit_type:'none', value:NULL, window:'none'}）。
  */
 export const mrLimitTypeSchema = z.enum([
   'monthly_tokens',
   'rolling_5h_requests',
   'weekly_messages',
+  'credit',
+  'fast_pass',
   'none',
 ]);
 

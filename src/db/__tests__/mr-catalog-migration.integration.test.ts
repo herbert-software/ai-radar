@@ -921,10 +921,16 @@ describe.skipIf(!databaseUrl)('3.7 spec 场景断言', () => {
       unknown[],
       unknown[],
     ]> = [
-      [mrLimitTypeSchema, ['monthly_tokens', 'none'], ['montly_tokens', 'credit']],
+      // 5b（add-model-radar-ingestion-freshness task 1.4）全桶扩值往返：credit/fast_pass 现合法。
+      [
+        mrLimitTypeSchema,
+        ['monthly_tokens', 'none', 'credit', 'fast_pass'],
+        ['montly_tokens'],
+      ],
       [mrSourceConfidenceSchema, ['official_doc', 'needs_login_recheck'], ['rumor']],
       [mrCategorySchema, ['coding_plan'], ['ide_member']],
-      [mrCurrencySchema, ['CNY', 'USD'], ['cny', 'EUR']],
+      // 5b task 1.4：EUR 扩入合法（仍拒小写 / 非 ISO 4217）。
+      [mrCurrencySchema, ['CNY', 'USD', 'EUR'], ['cny', 'JPY']],
       [mrReviewFlagStatusSchema, ['pending', 'resolved'], ['open']],
       [mrReviewFlagTargetTypeSchema, ['plan', 'source', 'vendor'], ['model']],
       [mrClientTypeSchema, ['tool', 'protocol'], ['client']],

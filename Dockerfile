@@ -31,6 +31,30 @@ COPY . .
 # 非 root 运行（node:alpine 自带 node 用户；源码与 node_modules 对其只读，运行期不写文件）。
 USER node
 
-# 默认常驻 worker（注册 4 条调度链，周报默认禁用 WEEKLY_REPORT_ENABLED=false → 实际 3 条生效）。
+# 默认常驻 worker（注册多条调度链，周报/MR 各链默认禁用 *_ENABLED=false → 仅日报段生效）。
 # compose 的 migrate / web 服务用 command 覆盖；常驻服务在 compose 用 init:true 兜住信号转发。
+# **主镜像不装 Playwright/浏览器**（design D15）：worker-main 只注册 http 档 MR 抓取链，
+# browser 档由下方独立 stage（mr-browser-worker）承载。
 CMD ["npm", "run", "worker"]
+
+# ── browser-worker stage（design D15）：Model Radar browser 档独立镜像（装 Playwright + chromium）。
+#
+# 单独 stage 使主镜像保持零 Playwright 体积/攻击面；本 stage 以官方 Playwright 镜像为基（已带
+# chromium 及其系统依赖，alpine 装不全 chromium 运行库故不复用上面的 node:alpine 基）。
+# 构建：`docker build --target mr-browser-worker -t ai-radar-mr-browser-worker .`
+# 运行：`npm run mr:browser-worker`（entrypoint 先做 egress fail-closed 自检，design D11）。
+#
+# ⚠️ 网络约束（design D11，**必需部署控制**，不在镜像内可保证）：本服务必须跑在
+# **封 RFC1918 / link-local（169.254.0.0/16，含云元数据 169.254.169.254）/ 环回**的 egress 代理
+# 或容器 netns 内；否则 browser-worker-main.ts 的启动自检会探到私网哨兵可达而 fail-closed 拒启动。
+FROM mcr.microsoft.com/playwright:v1.61.1-noble AS mr-browser-worker
+ENV TZ=Asia/Shanghai
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package.json package-lock.json ./
+# tsx / drizzle-kit 为 devDependencies 但运行时确需（经 tsx 直接跑源码），显式 --include=dev。
+RUN npm ci --include=dev
+COPY . .
+# Playwright 镜像自带 pwuser（非 root）；沙箱要求非 root（design D11）。
+USER pwuser
+CMD ["npm", "run", "mr:browser-worker"]

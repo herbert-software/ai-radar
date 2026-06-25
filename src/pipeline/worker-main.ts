@@ -39,7 +39,31 @@ import {
   scheduleWeeklyReport,
   createWeeklyReportWorker,
 } from './weekly-report.js';
-import { isAlertScanEnabled, isWeeklyReportEnabled } from '../config/env.js';
+import {
+  createEventReviewQueue,
+  scheduleEventReview,
+  createEventReviewWorker,
+  buildEventReviewConnection,
+} from '../mr/freshness/event-review-queue.js';
+import {
+  createMrScrapeHttpQueue,
+  scheduleMrScrapeHttp,
+  createMrScrapeHttpWorker,
+  buildScrapeConnection,
+} from '../mr/scrape/scrape-queue.js';
+import {
+  createStalenessQueue,
+  scheduleStaleness,
+  createStalenessWorker,
+  buildStalenessConnection,
+} from '../mr/freshness/staleness-queue.js';
+import {
+  isAlertScanEnabled,
+  isWeeklyReportEnabled,
+  isMrEventReviewEnabled,
+  isMrScrapeEnabled,
+  isMrStalenessEnabled,
+} from '../config/env.js';
 import { assertProductZhColumns } from './product-digest.js';
 
 /** 一条调度链的运行时句柄（worker + queue + 其复用的连接），供统一优雅关闭。 */
@@ -88,6 +112,37 @@ async function main(): Promise<void> {
     await scheduleWeeklyReport(queue);
     const worker = createWeeklyReportWorker({ connection });
     lanes.push({ name: 'weekly-report', worker, queue, connection });
+  }
+
+  // ── 链 4：Model Radar 事件复核 mr-event-review（事件流触发复核，独立连接 buildEventReviewConnection）。
+  //    默认禁用（MR_EVENT_REVIEW_ENABLED='false'）；改 env 即启用（design D8/D14）。
+  if (isMrEventReviewEnabled()) {
+    const connection = buildEventReviewConnection();
+    const queue = createEventReviewQueue(connection);
+    await scheduleEventReview(queue);
+    const worker = createEventReviewWorker({ connection });
+    lanes.push({ name: 'mr-event-review', worker, queue, connection });
+  }
+
+  // ── 链 5：Model Radar http 档抓取 mr-scrape-http（日级 cron，主镜像可跑、无 Playwright 依赖）。
+  //    browser 档为独立 entrypoint（browser-worker-main.ts）+ 独立镜像，**不在此装配**（design D15）。
+  //    默认禁用（MR_SCRAPE_ENABLED='false'）；改 env 即启用。
+  if (isMrScrapeEnabled()) {
+    const connection = buildScrapeConnection();
+    const queue = createMrScrapeHttpQueue(connection);
+    await scheduleMrScrapeHttp(queue);
+    const worker = createMrScrapeHttpWorker({ connection });
+    lanes.push({ name: 'mr-scrape-http', worker, queue, connection });
+  }
+
+  // ── 链 6：Model Radar 陈旧度排程 mr-staleness（独立连接 buildStalenessConnection）。
+  //    默认禁用（MR_STALENESS_ENABLED='false'）；改 env 即启用（design D9/D14）。
+  if (isMrStalenessEnabled()) {
+    const connection = buildStalenessConnection();
+    const queue = createStalenessQueue(connection);
+    await scheduleStaleness(queue);
+    const worker = createStalenessWorker({ connection });
+    lanes.push({ name: 'mr-staleness', worker, queue, connection });
   }
 
   console.error(

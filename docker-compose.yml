@@ -106,6 +106,41 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # ── 应用：Model Radar browser 档抓取（profile=app）。**独立镜像**（装 Playwright + chromium，
+  #    Dockerfile 的 mr-browser-worker stage），主镜像不装 Playwright（design D15）。
+  #    默认禁用（MR_SCRAPE_ENABLED=false）；改 env 即启用。entrypoint 启动先做 egress
+  #    fail-closed 自检（design D11）：探到私网/元数据哨兵可达即非零退出拒启动。
+  #
+  #    ⚠️ 网络约束（design D11，**必需部署控制**，compose 仅给骨架、不能在此保证封禁）：
+  #    本服务必须跑在封 RFC1918 / link-local（169.254.0.0/16，含云元数据 169.254.169.254）/
+  #    环回的 egress 代理或容器 netns 内。具体落地（egress 代理 / netns / 防火墙规则）按部署
+  #    环境（裸机 / k8s / 云）在部署期定；未配妥时自检会拒启动，不会裸奔成 SSRF-to-metadata 洞。
+  mr-browser-worker:
+    build:
+      context: .
+      target: mr-browser-worker
+    # CI 推送的独立镜像（与主镜像分 tag）；可用 AI_RADAR_MR_BROWSER_IMAGE 覆盖。
+    image: ${AI_RADAR_MR_BROWSER_IMAGE:-ghcr.io/herbertgao/ai-radar-mr-browser-worker:latest}
+    profiles: ["app"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${AI_RADAR_DATABASE_URL:-postgres://${POSTGRES_USER:-ai_radar}:${POSTGRES_PASSWORD:-ai_radar}@postgres:5432/${POSTGRES_DB:-ai_radar}}
+      REDIS_URL: redis://redis:6379
+    command: ["npm", "run", "mr:browser-worker"]
+    # 同 worker：tini 作 PID1 回收僵尸（浏览器子进程）+ 可靠转发 SIGTERM。
+    init: true
+    # browser 抓取单 job 含取页 + 渲染，给 90s grace 覆盖在途 job 收尾（与 worker 一致）。
+    stop_grace_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   # ── 应用：HTTP 健康端点（profile=app）。暴露 /health 供监控/内网探活。
   web:
     <<: *app
