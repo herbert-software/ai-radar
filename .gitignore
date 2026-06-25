@@ -28,3 +28,6 @@ coverage/
 # Claude Code local-only settings
 .claude/settings.local.json
 .claude/**/settings.local.json
+
+# Playwright MCP 工作目录（抓取/数据核对时的临时产物）
+.playwright-mcp/
