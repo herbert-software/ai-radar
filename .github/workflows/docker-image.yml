@@ -69,3 +69,33 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ── Model Radar browser 档独立镜像（Dockerfile 的 mr-browser-worker stage，装 Playwright +
+      #    chromium；主镜像不装，design D15）。PR 仅 buildx 验证该 stage 可构建；push main/tag 时推 GHCR。
+      - name: Derive mr-browser-worker image tags
+        id: meta-browser
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ai-radar-mr-browser-worker
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build mr-browser-worker (and push on non-PR)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: mr-browser-worker
+          # 官方 Playwright 基镜像（mcr.microsoft.com/playwright:*-noble）当前仅发布 linux/amd64，
+          # 故 browser 档镜像只构 amd64（与主镜像的多架构解耦；arm64 目标主机如需另议）。
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-browser.outputs.tags }}
+          labels: ${{ steps.meta-browser.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
