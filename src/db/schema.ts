@@ -385,3 +385,342 @@ export const aiExperiences = pgTable(
     ),
   ],
 );
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Model Radar（P5 / 5a，add-model-radar-data-model）—— 隔离的 `mr_*` bounded domain。
+ *
+ * 承载厂商/套餐/模型兼容/工具协议兼容/带类型限额/价格历史/来源与待复核状态。每张**断言事实**表
+ * （`mr_plans`/`mr_plan_limits`/`mr_plan_clients`/`mr_plan_models`）各带 provenance 三字段；
+ * `mr_price_history` 为例外（append-only 历史行，`changed_at` 兼任核对时间，不单建 last_checked）。
+ *
+ * 全沿用既有惯例（design D7/D8/D10/D11/D12，经 grep 核实）：
+ * - PK = `id varchar(128) PRIMARY KEY DEFAULT gen_random_uuid()::text`（对齐
+ *   ai_products/ai_news_events/ai_experiences 代理键；使 mr_review_flag.target_id 可统一引各身份表 PK）。
+ * - 零 FK（引用列裸 varchar(128)，不 references）、零 pg-enum、零 DB CHECK、零 partial index。
+ *   取值集合法性一律落应用层 Zod（见 ./mr-schema.zod.ts），DB 不约束（与 ai_experiences 注释同口径）。
+ * - 唯一键一律命名表级 `unique('<name>').on(...)`（非列级 .unique() 链）；每个唯一键组件列 `.notNull()`
+ *   （PG UNIQUE 对 NULL distinct，组件可空会让去重键静默失效）。
+ * - 引用完整性 / current=latest 双写 / family 小写归一 / append-only / none-行互斥 = 5b 录入契约，非 5a DB 强制。
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/**
+ * 厂商身份表（design D3/D4 豁免）。身份行（实体存在性），不挂 provenance——其时效由所属 plan
+ * 兼容行 provenance 间接承载。`normalized_name` 去重键（小写归一录入是 5b 契约）。
+ */
+export const mrVendors = pgTable(
+  'mr_vendors',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    // 归一去重键（5b 录入归一小写）；UNIQUE 组件 → NOT NULL。
+    normalizedName: text('normalized_name').notNull(),
+    name: text('name').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [unique('mr_vendors_normalized_name_key').on(table.normalizedName)],
+);
+
+/**
+ * 模型身份表（design D3）。唯一键 = 真实三列 `UNIQUE(vendor_id, family, version)`。
+ * `family` = 去版本号系列名小写（GLM-5.2→`glm`，Kimi-K2.7→`kimi`）；小写归一是 5b 录入契约，
+ * 5a 不加 Zod transform/CHECK、不强制、不测。`version` NOT NULL，未标版本填哨兵 `''`（不用 NULL，
+ * 否则 PG UNIQUE 放行多 NULL 让 GLM-5.2/GLM-4.7 误合）。身份行不挂 provenance（同 mr_vendors）。
+ */
+export const mrModels = pgTable(
+  'mr_models',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    vendorId: varchar('vendor_id', { length: 128 }).notNull(),
+    family: text('family').notNull(),
+    version: text('version').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_models_vendor_id_family_version_key').on(
+      table.vendorId,
+      table.family,
+      table.version,
+    ),
+  ],
+);
+
+/**
+ * 套餐表（断言事实表，带 provenance 三字段，design D4/D5/D6/D11）。
+ * `current_price numeric(12,2)` 与 `currency varchar(3)` 均 nullable 且**同生同灭**——
+ * 登录墙后拿不到价（needs_login_recheck）时两者均 NULL 占位、不写 mr_price_history。
+ * 同生同灭由应用层 Zod `.refine()` 兜（DB 零-CHECK 不挡，见 ./mr-schema.zod.ts）。
+ * `updated_at` NOT NULL DEFAULT now()（design D11：刻意比既有 updated_at 更严，有 default 故 insert 永不失败）。
+ */
+export const mrPlans = pgTable(
+  'mr_plans',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    vendorId: varchar('vendor_id', { length: 128 }).notNull(),
+    // UNIQUE(vendor_id, name) 组件 → NOT NULL（真实列，非派生）。
+    // 录入约定：name = 套餐全名（含产品上下文，如 'Coding Plan Pro'/'Qoder Pro'，非裸档位 'Pro'）；
+    // 故 key 不含 category 仍正确（同厂跨桶全名天然不同 + 挡同名误录）。裸档位跨桶误撞属 5b 录入契约须避免。
+    name: text('name').notNull(),
+    category: text('category').notNull(),
+    // 与 currency 同生同灭（Zod refine 兜）；needs_login_recheck 时两者皆 NULL 占位。
+    currentPrice: numeric('current_price', { precision: 12, scale: 2 }),
+    currency: varchar('currency', { length: 3 }),
+    // provenance 三字段（断言事实表必带，design D4）。
+    sourceUrl: text('source_url').notNull(),
+    lastChecked: timestamp('last_checked', { withTimezone: true }).notNull(),
+    sourceConfidence: text('source_confidence').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [unique('mr_plans_vendor_id_name_key').on(table.vendorId, table.name)],
+);
+
+/**
+ * 套餐↔模型兼容 junction（断言事实表，带 provenance 三字段，design D2/D4）。
+ * 兼容置信度独立于 plan 级（兼容常来自人脑/社区，不继承 plan 定价置信度）。
+ * 反向索引（model_id）暂缓：快照承读 + 低百行，慢了再单独 forward-only 加（design D2）。
+ */
+export const mrPlanModels = pgTable(
+  'mr_plan_models',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    planId: varchar('plan_id', { length: 128 }).notNull(),
+    modelId: varchar('model_id', { length: 128 }).notNull(),
+    sourceUrl: text('source_url').notNull(),
+    lastChecked: timestamp('last_checked', { withTimezone: true }).notNull(),
+    sourceConfidence: text('source_confidence').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_plan_models_plan_id_model_id_key').on(table.planId, table.modelId),
+  ],
+);
+
+/**
+ * 套餐↔工具/协议兼容 junction（断言事实表，带 provenance 三字段，design D2/D4）。
+ * `client_type ∈ {tool, protocol}`，UNIQUE(plan_id, client_type, client_id) 防工具/协议同名误撞。
+ * 反向索引（client_id）暂缓（同 mr_plan_models 理由）。
+ */
+export const mrPlanClients = pgTable(
+  'mr_plan_clients',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    planId: varchar('plan_id', { length: 128 }).notNull(),
+    clientType: text('client_type').notNull(),
+    clientId: text('client_id').notNull(),
+    sourceUrl: text('source_url').notNull(),
+    lastChecked: timestamp('last_checked', { withTimezone: true }).notNull(),
+    sourceConfidence: text('source_confidence').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_plan_clients_plan_id_client_type_client_id_key').on(
+      table.planId,
+      table.clientType,
+      table.clientId,
+    ),
+  ],
+);
+
+/**
+ * 带类型限额表（断言事实表，带 provenance 三字段，design D1/D4/D11）。
+ * `value` = 无精度 `numeric`（容月级 token 900 亿 + 小数 credit；**禁 integer** 防 int32 溢出），
+ * nullable（不限/登录墙占位时 NULL）。`window` = text NOT NULL 用哨兵（`'5h'`/`'week'`/`'month'`/`'none'`），
+ * 不用 NULL——PG UNIQUE 对 NULL distinct，window 可空则 (plan_id, limit_type, NULL) 重复不被拒。
+ * 「不限」= 恰一行 {limit_type:'none', value:NULL, window:'none'}；none 行与具名限额互斥 = 5b 契约（DB 拦不住跨行）。
+ */
+export const mrPlanLimits = pgTable(
+  'mr_plan_limits',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    planId: varchar('plan_id', { length: 128 }).notNull(),
+    limitType: text('limit_type').notNull(),
+    // 无精度 numeric（禁 integer，design D1）；不限/占位时 NULL。
+    value: numeric('value'),
+    // 哨兵 NOT NULL（design D1，使 UNIQUE 正常去重）。
+    window: text('window').notNull(),
+    sourceUrl: text('source_url').notNull(),
+    lastChecked: timestamp('last_checked', { withTimezone: true }).notNull(),
+    sourceConfidence: text('source_confidence').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_plan_limits_plan_id_limit_type_window_key').on(
+      table.planId,
+      table.limitType,
+      table.window,
+    ),
+  ],
+);
+
+/**
+ * 价格历史表（append-only，provenance 例外，design D5）。
+ * provenance 仅 `source_url`/`source_confidence`/`changed_at`——`changed_at` 兼任该行记录/核对时间
+ * （历史行不被重新核对，不单建 last_checked）；「再核对的新鲜度」体现在 mr_plans.current_price 的 last_checked。
+ * `new_value numeric(12,2) NOT NULL`（改价必留确值 ⇒ 必有币种 → currency NOT NULL）；`old_value` nullable。
+ * UNIQUE(plan_id, changed_at) 只防同刻重复 INSERT，防不住 UPDATE/DELETE 覆盖（5a 零-trigger）；
+ * append-only = 5b only-INSERT 写契约，非 5a DB 强制。
+ */
+export const mrPriceHistory = pgTable(
+  'mr_price_history',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    planId: varchar('plan_id', { length: 128 }).notNull(),
+    oldValue: numeric('old_value', { precision: 12, scale: 2 }),
+    newValue: numeric('new_value', { precision: 12, scale: 2 }).notNull(),
+    currency: varchar('currency', { length: 3 }).notNull(),
+    // 去重键兼记录时间（design D5）；UNIQUE 组件 → NOT NULL。
+    changedAt: timestamp('changed_at', { withTimezone: true }).notNull(),
+    sourceUrl: text('source_url').notNull(),
+    sourceConfidence: text('source_confidence').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_price_history_plan_id_changed_at_key').on(
+      table.planId,
+      table.changedAt,
+    ),
+  ],
+);
+
+/**
+ * 来源定位边（design D9）。`mr_source` 是被监控目标，使 5b「源指纹变 → 哪些 plan 待复核」可落地。
+ * `last_checked` nullable 无 default（未抓过 ≠ 入库时刻）；`content_fingerprint` nullable（sha256 hex）。
+ * 身份/定位边，不挂 provenance（design D4 豁免）。`plan.source_url` 与本表 source_url 对齐 = 5b 录入规范。
+ */
+export const mrSource = pgTable(
+  'mr_source',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    sourceUrl: text('source_url').notNull(),
+    vendorId: varchar('vendor_id', { length: 128 }).notNull(),
+    fetchStrategy: text('fetch_strategy').notNull(),
+    // sha256 hex（可空：未抓过无指纹）。
+    contentFingerprint: text('content_fingerprint'),
+    // 核对时间（可空无 default：未抓过 ≠ 入库时刻，design D11）。
+    lastChecked: timestamp('last_checked', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_source_vendor_id_source_url_key').on(
+      table.vendorId,
+      table.sourceUrl,
+    ),
+  ],
+);
+
+/**
+ * 源↔套餐定位边 junction（design D9）。定位边本身，不挂 provenance（design D4 豁免）。
+ */
+export const mrPlanSources = pgTable(
+  'mr_plan_sources',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    sourceId: varchar('source_id', { length: 128 }).notNull(),
+    planId: varchar('plan_id', { length: 128 }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_plan_sources_source_id_plan_id_key').on(
+      table.sourceId,
+      table.planId,
+    ),
+  ],
+);
+
+/**
+ * 待复核标（单 target 单行可变标，design D10）。普通 `UNIQUE(target_type, target_id)`（非 partial index）。
+ * `target_type ∈ {plan, source, vendor}`（粗于 provenance——某兼容断言陈旧经其所属 plan 的 flag 复核）；
+ * `target_id varchar(128)` 多态引三身份表 PK，故须同型 varchar(128)（design D11）。
+ *
+ * 写契约（必单语句 CAS，非 INSERT-then-UPDATE，落 5b）：开标/重开 = 无条件
+ * `INSERT … ON CONFLICT(target_type,target_id) DO UPDATE SET status='pending', reason=excluded.reason,
+ *  opened_at=now(), resolved_at=NULL`（孪生 kb_ingestion_records 同机制，reason=excluded.reason 是对其的正确扩展）；
+ * 解决 = plain `UPDATE … SET status='resolved', resolved_at=now()`。
+ * ponytail ceiling：单行可变标丢失「同 target 多次标记历史」——5a 不需要；要审计再建独立 append-only flag-event 日志（YAGNI）。
+ */
+export const mrReviewFlag = pgTable(
+  'mr_review_flag',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    targetType: text('target_type').notNull(),
+    targetId: varchar('target_id', { length: 128 }).notNull(),
+    reason: text('reason'),
+    status: text('status').notNull(),
+    openedAt: timestamp('opened_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_review_flag_target_type_target_id_key').on(
+      table.targetType,
+      table.targetId,
+    ),
+  ],
+);
+
+/**
+ * 目录版本表（design D11）。5c bump/latest 需有序唯一版本。`version bigint NOT NULL UNIQUE`
+ * 无 default（由 5c bump 路径产生，5a 仅建表不写）；`built_at` NOT NULL DEFAULT now()。
+ */
+export const mrCatalogVersion = pgTable(
+  'mr_catalog_version',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    version: bigint('version', { mode: 'bigint' }).notNull(),
+    builtAt: timestamp('built_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [unique('mr_catalog_version_version_key').on(table.version)],
+);

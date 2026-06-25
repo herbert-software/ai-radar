@@ -20,12 +20,44 @@
 | **P2** ✅ | 扩源 + 双通道 + 产品发现 | 3–4 周 | W5 ~ W8 | 07-14 ~ 08-10 | 一线大厂官方 RSS（OpenAI/DeepMind/HuggingFace，T1）/Product Hunt/arXiv collector、飞书通道、`ai_products` 表 + **硬规则产品合并**、实时重大发布告警、周报。**Reddit 经鉴权/限流调研移出关键路径**（条款风险，详见 `expand-sources-dual-channel-products` 提案非目标）；Meta/Anthropic 无原生 RSS 的 HTML 抓取列 T2 次批（Mistral 经实测有原生 RSS，已随后续扩源接入，连同 Microsoft AI） | P1 | **退出标准达成**（见下「P2 退出标准达成」）：双通道均不重复推；每日产品发现推送；实时告警跑通；周报跑通 |
 | **P3** ✅ | 语义去重 + 知识库 | 3–4 周 | W9 ~ W12 | 08-11 ~ 09-07 | pgvector embedding 去重 + LLM 二次判断、`ai_news_events` 事件合并、KB 入库（本地表 → Dify HTTP）、只入 `long_term_value≥70` | P2 + 真实数据积累 | **退出标准达成**（见下「P3 退出标准达成」，阈值实测复校列为持续运营动作）：中英文同一事件被识别为一条；KB 可检索 |
 | **P4** ✅ | MCP 查询入口 | 1.5–2 周 | W9 ~ W11（与 P3 并行） | 08-11 ~ 08-24 | MCP server：`get_today_ai_digest` / `search_ai_events` / `search_ai_products` / `mark_*` / `push_event_now` | P2 | **退出标准达成**（见下「P4 退出标准达成」）：从 Claude/Cursor 查到当日日报与历史 |
-| **P5** | AI 工具选型顾问 | 3–5 周 | W13 ~ W17 | 09-08 ~ 10-12 | `ai_tools` + `task_patterns` 表、规则召回、RAG 证据、LLM 解释、`recommend_ai_tools_for_task`（可拆 5a 数据+规则 / 5b RAG+解释 / 5c 暴露） | P3 + P4 + 数据积累 | "内部知识库选 Dify/RAGFlow/FastGPT" 能给出首选/备选/不推荐/落地步骤 |
-| **P6** | Web 控制台（可选，延后） | 按需 | — | — | 前后端同 TS、复用 Zod schema 的人工干预面板 | P4 | — |
+| **P5** ⭐ | **Model Radar — 编程订阅比价 + 选型（编程垂类，已提优先级，现关键路径下一步）** | 5–7 周 | —（P0–P4 提前完成，按日历重定基线） | 06-25 ~ 08-09 | 见下「[P5 Model Radar 步骤拆解](#p5-model-radar-步骤拆解)」5a–5e：数据模型+provenance / 录入+保鲜回路 / 桶2数据+比价检索API / Web 比价页 / 垂类选型推荐器 | P2（产品·事件流）+ P4（MCP） | 比价页 10s 内答「谁含 GLM-5.2 / 谁支持 Claude Code / 同档谁最划算 / 谁最近变了」；每条价/兼容/额度带 `source_url`+`last_checked`+`source_confidence`；陈旧项可被 ai-radar 变更流标「待复核」 |
+| **P6** | 泛化选型顾问（原 P5：任意工具 / 任意任务） | 3–5 周 | — | Model Radar 之后 | `ai_tools` + `task_patterns` 表、规则召回、RAG、LLM 解释、`recommend_ai_tools_for_task`；把 Model Radar 验证过的「规则召回 → RAG → LLM 解释」推荐器从编程订阅垂类泛化到「做某事用哪个 AI 工具」 | P5 | 「内部知识库选 Dify/RAGFlow/FastGPT」给出首选/备选/不推荐/落地步骤 |
+| **P7** | Web 控制台（内部人工干预面板，可选） | 按需 | — | — | 复用 P5 前端栈的人工干预面板 | P5 | — |
 
-**关键路径**：P0 → P1 → P2 → P3 → P5 ≈ **13–17 周（约 3.5–4 个月）** 到完整顾问；**首个可用版本约第 4 周末（7 月中）** 上线。
+**关键路径**：P0 → P1 → P2 → P3 → **P5（Model Radar）**。P0–P4 已上线（含情报流 / 双通道 / 语义去重 / 知识库 / MCP）；**下一关键里程碑 = P5 Model Radar**（约 **5–7 周**），泛化顾问（P6）作为其超集后置。
 
-> **进度（截至 2026-06-21）**：**P0–P4 关键路径全部落地**，外加 roadmap 外的「AI 博主经验挖掘」链（归档 `add-ai-blogger-experience-mining`，新增 `ai_experiences` 表 + 独立经验链 `source='blogger'`/`raw_type='experience'`，≥70 价值闸入知识库 + 实践锦囊推送）。**下一步 P5（AI 工具选型顾问）**，建议先拆 5a（`ai_tools` + `task_patterns` 表 + 规则召回，其余 5b/5c 依赖它）。唯一未结的退出标准是 P3 语义阈值的真实数据复校（接线就位、取 QA §9.2 起点默认，列为持续运营动作，见下「P3 退出标准达成」）。
+> **进度（截至 2026-06-21）**：**P0–P4 关键路径全部落地**，外加 roadmap 外的「AI 博主经验挖掘」链（归档 `add-ai-blogger-experience-mining`，新增 `ai_experiences` 表 + 独立经验链 `source='blogger'`/`raw_type='experience'`，≥70 价值闸入知识库 + 实践锦囊推送）。**下一步从通用顾问改为 P5 = Model Radar（编程订阅比价 + 选型，已提优先级，数据已核）**，先做 5a（数据模型 + provenance），其余 5b–5e 依赖它；原通用「AI 工具选型顾问」降为 P6 泛化目标（Model Radar 跑通后再泛化）。唯一未结的退出标准是 P3 语义阈值的真实数据复校（接线就位、取 QA §9.2 起点默认，列为持续运营动作，见下「P3 退出标准达成」）。
+
+## P5 Model Radar 步骤拆解
+
+> **背景**：Model Radar 原是独立产品构想（AI 编程订阅 / Coding Plan / Token 包的比价 + 选型）。经评估**并入本仓作同仓 bounded domain**，而非单开项目——它本质是 P5「AI 工具选型顾问」在**编程垂类**的具象化 + 项目首个 Web 前端，复用现有 PostgreSQL / Drizzle / BullMQ / MCP / 推送 / 部署。故提优先级，作 P0–P4 之后关键路径下一步。首版候选库（约 20 家，其中 8 厂商已逐字核对官方页，2026-06-24）随 5a 提案附库。**技术方案、已锁决策（抓取三档含 Playwright / Hono JSX SSR / 同容器托管 / 推荐器 v1 规则+模板）与 v1·v2 切分见 [`docs/model-radar-tech-plan.md`](./docs/model-radar-tech-plan.md)。**
+
+### 定位与边界
+
+- **是**：厂商 → 套餐 → 模型 → 工具/协议兼容矩阵 + 价格历史的**结构化关系目录** + 直观比价页 + 垂类选型推荐。
+- **不是**：自动爬全网填目录的 Agent。目录靠**结构化录入 + 人工策展**；ai-radar 管线只供「变更信号 + 待复核标」，不负责填事实。
+- **bounded domain**：自有 `mr_*` 表，**不复用、不污染** `ai_products` 与新闻管线 schema（后者是非结构化情报，Model Radar 是精确关系事实）。
+
+### 不可违背（与 `config.yaml` 第一架构原则一致）
+
+- 精确事实（价格 / 兼容 / 额度）由**结构化录入 + DB** 保障，**绝不交 LLM 判定**；LLM 只做解释与推荐措辞。
+- 额度建成**带类型限额行** `mr_plan_limits{limit_type, value, window}`（如 `monthly_tokens` / `rolling_5h_requests` / `weekly_messages` / `none`），**不建单个 `quota INT`**——各家额度口径异构，建成整数从根上烂掉。
+- **分桶隔离**：`category ∈ {IDE会员, Coding Plan, Token Plan, 企业席位}` 是 facet；归一化比较只在**同桶内**做，**检索/筛选横切所有桶**（最高频查询「Claude Code + GLM-5.2 最便宜」跨桶）。
+- 每条事实挂 **provenance**：`source_url` / `last_checked` / `source_confidence ∈ {official_pricing, official_doc, official_community, media_report, needs_login_recheck}`。源会漂移（实测火山方舟 `activity/codingplan` 已跳成智谱 GLM 页），靠 `last_checked` + confidence 暴露而非静默入错。
+- `included_models` **带版本**（GLM-5.2 ≠ GLM-4.7；模型阵容月级换代）。
+- **保鲜回路先于 UI**：先有「录入 + last_checked + 变更流待复核」，再做漂亮比价页；否则第一张表两周后就在骗用户。
+
+### 步骤（每步可单独立 `/opsx:propose`）
+
+| 步 | 范围 | 工期 | 退出标准（可观测） |
+|---|---|---|---|
+| **5a** | 数据模型 + provenance：`mr_vendors` / `mr_plans` / `mr_models` / `mr_plan_models`（模型兼容矩阵）/ `mr_plan_clients`（工具+协议兼容）/ `mr_plan_limits`（带类型限额行）/ `mr_price_history`；category facet；provenance 三字段 | ~1 周 | migration 幂等落表 + 唯一约束 + 一家样例厂商完整录入读回；额度走限额行非单 INT |
+| **5b** | 结构化录入 + 保鲜回路（**先于 UI**）：最小录入路径把已核 8 家入库（带 confidence）；`last_checked` / 陈旧度；接 ai-radar 事件流 → 对应 plan 打「待复核」（写状态不改事实） | ~1–1.5 周 | 8 家在库可查；变更流能把某厂商标待复核；源 URL 漂移类问题被 confidence/last_checked 暴露 |
+| **5c** | 桶2（多模型 Coding Plan：百炼/千帆/腾讯/火山/讯飞）数据 + 比价/检索 API：model × tool × 协议 × 预算 横切筛选；同桶内排序；「同档家族」折叠（5 家 ¥40/¥200 同质 → 收一组，差异在模型/工具/限制） | ~1 周 | API 按 model/tool 过滤返回合格 plan、同桶排序、返回带 provenance |
+| **5d** | Web 比价页（项目**首个真前端**，TS 前后端同栈 + 复用 Zod schema）：筛选 chips + 可排序表 + 行展开看全字段与来源 + 陈旧标；「估算中等任务轮次」做成**带旋钮的区间**、视觉次于官方原始额度、挂 ⚠ 估算 | ~1.5 周 | 浏览器 10s 内答四个 Success 问题；每格可溯源 |
+| **5e** | 垂类选型推荐器：规则硬筛（含某模型/工具/预算）→ RAG 证据（接知识库 + 变更流）→ LLM 解释 → 首选/备选/不推荐/落地；MCP 暴露 `recommend_coding_subscription` | ~1–1.5 周 | 「重度用 Claude Code + GLM-5.2 最便宜可用」给出排名 + 是否撞窗 + 月成本 + 依据 |
+
+> 桶2 之后按需补桶：Token/Credit Plan（GLM/MiniMax/MiMo/Step/Kimi，价格有区分但 credit 口径异构需归一化护栏）、IDE会员（Trae/Qoder/Comate/CodeBuddy/Raccoon，最异构）、企业席位。渠道/代理转售包列**第二阶段**单独表，不混入厂商官方榜。
 
 ## P1 退出标准达成
 
@@ -88,7 +120,8 @@
 - **P1 选 Telegram 单通道**：只为先打通最简推送链路验证整条管道；飞书 P2 补，二者可互换。
 - **产品合并 P2 用硬规则先行**（`canonical_domain` / `github_repo` / `product_hunt_slug` 唯一键），昂贵的语义合并留到 P3 与事件去重共用 embedding 设施。
 - **MCP（P4）排在有数据之后**：无积累的事件/产品则查询接口无内容；可与 P3 并行。
-- **顾问（P5）垫底**：最依赖前期沉淀的结构化产品库，价值最高，宜在地基稳固后做。
+- **Model Radar（P5）提优先级**：地基（P0–P4）已稳，Model Radar 价值高、数据已核、schema 最结构化，且是项目首个 Web 前端的自然载体；先用编程垂类把「规则召回 → RAG → LLM 解释」推荐器跑通，再泛化。
+- **泛化顾问（P6，原 P5）后置**：作为 Model Radar 的超集，最依赖前期沉淀的结构化产品库，宜在垂类验证后做。
 
 ## 横切关注点（每期都带，不单独排期）
 
@@ -107,4 +140,4 @@
 
 ## 与 OpenSpec 的衔接
 
-本仓库为 spec-driven。建议**逐期立提案**（`/opsx:propose`）：先做 P0 + P1，其余各期在前一期收尾时再提案，避免把仍会变动的后期细节过早写死。
+本仓库为 spec-driven。建议**逐期立提案**（`/opsx:propose`）：先做 P0 + P1，其余各期在前一期收尾时再提案，避免把仍会变动的后期细节过早写死。Model Radar（P5）按 **5a–5e 逐步立提案**，5a（数据模型 + provenance）先行，其余依赖它；每个提案须含「非目标」并对齐上方「不可违背」清单。
