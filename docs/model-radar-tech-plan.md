@@ -187,3 +187,52 @@ DB 只在「写入」和「重建快照」时被碰；所有读全部命中**一
 - **不把四个桶并成一个总榜**：同桶内比，检索跨桶。
 - **不为「实时价格」上分钟级轮询**：周/月级 + 事件触发。
 - **不复用/不污染 `ai_products` 与新闻管线 schema**：bounded domain。
+
+---
+
+## 5d 决策记录（2026-06-29，explore + Software Architect 决策，经代码核实）
+
+> 起因：5c 把快照缓存做成**每进程内存单例**（`src/mr/snapshot/cache.ts`），rebuild 钩子在「调用 `recordPriceChange` 的那个进程」刷新。但 3 进程拓扑下——HTTP server（`src/index.ts`，持缓存、服务页面）/ worker（`src/pipeline/worker-main.ts`，链1-6 写 flag/staleness）/ browser-worker / 一次性脚本（seed/策展改价）——**服务页面的 process 1 对其它进程的写一无所知**。这是 5d 必须先解的地基。
+
+### 决策 1：快照家不搬 Redis blob，维持每进程 build-from-DB + pub/sub 仅做失效通知
+
+- **复用 5c 内容哈希 version = 免协调一致性**：任意进程从同一 DB 状态独立 build 出逐字节相同的 snapshot → 相同 version；blob+自增计数器要靠共享存储才换来的属性，5c 哈希已白送。
+- Redis **只当 pub/sub 通道**（写方 publish 失效 → process 1 subscribe → 调既有 `invalidateModelRadarSnapshot()`），**不存 blob、DB 留 SOT**。
+- 真实数据探针背书：满 seed ~14 plan、几 KB、build ~58ms（含连接）→ 数据极小，Redis blob 唯一收益「DB 移出读热路径」无意义；CDN/ISR 过度设计（沿用「实测有压再上」）。
+- 备选（共享 Redis blob）否决：失败模式严格更差（Redis 宕+冷启动→无副本可服务、第二事实源与 DB 失谐、DTO 经 Redis JSON round-trip 的哈希契约）。
+
+### 决策 2：「链7」溶解——周期 rebuild 属 process 1 的 `setInterval`，不是 worker BullMQ 链
+
+- 常驻周期 rebuild 加进 worker 进程**无效**（在 worker 内存刷、没人服务）；它属于**服务进程 process 1**，是进程内定时器。
+- 它**本来就非可选**：`freshness.stale` 是烤进哈希的 now 派生离散量，无任何写能驱动其翻转，只有「推进 now 再 build」才行 → process 1 必须周期 rebuild 让 stale 翻转。它顺带是 pub/sub 漏消息的自愈网。
+- 兜底：Redis 全挂时 publish 失败仅记日志非致命；周期 rebuild 是纯 setInterval 不依赖 Redis、DB 兜读路径永远可服务；冷启动 build-from-DB 无竞态；5c fail-closed/ETag 契约原样保留。**不要** TTL/outbox/exactly-once（at-most-once pub/sub + 周期兜底即契约）。rebuild interval 是「价改/staleness 可见延迟上界」校准旋钮（先分钟级、实测再收紧）。
+
+### 决策 3：先 ship 页面骨架（unknown 价多），真价后续经 5d-C 流入
+
+- 页面价值不只「谁最划算」：还有结构目录、陈旧透明度、比价框架本身；诚实展示「结构齐全、价待核」即真实交付物。
+- 解耦风险曲线：前端（快/确定/可测）vs ops gate+egress+人工策展（慢/依赖环境/人在环）；不把快前端钉死在慢长杆上。
+- **价格呈现红线（fail-closed，非装饰）**：unknown 价必须渲染「待核」chip，**绝不显示 $0 或编数**；已核价不足时「同档最划算」显示「数据不足」而非假赢家。
+
+### 决策 4：per-fact age 采纳——`lastCheckedDate` 进哈希、「N天前」render 时算
+
+- `lastCheckedDate` 按 **per-provenance（每条断言事实行）** 日粒度进快照 DTO：**数据派生**（fact 重核才变、now 推进不动它）→ 进哈希仍稳定（绕开 5c 当初「连续 age/now 进哈希致漂移」的怕，也绕开「plan 级多源聚合取哪条」歧义）。
+- 「🟡N天前」是 render 时 `now − lastCheckedDate` 的**呈现**，不进快照/哈希。与 5c 的 `freshness.stale` 布尔互补共存。
+- 必加不变量测试：**推进 now、不重核任何事实 → 即便快照含 `lastCheckedDate`，哈希不变**。
+
+### 提案分解（3 个，A 先、C 并行）
+
+| 提案 (kebab-case) | 范围 | 依赖 | 顺序 |
+|---|---|---|---|
+| `add-model-radar-snapshot-cross-process-invalidation` | 写方 publish 失效 + process 1 subscribe→既有 invalidate + process 1 周期 rebuild（让 5c 缓存跨进程正确 + 驱动 stale 翻转）；**不引 blob、DB 留 SOT** | 5c（已归档） | **第 1**（小/基座/软依赖） |
+| `add-model-radar-compare-web-page` | Hono JSX SSR 只读比价页（结构+陈旧+**待核诚实呈现**、估算轮次旋钮挂 ⚠）+ per-fact age（`lastCheckedDate` 进 DTO/哈希、N天前 render 算） | 5c API；软依赖 A | 第 2 |
+| `enable-model-radar-browser-egress-prod-and-curate-bucket2` | browser-worker 生产启用（egress/netns 封 RFC1918+metadata+link-local、fail-closed 自检实跑勘验）+ 桶2 五家真价经 `recordPriceChange` 人工策展 | 5b browser 基建 | 并行/正交 |
+
+### 各提案非目标（要点）
+
+- **A**：不存快照 blob、不 CDN/R2、不为 process 1 多副本水平扩展设计、不动 5c fail-closed/content-hash-version/ETag 契约、不把 DB 移出读路径、不做保证投递/exactly-once。
+- **B**：不引 SPA/React/打包器（仅 Hono JSX SSR）、页面不做写、不做登录鉴权（公开只读目录）、不从未核价编「最划算」、哈希里不放连续 age/raw 时间戳、不做跨桶价比较、不做超出 snapshot API 既供数据的交互。
+- **C**：不碰前端、不让抓取直写 `current_price`（人在环经 recordPriceChange）、不扩抓取范围（仅桶2 五家）、不为跑通放松 egress/fail-closed、不用 LLM 判价。
+
+### 最大风险
+
+5d-C（browser/egress 生产 gate + 人工策展）是通往真价的唯一长杆且最难；前端会先以「结构齐全、永远待核」的诚实空壳上线——**若 5d-C 不被优先，管线全铺好但比价核心价值始终落不了地**。
