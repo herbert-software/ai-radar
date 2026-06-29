@@ -400,6 +400,15 @@ const envSchema = z.object({
   MR_STALENESS_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
   MR_STALENESS_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
   MR_STALENESS_THRESHOLD_DAYS: z.coerce.number().int().positive().default(30),
+
+  // ─── Model Radar 5d（add-model-radar-snapshot-cross-process-invalidation）服务进程周期 rebuild ───
+  // HTTP server 进程内 setInterval 周期重建快照缓存的间隔（毫秒）：驱动 `freshness.stale` 阈值穿越翻转、
+  // 作 pub/sub 漏消息的自愈网、并令不走 publish 的 flag/staleness 日级写在一个间隔内可见（design D2/D3）。
+  // **刻意用 `_MS`/setInterval，而非既有 `MR_*_CRON`+`_CRON_TZ`**——后者是 BullMQ repeatable job 约定，
+  // D2 已否决「周期 rebuild 做成 worker BullMQ 链」（刷 worker 内存、没人服务）。它属服务进程的进程内定时器。
+  // 与既有 `MR_SNAPSHOT_TTL_MS`（5b 抓取文件快照 TTL，design D13）**无关**：那管 .mr-snapshots 临时证据文件保留期，
+  // 此管 5c 进程内只读快照缓存的重建周期，二者除名字相近外无任何关系。默认 300000（5min，价改/陈旧可见延迟上界）。
+  MR_SNAPSHOT_REBUILD_INTERVAL_MS: z.coerce.number().int().positive().default(300000),
 })
   // 飞书配置完整性跨字段校验（feishu-push 5.1）：
   // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；

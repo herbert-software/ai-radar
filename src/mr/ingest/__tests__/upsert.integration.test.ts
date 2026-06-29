@@ -10,7 +10,7 @@
  *
  * 不触网 / 不触 LLM；缺 DATABASE_URL 时自动跳过。唯一前缀隔离 + afterAll 清理。
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { and, eq, inArray, like } from 'drizzle-orm';
@@ -25,6 +25,14 @@ process.env.LLM_API_KEY ||= 'test-key';
 process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
+
+// upsertPlan post-commit 经 runSnapshotRebuild 调真 publisher（连 env.REDIS_URL）。mock 成 no-op，
+// 守「测试绝不连真 Redis」红线、并免 Redis-down 时每次 publish 阻塞 ~1s（仿 cache.test.ts）。
+vi.mock('../../snapshot/invalidation.js', () => ({
+  publishSnapshotInvalidation: vi.fn(async () => {}),
+  createSnapshotInvalidationSubscriber: vi.fn(() => ({ quit: vi.fn(async () => {}) })),
+  SNAPSHOT_INVALIDATION_CHANNEL: 'mr:snapshot:invalidate',
+}));
 
 const {
   upsertVendor,

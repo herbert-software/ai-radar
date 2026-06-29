@@ -15,7 +15,7 @@
  * **生产 `_recordPriceChangeTx`** 并钉死其 `nowSql` 注入缝隙为同一固定时戳（撞 ON CONFLICT(plan_id, changed_at)）——
  * 直接覆盖生产同刻分支（不再用测试内手抄副本），断言 current 不动 + price_history_conflict flag。
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { eq, like, sql } from 'drizzle-orm';
@@ -31,6 +31,14 @@ process.env.LLM_API_KEY ||= 'test-key';
 process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
+
+// recordPriceChange/upsertPlan post-commit 经 runSnapshotRebuild 调真 publisher（连 env.REDIS_URL）。
+// mock 成 no-op，守「测试绝不连真 Redis」红线、并免 Redis-down 时每次 publish 阻塞 ~1s（仿 cache.test.ts）。
+vi.mock('../../snapshot/invalidation.js', () => ({
+  publishSnapshotInvalidation: vi.fn(async () => {}),
+  createSnapshotInvalidationSubscriber: vi.fn(() => ({ quit: vi.fn(async () => {}) })),
+  SNAPSHOT_INVALIDATION_CHANNEL: 'mr:snapshot:invalidate',
+}));
 
 const { recordPriceChange, _recordPriceChangeTx } = await import(
   '../record-price-change.js'

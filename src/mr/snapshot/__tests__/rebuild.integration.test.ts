@@ -14,10 +14,10 @@
  * ⑤⑥ 用 builder 全局读后**按本套件 plan id 过滤**再哈希，隔离同库其它行的 staleness 干扰（version 是全快照
  * 哈希，跨 now 直接比全局哈希会被无关行翻转污染）。缺 DATABASE_URL 自动 skip。
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { eq, inArray, like } from 'drizzle-orm';
+import { eq, inArray, like, sql } from 'drizzle-orm';
 import * as schema from '../../../db/schema.js';
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -30,6 +30,14 @@ process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 
+// 组 D：recordPriceChange/upsertPlan 提交后经 runSnapshotRebuild 调真 publisher（短连接连真 Redis）。
+// 全局 mock invalidation 把 publish 换成 no-op spy，既守「测试绝不连真 Redis」红线，又供 4.8 断言 publish 时序。
+vi.mock('../invalidation.js', () => ({
+  publishSnapshotInvalidation: vi.fn(async () => {}),
+  createSnapshotInvalidationSubscriber: vi.fn(() => ({ quit: vi.fn(async () => {}) })),
+  SNAPSHOT_INVALIDATION_CHANNEL: 'mr:snapshot:invalidate',
+}));
+
 const { buildModelRadarSnapshot } = await import('../build.js');
 const {
   computeSnapshotVersion,
@@ -39,9 +47,13 @@ const {
   peekCachedSnapshot,
 } = await import('../cache.js');
 const { runSnapshotRebuild } = await import('../rebuild.js');
-const { recordPriceChange } = await import('../../ingest/record-price-change.js');
+const { recordPriceChange, _recordPriceChangeTx } = await import(
+  '../../ingest/record-price-change.js'
+);
 const { upsertVendor, upsertPlan } = await import('../../ingest/upsert.js');
 const { setReviewFlag } = await import('../../write/flag.js');
+const { publishSnapshotInvalidation } = await import('../invalidation.js');
+const publishSpy = vi.mocked(publishSnapshotInvalidation);
 
 const PREFIX = 'mr-rebuild-itest-';
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl }) : null;
@@ -254,5 +266,159 @@ describeIfDb('5.4 rebuild 耦合 + 版本失效', () => {
     await getModelRadarSnapshot(db!, NOW);
     await getModelRadarSnapshot(db!, NOW);
     expect(await count()).toBe(before);
+  });
+});
+
+describeIfDb('4.2 周期 rebuild body（注入推进 now）：stale 翻转 + flag 可见（非 publish）', () => {
+  it('跨 staleness 阈值 → cached plan stale 翻转 + 隔离 version 变；不跨 + 无 DB 变 → 隔离 version 稳定', async () => {
+    publishSpy.mockClear();
+    // 默认阈值 30 天：plan 自身永鲜（lastChecked=now2），关联源 last_checked=2026-03-01 仅在 now2 跨阈值。
+    const now1 = new Date('2026-02-01T00:00:00Z'); // 阈值 2026-01-02 → 源鲜
+    const now1b = new Date('2026-02-06T00:00:00Z'); // 阈值 2026-01-07 → 源仍鲜（不跨）
+    const now2 = new Date('2026-04-01T00:00:00Z'); // 阈值 2026-03-02 → 源陈旧（跨）
+    const vendorId = await makeVendor('p-stale');
+    const planId = await makePlan(vendorId, 'p-stale', { lastChecked: now2 });
+    const [src] = await db!
+      .insert(schema.mrSource)
+      .values({
+        sourceUrl: `${PREFIX}src-p-stale`,
+        vendorId,
+        fetchStrategy: 'http',
+        lastChecked: new Date('2026-03-01T00:00:00Z'),
+      })
+      .returning();
+    await db!.insert(schema.mrPlanSources).values({ planId, sourceId: src!.id });
+
+    // 隔离 version：按本套件 plan id 过滤后哈希，避免同库其它行 staleness 跨 now 翻转污染全局哈希。
+    const isoVersion = async (now: Date): Promise<string> => {
+      const snap = await buildModelRadarSnapshot(db!, now);
+      return computeSnapshotVersion({ plans: [snap.plans.find((p) => p.id === planId)!] });
+    };
+
+    // 周期 rebuild body：注入 now1（不跨阈值）→ cached plan 不陈旧。
+    await rebuildModelRadarSnapshot(db!, now1);
+    expect(cachedPlan(planId)!.freshness.stale).toBe(false);
+    // 不跨阈值 + 无 DB 变 → 隔离 version 稳定（304 命中）。
+    expect(await isoVersion(now1)).toBe(await isoVersion(now1b));
+
+    // 周期 rebuild body：注入 now2（跨阈值）→ cached plan 翻 stale=true。
+    await rebuildModelRadarSnapshot(db!, now2);
+    expect(cachedPlan(planId)!.freshness.stale).toBe(true);
+    // 跨阈值 → 隔离 version 变（不 304-with-stale）。
+    expect(await isoVersion(now2)).not.toBe(await isoVersion(now1));
+
+    // 周期 rebuild 路径绝不 publish（design D2 承重不变量）。
+    expect(publishSpy).not.toHaveBeenCalled();
+  });
+
+  it('flag 写（不经 publish）经周期 rebuild body 可见：reviewStatus.pending 反映（req-2）', async () => {
+    publishSpy.mockClear();
+    const vendorId = await makeVendor('p-flag');
+    const planId = await makePlan(vendorId, 'p-flag');
+
+    // warm via 周期 rebuild body（非 publish 的 cache fn）。
+    await rebuildModelRadarSnapshot(db!, NOW);
+    expect(cachedPlan(planId)!.reviewStatus.pending).toBe(false);
+    const v0 = peekCachedSnapshot()!.version;
+
+    // 保鲜回路给 plan 打 pending flag（setReviewFlag 不经 runSnapshotRebuild、不 publish）。
+    await setReviewFlag(db!, { targetType: 'plan', targetId: planId }, `${PREFIX}p-flag-pending`);
+
+    // 再调周期 rebuild body → 反映 pending + version 变（证「不走 publish 的 flag 写经周期 rebuild 可见」）。
+    await rebuildModelRadarSnapshot(db!, NOW);
+    expect(cachedPlan(planId)!.reviewStatus.pending).toBe(true);
+    expect(peekCachedSnapshot()!.version).not.toBe(v0);
+    // 全程未经 publish（flag 可见性走周期 rebuild，非 pub/sub）。
+    expect(publishSpy).not.toHaveBeenCalled();
+  });
+});
+
+describeIfDb('4.4 只读不变量：周期 rebuild / 订阅回调路径不写 mr_*、不 bump mr_catalog_version', () => {
+  it('多次周期 rebuild + 订阅回调(invalidate) 前后 mr_* 行数与 mr_catalog_version 不变', async () => {
+    const vendorId = await makeVendor('p-ro');
+    await makePlan(vendorId, 'p-ro');
+
+    const counts = async () => ({
+      plans: (await db!.select({ id: schema.mrPlans.id }).from(schema.mrPlans)).length,
+      flags: (await db!.select({ id: schema.mrReviewFlag.id }).from(schema.mrReviewFlag)).length,
+      history: (await db!.select({ id: schema.mrPriceHistory.id }).from(schema.mrPriceHistory))
+        .length,
+      sources: (await db!.select({ id: schema.mrSource.id }).from(schema.mrSource)).length,
+      catalog: (await db!.select({ id: schema.mrCatalogVersion.id }).from(schema.mrCatalogVersion))
+        .length,
+    });
+
+    const before = await counts();
+    // 周期 rebuild body（cache fn）多次 + 订阅回调路径（invalidate 清进程内缓存，无 DB 写）。
+    await rebuildModelRadarSnapshot(db!, NOW);
+    await rebuildModelRadarSnapshot(db!, new Date());
+    invalidateModelRadarSnapshot(); // = subscriber onInvalidate 路径
+    await rebuildModelRadarSnapshot(db!, NOW);
+    expect(await counts()).toEqual(before);
+  });
+});
+
+describeIfDb('4.8 提交后才 publish（B3，publish 不在事务回调内）', () => {
+  it('history-conflict 分支：_recordPriceChangeTx 在事务内调 setReviewFlag，但绝不在事务内 publish', async () => {
+    publishSpy.mockClear();
+    const vendorId = await makeVendor('txpub');
+    const planId = await makePlan(vendorId, 'txpub', { currentPrice: '20.00', currency: 'USD' });
+    const prov = { sourceUrl: `${PREFIX}prov-txpub`, sourceConfidence: 'official_pricing' };
+    // 钉死 changed_at 受控复现同刻冲突（仅测试传 nowSql）。
+    const FIXED = sql`'2026-06-29 12:00:00.000000+00'::timestamptz`;
+
+    // ① 首次真追加（changed_at=FIXED，20→10）。
+    const o1 = await db!.transaction((tx) =>
+      _recordPriceChangeTx(tx, { planId, newValue: '10.00', currency: 'USD', provenance: prov }, FIXED),
+    );
+    expect(o1.outcome).toBe('appended');
+
+    // ② 同 changed_at 异价 → ON CONFLICT DO NOTHING → 元组异 → history-conflict + 同事务内 setReviewFlag。
+    const o2 = await db!.transaction((tx) =>
+      _recordPriceChangeTx(tx, { planId, newValue: '99.00', currency: 'USD', provenance: prov }, FIXED),
+    );
+    expect(o2.outcome).toBe('history-conflict');
+
+    // setReviewFlag 确在事务内写了 pending 标。
+    const flags = await db!
+      .select({ status: schema.mrReviewFlag.status })
+      .from(schema.mrReviewFlag)
+      .where(eq(schema.mrReviewFlag.targetId, planId));
+    expect(flags.some((f) => f.status === 'pending')).toBe(true);
+
+    // 关键（B3）：publish 只活在 runSnapshotRebuild（最外层提交后），_recordPriceChangeTx 路径绝不触发 publish。
+    expect(publishSpy).not.toHaveBeenCalled();
+
+    // 清理：history-conflict flag 的 reason 非 PREFIX 前缀，cleanup 不覆盖，手动删。
+    await db!.delete(schema.mrReviewFlag).where(eq(schema.mrReviewFlag.targetId, planId));
+  });
+
+  it('公开 recordPriceChange：publish 只在最外层事务提交后发出一次（publish 读到已提交新价）', async () => {
+    publishSpy.mockClear();
+    const vendorId = await makeVendor('postcommit');
+    const planId = await makePlan(vendorId, 'postcommit', { currentPrice: '20.00', currency: 'USD' });
+
+    // publish 触发时读 DB：若 publish 在提交后发出，则应读到已提交的新价 30.00（提交前发出会读到旧值/未提交）。
+    let priceWhenPublished: string | null | undefined;
+    publishSpy.mockImplementationOnce(async () => {
+      const rows = await db!
+        .select({ price: schema.mrPlans.currentPrice })
+        .from(schema.mrPlans)
+        .where(eq(schema.mrPlans.id, planId));
+      priceWhenPublished = rows[0]?.price ?? null;
+    });
+
+    const outcome = await recordPriceChange(
+      {
+        planId,
+        newValue: '30.00',
+        currency: 'USD',
+        provenance: { sourceUrl: `${PREFIX}prov-postcommit`, sourceConfidence: 'official_pricing' },
+      },
+      db!,
+    );
+    expect(outcome.outcome).toBe('appended');
+    expect(publishSpy).toHaveBeenCalledTimes(1); // 最外层提交后恰发一次
+    expect(priceWhenPublished).toBe('30.00'); // publish 时新价已提交可见 → publish 在 commit 之后
   });
 });

@@ -23,6 +23,14 @@ process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 
+// 组 D：runSnapshotRebuild 现默认调真 publisher（短连接连真 Redis）。mock invalidation 把它换成 no-op spy，
+// 既守「测试绝不连真 Redis」红线，又避免 Redis-down 时每次 publish 阻塞 ~1s 拖慢；4.3 单测据此注入抛错 publish。
+vi.mock('../invalidation.js', () => ({
+  publishSnapshotInvalidation: vi.fn(async () => {}),
+  createSnapshotInvalidationSubscriber: vi.fn(() => ({ quit: vi.fn(async () => {}) })),
+  SNAPSHOT_INVALIDATION_CHANNEL: 'mr:snapshot:invalidate',
+}));
+
 const {
   computeSnapshotVersion,
   rebuildModelRadarSnapshot,
@@ -31,6 +39,8 @@ const {
   peekCachedSnapshot,
 } = await import('../cache.js');
 const { runSnapshotRebuild } = await import('../rebuild.js');
+const { publishSnapshotInvalidation } = await import('../invalidation.js');
+const publishSpy = vi.mocked(publishSnapshotInvalidation);
 type ModelRadarSnapshot = import('../dto.js').ModelRadarSnapshot;
 type SnapshotPlan = import('../dto.js').SnapshotPlan;
 
@@ -222,5 +232,33 @@ describe('5.3b rebuild job body never-throws（fail-closed）', () => {
     const res = await runSnapshotRebuild({ dbh: dummyDb, now: NOW, buildFn: stubBuild(snap) });
     expect(res.ok).toBe(true);
     expect(res.version).toBe(computeSnapshotVersion(snap));
+  });
+});
+
+describe('4.3 Redis-down 自愈：publish 抛错下写/重建不受影响', () => {
+  it('runSnapshotRebuild 注入抛错 publish → 写仍成功(ok:true)、version 仍出、outcome 不受影响', async () => {
+    const throwingPublish = vi.fn(async () => {
+      throw new Error('redis down: publish 失败');
+    });
+    const snap = makeSnapshot([makePlan({ currentPrice: '20.00' })]);
+    const res = await runSnapshotRebuild({
+      dbh: dummyDb,
+      now: NOW,
+      buildFn: stubBuild(snap),
+      publish: throwingPublish,
+    });
+    expect(res.ok).toBe(true); // publish 抛错被 runSnapshotRebuild 防御性 try/catch 吞掉、不影响写
+    expect(res.version).toBe(computeSnapshotVersion(snap));
+    expect(throwingPublish).toHaveBeenCalledTimes(1);
+  });
+
+  it('周期 rebuild body(rebuildModelRadarSnapshot) 纯 cache fn：不依赖 Redis、不触 publish', async () => {
+    publishSpy.mockClear();
+    invalidateModelRadarSnapshot();
+    const snap = makeSnapshot([makePlan({ currentPrice: '50.00' })]);
+    const built = await rebuildModelRadarSnapshot(dummyDb, NOW, stubBuild(snap));
+    expect(built.snapshot.plans[0]!.currentPrice).toBe('50.00');
+    // 周期 rebuild 结构上不引用 publisher → Redis 全挂也照常重建（design D2/spec「Redis 全挂周期 rebuild 仍工作」）。
+    expect(publishSpy).not.toHaveBeenCalled();
   });
 });

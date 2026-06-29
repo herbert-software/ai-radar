@@ -10,6 +10,7 @@
  */
 import { serve } from '@hono/node-server';
 import { app } from './app.js';
+import { startSnapshotBackgroundRefresh } from './mr/snapshot/background.js';
 
 const port = Number(process.env.PORT ?? 3000);
 
@@ -17,10 +18,15 @@ const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`ai-radar 已启动，监听 http://localhost:${info.port}（健康检查：/health）`);
 });
 
+// Model Radar 快照后台刷新（5d）：subscriber 收跨进程失效 + 周期 rebuild 驱动 stale 翻转/漏消息自愈。
+const snapshotBg = startSnapshotBackgroundRefresh();
+
 let shuttingDown = false;
 const shutdown = (signal: string): void => {
   if (shuttingDown) return; // 重复信号幂等。
   shuttingDown = true;
+  // best-effort fire（不 await）：clearInterval 同步即时、quit 异步 best-effort，不阻塞下方 server.close/exit。
+  void snapshotBg.stop();
   console.error(`[web] 收到 ${signal}，关闭 HTTP server…`);
   // close() 停止接收新连接、在途请求处理完后回调退出。但 http.Server.close() **不会**
   // 主动断开空闲 keep-alive 连接（监控/反代常驻探活会保活），否则回调永不触发 → 卡到
