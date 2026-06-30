@@ -10,7 +10,7 @@
  *   （RAG 证据，类型 `unknown`、不预钉形状），召回与候选 schema 不变 —— 杜绝换层重构。
  */
 import { z } from 'zod';
-import { mrCurrencySchema } from '../../db/mr-schema.zod.js';
+import { mrAvailabilitySchema, mrCurrencySchema } from '../../db/mr-schema.zod.js';
 import { priceStatusSchema, snapshotProvenanceSchema } from '../snapshot/dto.js';
 
 /** 用量档（轻/中/重）；推荐器自持其 → `{demandedRounds, tokensPerRound}` 映射（两个正交旋钮）。 */
@@ -31,9 +31,11 @@ export const ruleReasonKindSchema = z.enum([
   'protocol_match',
   'monthly_cost',
   'window',
+  'discontinued',
   'unreviewed',
   'pending_review',
   'over_budget',
+  'best_period',
   'primary_cheapest',
   'alternative',
 ]);
@@ -51,6 +53,7 @@ export const rankedCandidateSchema = z.object({
   monthlyCost: z.number().nullable(),
   currency: z.string().nullable(),
   priceStatus: priceStatusSchema,
+  availability: mrAvailabilitySchema,
   stale: z.boolean(),
   fitsWindow: fitsWindowSchema,
   verdict: verdictSchema,

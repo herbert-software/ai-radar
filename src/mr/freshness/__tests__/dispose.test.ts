@@ -3,7 +3,7 @@
  *
  * 覆盖 spec「人工 dispose 最小面闭环」的路由/原子契约：
  * - `markChecked(plan)`：同事务内 resolveFlag + 刷 `mr_plans` **及全部 child 事实行**
- *   （limit/client/model）last_checked → 断言四张表都被 UPDATE（闭合「junction 触发 plan flag → 只刷
+ *   （limit/client/model/period price）last_checked → 断言五张表都被 UPDATE（闭合「junction 触发 plan flag → 只刷
  *   mr_plans → 复打标跑步机」）；
  * - `markChecked(source)`：只刷 `mr_source`，不碰 plan child；
  * - markChecked 全程在 `db.transaction` 内（resolve + 刷 last_checked 原子）；
@@ -83,7 +83,7 @@ function tableNames(hits: TableHit[]): Set<unknown> {
 }
 
 describe('markChecked 粒度刷新（注入桩）', () => {
-  it('markChecked(plan)：刷 mr_plans + 全部 child 事实行（4 张表均 UPDATE）', async () => {
+  it('markChecked(plan)：刷 mr_plans + 全部 child 事实行（含 mr_plan_prices）', async () => {
     const hits: TableHit[] = [];
     const result = await markChecked(makeDbStub(hits) as never, {
       targetType: 'plan',
@@ -92,12 +92,13 @@ describe('markChecked 粒度刷新（注入桩）', () => {
 
     expect(result).toEqual({ outcome: 'checked' });
     const tables = tableNames(hits);
-    // resolveFlag UPDATE mr_review_flag + 刷 mr_plans/limits/clients/models 各 UPDATE。
+    // resolveFlag UPDATE mr_review_flag + 刷 mr_plans/limits/clients/models/period prices 各 UPDATE。
     expect(tables.has(schema.mrReviewFlag)).toBe(true);
     expect(tables.has(schema.mrPlans)).toBe(true);
     expect(tables.has(schema.mrPlanLimits)).toBe(true);
     expect(tables.has(schema.mrPlanClients)).toBe(true);
     expect(tables.has(schema.mrPlanModels)).toBe(true);
+    expect(tables.has(schema.mrPlanPrices)).toBe(true);
   });
 
   it('markChecked(source)：只刷 mr_source，不碰 plan child', async () => {

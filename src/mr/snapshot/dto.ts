@@ -21,6 +21,8 @@
 import { z } from 'zod';
 import {
   isOfficialConfidence,
+  mrAvailabilitySchema,
+  mrBillingPeriodSchema,
   mrCategorySchema,
   mrClientTypeSchema,
   mrCurrencySchema,
@@ -29,6 +31,7 @@ import {
   mrPriceAmountSchema,
   mrSourceConfidenceSchema,
 } from '../../db/mr-schema.zod.js';
+import { effectiveMonthly } from '../effective-monthly.js';
 
 /**
  * 每条断言事实的 provenance（plan 价格事实 + models/clients/limits）。
@@ -81,6 +84,16 @@ export const snapshotSourceSchema = z.object({
 /** 价格状态（design D4：known 须同币种 + 已核官方 provenance；否则 unknown）。 */
 export const priceStatusSchema = z.enum(['known', 'unknown']);
 
+/** 月价之外的周期价行（展示字段；不参与 cheapest/sort）。 */
+export const snapshotPeriodPriceSchema = z.object({
+  billingPeriod: mrBillingPeriodSchema,
+  price: z.string().nullable(),
+  currency: mrCurrencySchema,
+  priceStatus: priceStatusSchema,
+  provenance: snapshotProvenanceSchema,
+  effectiveMonthly: z.number().nullable(),
+});
+
 /**
  * 单个套餐的去规范化服务表征。
  *
@@ -95,6 +108,7 @@ export const snapshotPlanSchema = z
     vendorName: z.string(),
     name: z.string(),
     category: mrCategorySchema,
+    availability: mrAvailabilitySchema,
     /** numeric→string；priceStatus=unknown 时可为 NULL（占位）或非 NULL（非官方 confidence 带价）。 */
     currentPrice: z.string().nullable(),
     currency: mrCurrencySchema.nullable(),
@@ -104,6 +118,7 @@ export const snapshotPlanSchema = z
     freshness: z.object({ stale: z.boolean() }),
     /** 待复核（plan 级聚合：plan flag / vendor flag / 关联 source flag 任一 pending 即 true）。 */
     reviewStatus: z.object({ pending: z.boolean() }),
+    periodPrices: z.array(snapshotPeriodPriceSchema),
     models: z.array(snapshotModelSchema),
     clients: z.array(snapshotClientSchema),
     limits: z.array(snapshotLimitSchema),
@@ -135,6 +150,55 @@ export const snapshotPlanSchema = z
         code: z.ZodIssueCode.custom,
         message: 'priceStatus=unknown 但价格/币种/provenance 满足 known 条件，判定不一致',
       });
+    }
+    for (const pp of p.periodPrices) {
+      const ppKnown =
+        pp.price !== null && isOfficialConfidence(pp.provenance.sourceConfidence);
+      if (pp.priceStatus === 'known' && !ppKnown) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['periodPrices'],
+          message: 'period priceStatus=known 必须满足 price 非 NULL 且 source_confidence 属已核官方集合',
+        });
+      }
+      if (pp.priceStatus === 'unknown' && ppKnown) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['periodPrices'],
+          message: 'period priceStatus=unknown 但价格/provenance 满足 known 条件，判定不一致',
+        });
+      }
+      if (pp.price !== null && !mrPriceAmountSchema.safeParse(pp.price).success) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['periodPrices'],
+          message: 'period price 须为合法金额（有限、≥ 0、小数位 ≤ 2）',
+        });
+      }
+      if (pp.priceStatus !== 'known' && pp.effectiveMonthly !== null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['periodPrices'],
+          message: "period priceStatus!='known' 时 effectiveMonthly 必须为 null",
+        });
+      }
+      if (p.category === 'token_plan' && pp.effectiveMonthly !== null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['periodPrices'],
+          message: 'token_plan 不生成 effectiveMonthly',
+        });
+      }
+      if (p.category !== 'token_plan' && pp.priceStatus === 'known') {
+        const expected = effectiveMonthly(pp.price, pp.billingPeriod, pp.priceStatus);
+        if (pp.effectiveMonthly !== expected) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['periodPrices'],
+            message: 'period effectiveMonthly 与 price/billingPeriod/priceStatus 不一致',
+          });
+        }
+      }
     }
   });
 
@@ -172,6 +236,7 @@ export type SnapshotClient = z.infer<typeof snapshotClientSchema>;
 export type SnapshotLimit = z.infer<typeof snapshotLimitSchema>;
 export type SnapshotSource = z.infer<typeof snapshotSourceSchema>;
 export type PriceStatus = z.infer<typeof priceStatusSchema>;
+export type SnapshotPeriodPrice = z.infer<typeof snapshotPeriodPriceSchema>;
 export type SnapshotPlan = z.infer<typeof snapshotPlanSchema>;
 export type ModelRadarSnapshot = z.infer<typeof modelRadarSnapshotSchema>;
 export type SnapshotSortScope = z.infer<typeof snapshotSortScopeSchema>;

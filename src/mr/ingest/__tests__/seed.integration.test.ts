@@ -59,6 +59,7 @@ async function cleanup() {
 
   if (planIds.length > 0) {
     await db.delete(schema.mrPlanSources).where(inArray(schema.mrPlanSources.planId, planIds));
+    await db.delete(schema.mrPlanPrices).where(inArray(schema.mrPlanPrices.planId, planIds));
     await db.delete(schema.mrPlanModels).where(inArray(schema.mrPlanModels.planId, planIds));
     await db.delete(schema.mrPlanClients).where(inArray(schema.mrPlanClients.planId, planIds));
     await db.delete(schema.mrPlanLimits).where(inArray(schema.mrPlanLimits.planId, planIds));

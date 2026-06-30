@@ -32,6 +32,7 @@ function known(
     vendorName: 'Vendor 1',
     name: id,
     category,
+    availability: 'unknown',
     currentPrice: price,
     currency,
     priceStatus: 'known',
@@ -42,6 +43,7 @@ function known(
     },
     freshness: { stale: false },
     reviewStatus: { pending: false },
+    periodPrices: [],
     models: [],
     clients: [],
     limits: [],
@@ -64,6 +66,7 @@ function unknown(
     vendorName: 'Vendor 1',
     name: id,
     category: opts.category ?? 'coding_plan',
+    availability: 'unknown',
     currentPrice: opts.price ?? null,
     currency: opts.currency ?? null,
     priceStatus: 'unknown',
@@ -74,6 +77,7 @@ function unknown(
     },
     freshness: { stale: false },
     reviewStatus: { pending: false },
+    periodPrices: [],
     models: [],
     clients: [],
     limits: [],
@@ -187,6 +191,57 @@ describe('3.5 过滤/排序服务（合成快照 fixture）', () => {
 
     const ids = groups.flatMap((g) => g.plans.map((p) => p.id));
     expect(ids).toEqual(['A']);
+  });
+
+  it('discontinued 已核低价可列出但不成为 cheapest；unknown availability 不误杀', () => {
+    const discontinued = known('A', '1', 'CNY');
+    discontinued.availability = 'discontinued';
+    const unknownAvailability = known('B', '49', 'CNY');
+    unknownAvailability.availability = 'unknown';
+    const s = snap(discontinued, unknownAvailability);
+    const { groups } = queryModelRadarSnapshot(s, defaults);
+
+    const cny = groups.find((g) => g.sortScope.currency === 'CNY')!;
+    expect(cny.plans.map((p) => p.id)).toEqual(['A', 'B']);
+    expect(cny.cheapestPlanId).toBe('B');
+    expect(cny.comparable).toBe(true);
+  });
+
+  it('全 discontinued 已核价组仍列出但不可比、无 cheapest', () => {
+    const a = known('A', '1', 'CNY');
+    const b = known('B', '2', 'CNY');
+    a.availability = 'discontinued';
+    b.availability = 'discontinued';
+    const { groups } = queryModelRadarSnapshot(snap(a, b), defaults);
+
+    const cny = groups.find((g) => g.sortScope.currency === 'CNY')!;
+    expect(cny.plans.map((p) => p.id)).toEqual(['A', 'B']);
+    expect(cny.cheapestPlanId).toBeNull();
+    expect(cny.comparable).toBe(false);
+  });
+
+  it('季/年 effectiveMonthly 不参与 cheapest，仍按 canonical 月价排序', () => {
+    const annualCheaper = known('A', '49', 'CNY');
+    annualCheaper.periodPrices = [
+      {
+        billingPeriod: 'annual',
+        price: '468.00',
+        currency: 'CNY',
+        priceStatus: 'known',
+        provenance: {
+          sourceUrl: 'https://example.com/pricing',
+          sourceConfidence: 'official_pricing',
+          lastCheckedDate: '2026-06-20',
+        },
+        effectiveMonthly: 39,
+      },
+    ];
+    const monthlyCheaper = known('B', '45', 'CNY');
+    const { groups } = queryModelRadarSnapshot(snap(annualCheaper, monthlyCheaper), defaults);
+
+    const cny = groups.find((g) => g.sortScope.currency === 'CNY')!;
+    expect(cny.plans.map((p) => p.id)).toEqual(['B', 'A']);
+    expect(cny.cheapestPlanId).toBe('B');
   });
 });
 

@@ -35,11 +35,13 @@ vi.mock('../../snapshot/invalidation.js', () => ({
 }));
 
 const {
+  setPlanAvailability,
   upsertVendor,
   upsertModel,
   upsertPlan,
   upsertPlanLimit,
   upsertPlanModel,
+  upsertPlanPeriodPrice,
   upsertSource,
 } = await import('../upsert.js');
 
@@ -79,6 +81,7 @@ async function cleanup() {
     }
     if (planIds.length > 0) {
       await db.delete(schema.mrPriceHistory).where(inArray(schema.mrPriceHistory.planId, planIds));
+      await db.delete(schema.mrPlanPrices).where(inArray(schema.mrPlanPrices.planId, planIds));
       await db.delete(schema.mrPlanModels).where(inArray(schema.mrPlanModels.planId, planIds));
       await db.delete(schema.mrPlanLimits).where(inArray(schema.mrPlanLimits.planId, planIds));
       await db.delete(schema.mrPlanClients).where(inArray(schema.mrPlanClients.planId, planIds));
@@ -225,6 +228,127 @@ describeIfDb('7.1 录入 Zod 闸 + identity/fact 写契约', () => {
       );
     expect(flags).toHaveLength(1);
     expect(flags[0]!.status).toBe('pending');
+  });
+
+  it('同 (vendor,name) 异 availability 打 conflict flag、不盲覆盖；授权 setter 可显式改 lifecycle', async () => {
+    const v = await upsertVendor(db!, {
+      normalizedName: `${PREFIX}vendor-availability`,
+      name: 'Availability Vendor',
+    });
+    const name = `${PREFIX}Availability Plan`;
+    const a = await upsertPlan(db!, {
+      vendorId: v.id,
+      name,
+      category: 'coding_plan',
+      availability: 'on_sale',
+      currentPrice: '49.00',
+      currency: 'CNY',
+      sourceUrl: `${PREFIX}src-avail`,
+      sourceConfidence: 'official_pricing',
+    });
+    expect(a.outcome).toBe('inserted');
+    const planId = (a as { id: string }).id;
+
+    const b = await upsertPlan(db!, {
+      vendorId: v.id,
+      name,
+      category: 'coding_plan',
+      availability: 'discontinued',
+      currentPrice: '49.00',
+      currency: 'CNY',
+      sourceUrl: `${PREFIX}src-avail`,
+      sourceConfidence: 'official_pricing',
+    });
+    expect(b.outcome).toBe('conflict');
+    expect((b as { field: string }).field).toBe('availability');
+
+    let planRows = await db!
+      .select()
+      .from(schema.mrPlans)
+      .where(eq(schema.mrPlans.id, planId));
+    expect(planRows[0]!.availability).toBe('on_sale');
+
+    const set = await setPlanAvailability(db!, planId, 'discontinued');
+    expect(set.outcome).toBe('updated');
+    planRows = await db!
+      .select()
+      .from(schema.mrPlans)
+      .where(eq(schema.mrPlans.id, planId));
+    expect(planRows[0]!.availability).toBe('discontinued');
+  });
+
+  it('upsertPlanPeriodPrice：拒 monthly，同价刷新 provenance/last_checked，异价 conflict 不盲覆盖', async () => {
+    const v = await upsertVendor(db!, {
+      normalizedName: `${PREFIX}vendor-period-price`,
+      name: 'Period Price Vendor',
+    });
+    const plan = await upsertPlan(db!, {
+      vendorId: v.id,
+      name: `${PREFIX}Period Price Plan`,
+      category: 'coding_plan',
+      availability: 'on_sale',
+      currentPrice: '49.00',
+      currency: 'CNY',
+      sourceUrl: `${PREFIX}src-period-month`,
+      sourceConfidence: 'official_pricing',
+    });
+    const planId = (plan as { id: string }).id;
+
+    await expect(
+      upsertPlanPeriodPrice(db!, {
+        planId,
+        billingPeriod: 'monthly',
+        price: '49.00',
+        currency: 'CNY',
+        sourceUrl: `${PREFIX}src-period`,
+        sourceConfidence: 'official_pricing',
+      }),
+    ).rejects.toThrow();
+
+    const inserted = await upsertPlanPeriodPrice(db!, {
+      planId,
+      billingPeriod: 'annual',
+      price: '468.00',
+      currency: 'CNY',
+      sourceUrl: `${PREFIX}src-period-a`,
+      sourceConfidence: 'official_pricing',
+      lastChecked: new Date('2026-06-01T00:00:00.000Z'),
+    });
+    expect(inserted.outcome).toBe('inserted');
+
+    const refreshed = await upsertPlanPeriodPrice(db!, {
+      planId,
+      billingPeriod: 'annual',
+      price: '468.00',
+      currency: 'CNY',
+      sourceUrl: `${PREFIX}src-period-b`,
+      sourceConfidence: 'official_doc',
+      lastChecked: new Date('2026-06-02T00:00:00.000Z'),
+    });
+    expect(refreshed.outcome).toBe('refreshed');
+    let rows = await db!
+      .select()
+      .from(schema.mrPlanPrices)
+      .where(eq(schema.mrPlanPrices.planId, planId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.sourceUrl).toBe(`${PREFIX}src-period-b`);
+    expect(rows[0]!.sourceConfidence).toBe('official_doc');
+
+    const conflict = await upsertPlanPeriodPrice(db!, {
+      planId,
+      billingPeriod: 'annual',
+      price: '500.00',
+      currency: 'CNY',
+      sourceUrl: `${PREFIX}src-period-c`,
+      sourceConfidence: 'official_pricing',
+    });
+    expect(conflict.outcome).toBe('conflict');
+    expect((conflict as { field: string }).field).toBe('price');
+    rows = await db!
+      .select()
+      .from(schema.mrPlanPrices)
+      .where(eq(schema.mrPlanPrices.planId, planId));
+    expect(Number(rows[0]!.price)).toBe(468);
   });
 
   it('fact 全同字段 = noop（幂等）', async () => {

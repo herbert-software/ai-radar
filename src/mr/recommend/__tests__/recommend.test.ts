@@ -13,7 +13,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { recommend, type RecommendInput } from '../recommend.js';
 import { recommendationResultSchema, type ExplanationInput } from '../schema.js';
-import type { ModelRadarSnapshot, SnapshotLimit, SnapshotPlan } from '../../snapshot/dto.js';
+import type { ModelRadarSnapshot, SnapshotLimit, SnapshotPeriodPrice, SnapshotPlan } from '../../snapshot/dto.js';
 import type { MrCurrency } from '../schema.js';
 
 const PROV = {
@@ -37,6 +37,8 @@ interface PlanOpts {
   tool?: string;
   protocol?: string;
   limits?: SnapshotLimit[];
+  availability?: SnapshotPlan['availability'];
+  periodPrices?: SnapshotPeriodPrice[];
 }
 
 /** 默认匹配 model=glm:4.6 + tool=claude-code（recall 命中），可逐项覆盖。 */
@@ -50,12 +52,14 @@ function mkPlan(id: string, opts: PlanOpts = {}): SnapshotPlan {
     vendorName: `Vendor ${id}`,
     name: id,
     category: 'coding_plan',
+    availability: opts.availability ?? 'unknown',
     currentPrice: known ? (opts.price ?? '49') : (opts.price ?? null),
     currency: known ? (opts.currency ?? 'CNY') : (opts.currency ?? null),
     priceStatus: known ? 'known' : 'unknown',
     provenance: known ? PROV : PROV_UNVETTED,
     freshness: { stale: opts.stale ?? false },
     reviewStatus: { pending: opts.pending ?? false },
+    periodPrices: opts.periodPrices ?? [],
     models: [{ modelId: `m-${id}`, family: model.family, version: model.version, provenance: PROV }],
     clients: [
       { clientType: 'tool', clientId: tool, provenance: PROV },
@@ -63,6 +67,25 @@ function mkPlan(id: string, opts: PlanOpts = {}): SnapshotPlan {
     ],
     limits: opts.limits ?? [],
     sources: [],
+  };
+}
+
+function mkPeriodPrice(opts: {
+  billingPeriod?: SnapshotPeriodPrice['billingPeriod'];
+  price?: string | null;
+  currency?: MrCurrency;
+  priceStatus?: 'known' | 'unknown';
+  effectiveMonthly?: number | null;
+} = {}): SnapshotPeriodPrice {
+  const known = (opts.priceStatus ?? 'known') === 'known';
+  const price = known ? (opts.price ?? '468') : (opts.price ?? null);
+  return {
+    billingPeriod: opts.billingPeriod ?? 'annual',
+    price,
+    currency: opts.currency ?? 'CNY',
+    priceStatus: known ? 'known' : 'unknown',
+    provenance: known ? PROV : PROV_UNVETTED,
+    effectiveMonthly: known ? (opts.effectiveMonthly ?? 39) : null,
   };
 }
 
@@ -120,12 +143,14 @@ describe('4.3 规则硬筛召回：currency/budget 不喂 query、锁币种组�
 
   it('0-eligible 且有候选：据待核 / 超预算 / exceeds 缘由组合给说明（不空手、不误导）', async () => {
     const s = snap(
+      mkPlan('disc', { price: '20', availability: 'discontinued' }), // 已停售
       mkPlan('pend', { price: '30', pending: true }), // 待核
       mkPlan('over', { price: '500' }), // 超预算（放宽预算可用）
       mkPlan('big', { price: '40', limits: [TOKENS_EXCEEDS] }), // exceeds（降用量档）
     );
     const r = await recommend(s, { tool: 'claude-code', currency: 'CNY', maxMonthlyPrice: 100, usageProfile: heavy });
     expect(r.candidates.some((c) => c.verdict === 'primary')).toBe(false); // primary=null
+    expect(r.explanation).toContain('已停售');
     expect(r.explanation).toContain('待核');
     expect(r.explanation).toContain('放宽预算到 500 CNY');
     expect(r.explanation).toContain('降低用量档'); // exceeds 不误导为放宽预算
@@ -133,6 +158,33 @@ describe('4.3 规则硬筛召回：currency/budget 不喂 query、锁币种组�
 });
 
 describe('4.4 verdict 四态有序全覆盖（每候选恰一态、无重叠无空洞）', () => {
+  it('discontinued→not_recommended，且优先于未核价 / pending / exceeds / 最佳周期', async () => {
+    const s = snap(
+      mkPlan('disc', {
+        availability: 'discontinued',
+        priceStatus: 'unknown',
+        pending: true,
+        limits: [TOKENS_EXCEEDS],
+        periodPrices: [mkPeriodPrice({ price: '468', effectiveMonthly: 39 })],
+      }),
+    );
+    const r = await recommend(s, { tool: 'claude-code', currency: 'CNY', usageProfile: heavy });
+    const disc = r.candidates[0]!;
+    expect(disc.verdict).toBe('not_recommended');
+    expect(disc.availability).toBe('discontinued');
+    expect(disc.fitsWindow).toBe('exceeds'); // 字段仍计算，但不作为停售候选的 reason 主因
+    expect(disc.reasons.some((reason) => reason.kind === 'discontinued' && reason.detail.includes('已停售'))).toBe(true);
+    expect(disc.reasons.some((reason) => reason.kind === 'window')).toBe(false);
+    expect(disc.reasons.some((reason) => reason.kind === 'best_period')).toBe(false);
+    expect(disc.reasons.some((reason) => reason.kind === 'unreviewed')).toBe(false);
+    expect(disc.reasons.some((reason) => reason.kind === 'pending_review')).toBe(false);
+    expect(r.explanation).toContain('已停售');
+    expect(r.explanation).not.toContain('降低用量档');
+    expect(r.explanation).not.toContain('额度不足');
+    expect(r.explanation).not.toContain('含可能已停售');
+    expect(r.explanation).not.toContain('含停售占位');
+  });
+
   it('pending→insufficient、超预算/exceeds→not_recommended、最低 eligible→primary、其余→alternative', async () => {
     const s = snap(
       mkPlan('p30pending', { price: '30', pending: true }), // 已核+pending → insufficient_data
@@ -160,6 +212,52 @@ describe('4.4 verdict 四态有序全覆盖（每候选恰一态、无重叠无�
     const s = snap(mkPlan('exact', { price: '100' }));
     const r = await recommend(s, { tool: 'claude-code', currency: 'CNY', maxMonthlyPrice: 100 });
     expect(r.candidates[0]!.verdict).toBe('primary'); // 100 == 100 → 不超预算 → eligible
+  });
+});
+
+describe('4.4/5d 最佳周期标注（不改 canonical 月价排名）', () => {
+  it('已核季/年有效月价低于月价时标最佳周期，排名仍按 canonical 月价', async () => {
+    const s = snap(
+      mkPlan('monthly45', { price: '45' }),
+      mkPlan('annual49', { price: '49', periodPrices: [mkPeriodPrice({ price: '468', effectiveMonthly: 39 })] }),
+    );
+    const r = await recommend(s, { tool: 'claude-code', currency: 'CNY' });
+
+    expect(r.candidates.map((c) => [c.planId, c.verdict])).toEqual([
+      ['monthly45', 'primary'],
+      ['annual49', 'alternative'],
+    ]);
+    const annual = r.candidates.find((c) => c.planId === 'annual49')!;
+    const bestPeriod = annual.reasons.find((reason) => reason.kind === 'best_period');
+    expect(bestPeriod?.detail).toContain('最佳周期=年付');
+    expect(bestPeriod?.detail).toContain('有效月价 39 CNY');
+    expect(bestPeriod?.detail).toContain('含预付锁期');
+    expect(r.explanation).toContain('最佳周期=年付');
+  });
+
+  it('canonical 月价未核但同币种周期价已核时也可标最佳周期，verdict 仍按未核价规则', async () => {
+    const s = snap(
+      mkPlan('period-only', {
+        priceStatus: 'unknown',
+        periodPrices: [mkPeriodPrice({ price: '468', effectiveMonthly: 39 })],
+      }),
+    );
+    const r = await recommend(s, { tool: 'claude-code', currency: 'CNY' });
+    const candidate = r.candidates[0]!;
+    expect(candidate.verdict).toBe('insufficient_data');
+    expect(candidate.monthlyCost).toBeNull();
+    expect(candidate.reasons.find((reason) => reason.kind === 'best_period')?.detail).toContain('最佳周期=年付');
+  });
+
+  it('canonical 月价未核时不拿异币种周期价生成最佳周期', async () => {
+    const s = snap(
+      mkPlan('usd-period-only', {
+        priceStatus: 'unknown',
+        periodPrices: [mkPeriodPrice({ currency: 'USD', price: '60', effectiveMonthly: 5 })],
+      }),
+    );
+    const r = await recommend(s, { tool: 'claude-code', currency: 'CNY' });
+    expect(r.candidates[0]!.reasons.some((reason) => reason.kind === 'best_period')).toBe(false);
   });
 });
 

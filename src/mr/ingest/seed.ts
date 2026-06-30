@@ -12,17 +12,21 @@
  * coding_plan 烘焙 CNY 官方真月价——**首播种**经 `upsertPlan` INSERT 落价；**重播**（行已存）经 `upsertPlan` 检出价变
  * 委托 `recordPriceChange`（design D2/D4 授权改价入口，非盲覆盖）。停售 plan 经 `reviewFlagReason → setReviewFlag` 打停售 flag。
  *
- * **不 bump catalog version、不投 rebuild**（design D16）。注：**5c 公开 version/ETag = 快照内容哈希**
+ * **不 bump catalog version**（design D16）。注：**5c 公开 version/ETag = 快照内容哈希**
  * （add-model-radar-compare-api D8），`mr_catalog_version` 在 5c **不写不读不服务**、留未来/内部用途
- * （非漏接线）；故 seed 写 mr_* 既不碰该表、5c 也不靠它，rebuild 由内容哈希驱动。
+ * （非漏接线）。本变更的授权 lifecycle/周期价写入口会在提交后触发 snapshot rebuild/invalidation。
  */
 import { db as defaultDb } from '../../db/index.js';
+import { and, eq } from 'drizzle-orm';
+import { mrPlans } from '../../db/schema.js';
 import {
+  setPlanAvailability,
   upsertModel,
   upsertPlan,
   upsertPlanClient,
   upsertPlanLimit,
   upsertPlanModel,
+  upsertPlanPeriodPrice,
   upsertPlanSource,
   upsertSource,
   upsertVendor,
@@ -41,6 +45,8 @@ export interface SeedResult {
   limits: number;
   models: number;
   clients: number;
+  /** 录入的季/年付周期价行数（含刷新）。 */
+  periodPrices: number;
   sources: number;
   /** 录入的 (source_id, plan_id) 定位边数。 */
   planSources: number;
@@ -60,6 +66,7 @@ export async function runSeed(dbh: DbLike = defaultDb): Promise<SeedResult> {
     limits: 0,
     models: 0,
     clients: 0,
+    periodPrices: 0,
     sources: 0,
     planSources: 0,
   };
@@ -86,10 +93,22 @@ export async function runSeed(dbh: DbLike = defaultDb): Promise<SeedResult> {
     // 套餐 + child 事实行。plan id 收集供定位边录入。
     const planIds: string[] = [];
     for (const p of v.plans) {
+      const existingPlan = (
+        await dbh
+          .select({ id: mrPlans.id, availability: mrPlans.availability })
+          .from(mrPlans)
+          .where(and(eq(mrPlans.vendorId, vendor.id), eq(mrPlans.name, p.name)))
+          .limit(1)
+      )[0];
+      if (existingPlan && existingPlan.availability !== p.availability) {
+        await setPlanAvailability(dbh, existingPlan.id, p.availability);
+      }
+
       const plan = await upsertPlan(dbh, {
         vendorId: vendor.id,
         name: p.name,
         category: p.category,
+        availability: p.availability,
         currentPrice: p.currentPrice,
         currency: p.currency,
         sourceUrl: p.sourceUrl,
@@ -105,6 +124,18 @@ export async function runSeed(dbh: DbLike = defaultDb): Promise<SeedResult> {
       // （spec「已停售 plan 不留作普通待核」）。CAS 幂等收敛单行，可安全重跑。
       if (p.reviewFlagReason) {
         await setReviewFlag(dbh, { targetType: 'plan', targetId: planId }, p.reviewFlagReason);
+      }
+
+      for (const pp of p.periodPrices ?? []) {
+        await upsertPlanPeriodPrice(dbh, {
+          planId,
+          billingPeriod: pp.billingPeriod,
+          price: pp.price,
+          currency: pp.currency,
+          sourceUrl: pp.sourceUrl,
+          sourceConfidence: pp.sourceConfidence,
+        });
+        res.periodPrices += 1;
       }
 
       for (const l of p.limits) {

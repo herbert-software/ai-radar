@@ -23,6 +23,7 @@ import {
   mrPlanClients,
   mrPlanLimits,
   mrPlanModels,
+  mrPlanPrices,
   mrPlans,
   mrSource,
 } from '../../db/schema.js';
@@ -55,6 +56,7 @@ const REASON_PLAN_SELF = '套餐价格信息陈旧';
 const REASON_LIMIT = '限额行陈旧';
 const REASON_CLIENT = '工具/协议兼容行陈旧';
 const REASON_MODEL = '模型兼容行陈旧';
+const REASON_PERIOD_PRICE = '周期价行陈旧';
 const REASON_SOURCE = '来源页面长期未核对';
 
 const defaultLog = (message: string, detail?: unknown): void =>
@@ -119,6 +121,13 @@ export async function runStaleness(
     .from(mrPlanModels)
     .where(stale(mrPlanModels.lastChecked));
   for (const m of staleModels) flagPlan(m.planId, REASON_MODEL);
+
+  // ⑥ period price 超期 → 所属 plan flag。
+  const stalePeriodPrices = await dbh
+    .select({ planId: mrPlanPrices.planId })
+    .from(mrPlanPrices)
+    .where(stale(mrPlanPrices.lastChecked));
+  for (const p of stalePeriodPrices) flagPlan(p.planId, REASON_PERIOD_PRICE);
 
   // per-target 独立打标（每 CAS 自治，失败隔离，不裹批事务）。
   let sourceFlagged = 0;

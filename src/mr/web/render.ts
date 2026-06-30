@@ -74,10 +74,11 @@ export function sourceHost(url: string): string {
   }
 }
 
-/** 取 plan 全部 fact 的 lastCheckedDate（价格 + models + clients + limits + 关联源）。仅关联源行可为 null。 */
+/** 取 plan 全部 fact 的 lastCheckedDate（价格 + 周期价 + models + clients + limits + 关联源）。仅关联源行可为 null。 */
 function planFactDates(plan: SnapshotPlan): (string | null)[] {
   return [
     plan.provenance.lastCheckedDate,
+    ...plan.periodPrices.map((p) => p.provenance.lastCheckedDate),
     ...plan.models.map((m) => m.provenance.lastCheckedDate),
     ...plan.clients.map((c) => c.provenance.lastCheckedDate),
     ...plan.limits.map((l) => l.provenance.lastCheckedDate),
@@ -123,7 +124,7 @@ export function sortPlansByFreshness(plans: SnapshotPlan[], dir: FreshnessSort):
 }
 
 export interface CheapestInfo {
-  /** 是否输出「最划算」标：须**已核 plans.length ≥ 2**（仅 `comparable` 对单 plan 已核组也 true，不足判，spec/task 4.2）。 */
+  /** 是否输出「最划算」标：须**非停售已核候选 ≥ 2**；停售历史价行可列出但不算可比候选。 */
   showCheapest: boolean;
   cheapestPlanId: string | null;
   /** 「另有 N 个未核价未参与」的 N（取该 category 的 `currency=null` 组，勿读已核组上的 0，design D4）。 */
@@ -135,7 +136,10 @@ export interface CheapestInfo {
  * **跨引**同 category 的 `currency=null` 组的 unknownCount（已核组自身 unknownCount 恒 0，勿读）。
  */
 export function cheapestInfo(group: SnapshotPlanGroup, unknownInCategory: number): CheapestInfo {
-  const showCheapest = group.plans.length >= 2 && group.cheapestPlanId !== null;
+  const comparablePlanCount = group.plans.filter(
+    (p) => p.priceStatus === 'known' && p.availability !== 'discontinued',
+  ).length;
+  const showCheapest = comparablePlanCount >= 2 && group.cheapestPlanId !== null;
   return {
     showCheapest,
     cheapestPlanId: showCheapest ? group.cheapestPlanId : null,

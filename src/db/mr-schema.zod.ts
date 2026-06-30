@@ -5,7 +5,7 @@
  * 关键不变量（design D4/D6/D10 + 风险/权衡）：
  * 全仓零 pg-enum / 零 DB CHECK（对齐 ai_experiences 注释「唯一防线是 Zod」）——`mr_*` 表的取值集
  * 合法性**唯一防线就是本文件的 Zod**。每个有限值集列都必须有枚举闸，否则绕过录入的写入方可写脏值
- * （DB 放行）。**所有有限值集列均须经此校验**（8 个枚举），`mr_plans` 价格/币种同生同灭须经 refine。
+ * （DB 放行）。**所有有限值集列均须经此校验**，`mr_plans` 价格/币种同生同灭须经 refine。
  *
  * 词表为「5a 桶2 样例出现的类型」，**不声称覆盖 8 家全部**；`limit_type` 的 credit/fast_pass、
  * currency 的更多 ISO 4217、source_confidence/fetch_strategy 等的扩集留 5b 全桶入库随录入扩。
@@ -46,6 +46,12 @@ export const mrCategorySchema = z.enum([
   'token_plan',
   'enterprise_seat',
 ]);
+
+/** 套餐生命周期（与 source_confidence / reviewStatus.pending 三正交）。 */
+export const mrAvailabilitySchema = z.enum(['on_sale', 'discontinued', 'unknown']);
+
+/** 月价之外的订阅计费周期。`monthly` 禁止入周期价表，避免与 mr_plans.current_price 双 SOT。 */
+export const mrBillingPeriodSchema = z.enum(['quarterly', 'annual']);
 
 /** 源抓取策略（design D9，3 值）。 */
 export const mrFetchStrategySchema = z.enum(['http', 'browser', 'manual']);
@@ -136,6 +142,7 @@ export const mrPriceAmountSchema = z
 export const mrPlanWriteSchema = z
   .object({
     category: mrCategorySchema,
+    availability: mrAvailabilitySchema.default('unknown'),
     currentPrice: z.union([z.string(), z.number()]).nullable(),
     currency: mrCurrencySchema.nullable(),
     sourceConfidence: mrSourceConfidenceSchema,
@@ -152,3 +159,42 @@ export const mrPlanWriteSchema = z
     (v) => v.currentPrice == null || mrPriceAmountSchema.safeParse(v.currentPrice).success,
     'current_price 非法（须有限、≥ 0、量级 < 1e10、小数位 ≤ 2，贴合 numeric(12,2)）',
   );
+
+/** 周期价读/写侧派生价格状态：known 当且仅当 price 非 NULL 且 provenance 属官方已核集合。 */
+export function getMrPlanPriceStatus(input: {
+  price: string | number | null;
+  source_confidence: string;
+}): 'known' | 'unknown' {
+  return input.price !== null && isOfficialConfidence(input.source_confidence)
+    ? 'known'
+    : 'unknown';
+}
+
+/**
+ * `mr_plan_prices` 周期价行校验 —— 只允许季度/年付、币种必填、price 可 NULL，占位行仍保留 provenance。
+ *
+ * confidence↔price 绑定：非官方/待复核 confidence 禁带非 NULL price；priceStatus 派生为
+ * `known` 当且仅当 price 非 NULL + official confidence。官方 confidence + NULL price 仍被解析为 unknown，
+ * 供上层授权写路径按事实冲突/待核语义决定是否接受。
+ */
+export const mrPlanPriceSchema = z
+  .object({
+    plan_id: z.string().min(1),
+    billing_period: mrBillingPeriodSchema,
+    price: mrPriceAmountSchema.nullable(),
+    currency: mrCurrencySchema,
+    source_url: z.string().min(1),
+    last_checked: z.date(),
+    source_confidence: mrSourceConfidenceSchema,
+  })
+  .superRefine((v, ctx) => {
+    if (v.price !== null && !isOfficialConfidence(v.source_confidence)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          '非官方 source_confidence 禁带非 NULL 周期价（official_pricing/official_doc 才可写价；needs_login_recheck/official_community/media_report 须保持 price=NULL）',
+      });
+    }
+  });
+
+export type MrBillingPeriod = z.infer<typeof mrBillingPeriodSchema>;

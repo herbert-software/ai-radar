@@ -37,6 +37,7 @@ function makeStub(opts: {
   staleLimits: Array<{ planId: string }>;
   staleClients: Array<{ planId: string }>;
   staleModels: Array<{ planId: string }>;
+  stalePeriodPrices: Array<{ planId: string }>;
   flagCalls: FlagCall[];
   failTargetIds?: ReadonlySet<string>;
 }) {
@@ -50,6 +51,7 @@ function makeStub(opts: {
           else if (table === schema.mrPlanLimits) rows = opts.staleLimits;
           else if (table === schema.mrPlanClients) rows = opts.staleClients;
           else if (table === schema.mrPlanModels) rows = opts.staleModels;
+          else if (table === schema.mrPlanPrices) rows = opts.stalePeriodPrices;
           else throw new Error('unexpected table in stub.select');
           return { where: async () => rows };
         },
@@ -82,6 +84,7 @@ const empty = {
   staleLimits: [],
   staleClients: [],
   staleModels: [],
+  stalePeriodPrices: [],
 };
 
 describe('runStaleness 路由 + 去重（注入桩）', () => {
@@ -109,6 +112,18 @@ describe('runStaleness 路由 + 去重（注入桩）', () => {
     expect(flagCalls[0]!.reason).toContain('限额行陈旧');
   });
 
+  it('period price 超期 → 经所属 plan 打标（reason 注明周期价陈旧）', async () => {
+    const flagCalls: FlagCall[] = [];
+    await runStaleness(
+      makeStub({ ...empty, stalePeriodPrices: [{ planId: 'plan-period' }], flagCalls }) as never,
+      { thresholdDays: 30 },
+    );
+    expect(flagCalls).toHaveLength(1);
+    expect(flagCalls[0]!.targetType).toBe('plan');
+    expect(flagCalls[0]!.targetId).toBe('plan-period');
+    expect(flagCalls[0]!.reason).toContain('周期价行陈旧');
+  });
+
   it('source 超期 → source flag', async () => {
     const flagCalls: FlagCall[] = [];
     const result = await runStaleness(
@@ -130,6 +145,7 @@ describe('runStaleness 路由 + 去重（注入桩）', () => {
         staleLimits: [{ planId: 'plan-x' }],
         staleModels: [{ planId: 'plan-x' }],
         staleClients: [{ planId: 'plan-x' }],
+        stalePeriodPrices: [{ planId: 'plan-x' }],
         flagCalls,
       }) as never,
       { thresholdDays: 30 },

@@ -23,14 +23,15 @@ export default tseslint.config(
     },
   },
   {
-    // Model Radar（5b，design D7）结构守卫：把「抓取改不了事实」从人的纪律降为 lint 错误。
-    // `src/mr/scrape/`（三档抓取）与 `event-consumer*`（事件消费者）只允许 import `src/mr/write/`
+    // Model Radar（5b + add-model-radar-price-state-and-periods）结构守卫：把「抓取/保鲜改不了事实」从人的纪律降为 lint 错误。
+    // `src/mr/scrape/`（三档抓取）与 `src/mr/freshness/`（保鲜回路）只允许 import `src/mr/write/`
     // （flag / fingerprint / last_checked 更新器）——**禁 import `src/mr/ingest/`** 的事实 writer
-    // （`upsert*` + **点名 `recordPriceChange`**：它改 `mr_plans.current_price` 是事实写）。
+    // （`upsert*` + `recordPriceChange` + `setPlanAvailability`/`upsertPlanPeriodPrice`）。
     files: [
       'src/mr/scrape/**',
-      'src/mr/freshness/event-consumer*',
+      'src/mr/freshness/**',
     ],
+    ignores: ['src/mr/freshness/__tests__/**'],
     rules: {
       'no-restricted-imports': [
         'error',
@@ -40,7 +41,7 @@ export default tseslint.config(
               // 禁 `src/mr/ingest/` 全部事实 writer（upsert*/record-price-change），含相对 .js 后缀路径。
               group: ['**/mr/ingest/*', '**/ingest/upsert*', '**/ingest/record-price-change*'],
               message:
-                '抓取链 / 事件消费者禁止 import src/mr/ingest/ 事实 writer（upsert*/recordPriceChange）——只能改不了事实，仅可 import src/mr/write/（flag/fingerprint/last_checked）。design D7。',
+                '抓取链 / 保鲜回路禁止 import src/mr/ingest/ 事实 writer（upsert*/recordPriceChange/setPlanAvailability/upsertPlanPeriodPrice）——只能改不了事实，仅可 import src/mr/write/（flag/fingerprint/last_checked）。design D7/D6。',
             },
             {
               // 点名覆盖 recordPriceChange（D7：它改 mr_plans.current_price 是事实写，绝不可被抓取链可达）。
@@ -48,6 +49,12 @@ export default tseslint.config(
               importNames: ['recordPriceChange', '_recordPriceChangeTx'],
               message:
                 'recordPriceChange 是事实写入口（改 mr_plans.current_price）——抓取链 / 事件消费者禁止 import。design D7。',
+            },
+            {
+              group: ['**/ingest/upsert*'],
+              importNames: ['setPlanAvailability', 'upsertPlanPeriodPrice'],
+              message:
+                'setPlanAvailability/upsertPlanPeriodPrice 是人工/seed 授权写入口——抓取链 / 保鲜回路禁止 import 或调用；只能打 reviewStatus.pending。',
             },
           ],
         },
@@ -127,13 +134,19 @@ export default tseslint.config(
               // 重述 B 块：禁 src/mr/ingest/ 事实 writer（upsert*/record-price-change），含相对 .js 路径。
               group: ['**/mr/ingest/*', '**/ingest/upsert*', '**/ingest/record-price-change*'],
               message:
-                '抓取链禁止 import src/mr/ingest/ 事实 writer（upsert*/recordPriceChange）——只能改不了事实，仅可 import src/mr/write/。design D7。',
+                '抓取链禁止 import src/mr/ingest/ 事实 writer（upsert*/recordPriceChange/setPlanAvailability/upsertPlanPeriodPrice）——只能改不了事实，仅可 import src/mr/write/。design D7/D6。',
             },
             {
               group: ['**/record-price-change*'],
               importNames: ['recordPriceChange', '_recordPriceChangeTx'],
               message:
                 'recordPriceChange 是事实写入口（改 mr_plans.current_price）——抓取链禁止 import。design D7。',
+            },
+            {
+              group: ['**/ingest/upsert*'],
+              importNames: ['setPlanAvailability', 'upsertPlanPeriodPrice'],
+              message:
+                'setPlanAvailability/upsertPlanPeriodPrice 是人工/seed 授权写入口——抓取链禁止 import 或调用；只能打 reviewStatus.pending。',
             },
           ],
           paths: [

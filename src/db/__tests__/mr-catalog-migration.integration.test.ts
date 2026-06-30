@@ -16,6 +16,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
 import {
   mrCategorySchema,
+  mrAvailabilitySchema,
+  mrBillingPeriodSchema,
   mrClientTypeSchema,
   mrCurrencySchema,
   mrFetchStrategySchema,
@@ -60,6 +62,7 @@ async function cleanup(): Promise<void> {
   await pool.query(`DELETE FROM mr_plan_models WHERE plan_id IN ${planIds}`);
   await pool.query(`DELETE FROM mr_plan_clients WHERE plan_id IN ${planIds}`);
   await pool.query(`DELETE FROM mr_plan_limits WHERE plan_id IN ${planIds}`);
+  await pool.query(`DELETE FROM mr_plan_prices WHERE plan_id IN ${planIds}`);
   await pool.query(`DELETE FROM mr_price_history WHERE plan_id IN ${planIds}`);
   await pool.query(`DELETE FROM mr_plan_sources WHERE plan_id IN ${planIds} OR source_id IN ${sourceIds}`);
   await pool.query(
@@ -115,6 +118,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
     'mr_plan_models',
     'mr_plan_clients',
     'mr_plan_limits',
+    'mr_plan_prices',
     'mr_price_history',
     'mr_source',
     'mr_plan_sources',
@@ -122,7 +126,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
     'mr_catalog_version',
   ];
 
-  it('逐一点名全部 11 张 mr_* 表存在', async () => {
+  it('逐一点名全部 12 张 mr_* 表存在', async () => {
     const { rows } = await pool!.query<{ table_name: string }>(
       `SELECT table_name FROM information_schema.tables WHERE table_name = ANY($1)`,
       [ALL_TABLES],
@@ -131,10 +135,10 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
     for (const t of ALL_TABLES) {
       expect(present.has(t), `缺表 ${t}`).toBe(true);
     }
-    expect(present.size).toBe(11);
+    expect(present.size).toBe(12);
   });
 
-  it('全部命名唯一约束逐一就位且为精确集（恰 11 条、无多余、命名表级 *_key）', async () => {
+  it('全部命名唯一约束逐一就位且为精确集（恰 12 条、无多余、命名表级 *_key）', async () => {
     // 读所有 mr_* 表 UNIQUE 约束（含约束名 + 覆盖列集合，按列名排序聚合）。
     const { rows } = await pool!.query<{
       table_name: string;
@@ -162,6 +166,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       mr_plan_models: 'model_id,plan_id',
       mr_plan_clients: 'client_id,client_type,plan_id',
       mr_plan_limits: 'limit_type,plan_id,window',
+      mr_plan_prices: 'billing_period,currency,plan_id',
       mr_price_history: 'changed_at,plan_id',
       mr_source: 'source_url,vendor_id',
       mr_plan_sources: 'plan_id,source_id',
@@ -209,6 +214,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       ['mr_plans', 'vendor_id'],
       ['mr_plans', 'name'],
       ['mr_plans', 'category'],
+      ['mr_plans', 'availability'],
       ['mr_plans', 'source_url'],
       ['mr_plans', 'last_checked'],
       ['mr_plans', 'source_confidence'],
@@ -238,6 +244,15 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       ['mr_plan_limits', 'source_confidence'],
       ['mr_plan_limits', 'created_at'],
       ['mr_plan_limits', 'updated_at'],
+      // mr_plan_prices（price 刻意可空；唯一键组件 + provenance 三元 + 审计均 NOT NULL）
+      ['mr_plan_prices', 'plan_id'],
+      ['mr_plan_prices', 'billing_period'],
+      ['mr_plan_prices', 'currency'],
+      ['mr_plan_prices', 'source_url'],
+      ['mr_plan_prices', 'last_checked'],
+      ['mr_plan_prices', 'source_confidence'],
+      ['mr_plan_prices', 'created_at'],
+      ['mr_plan_prices', 'updated_at'],
       // mr_price_history（new_value / currency / changed_at / source_url / source_confidence）
       ['mr_price_history', 'plan_id'],
       ['mr_price_history', 'new_value'],
@@ -291,6 +306,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       ['mr_plans', 'current_price'],
       ['mr_plans', 'currency'],
       ['mr_plan_limits', 'value'],
+      ['mr_plan_prices', 'price'],
       ['mr_price_history', 'old_value'],
       ['mr_review_flag', 'reason'],
       ['mr_review_flag', 'resolved_at'],
@@ -328,6 +344,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       ['mr_plan_models', 'model_id'],
       ['mr_plan_clients', 'plan_id'],
       ['mr_plan_limits', 'plan_id'],
+      ['mr_plan_prices', 'plan_id'],
       ['mr_price_history', 'plan_id'],
       ['mr_source', 'vendor_id'],
       ['mr_plan_sources', 'source_id'],
@@ -370,7 +387,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       `SELECT table_name, column_name, data_type, numeric_precision, numeric_scale
        FROM information_schema.columns
        WHERE table_name LIKE 'mr_%'
-         AND column_name IN ('value', 'current_price', 'old_value', 'new_value')`,
+         AND column_name IN ('value', 'current_price', 'old_value', 'new_value', 'price')`,
     );
     const byKey = new Map(
       rows.map((r) => [`${r.table_name}.${r.column_name}`, r]),
@@ -382,6 +399,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
     // 价格列均 numeric(12,2)。
     for (const key of [
       'mr_plans.current_price',
+      'mr_plan_prices.price',
       'mr_price_history.old_value',
       'mr_price_history.new_value',
     ]) {
@@ -525,6 +543,43 @@ describe.skipIf(!databaseUrl)('3.2 异构额度共存 + 重复 (plan_id,limit_ty
       );
     await insNone();
     await expect(insNone()).rejects.toThrow();
+  });
+});
+
+// ───────────────────────────── 3.2b availability + 周期价地基 ─────────────────────────────
+
+describe.skipIf(!databaseUrl)('3.2b availability 默认值 + mr_plan_prices 唯一键', () => {
+  it('mr_plans.availability 默认 unknown，既有插入路径不臆断在售', async () => {
+    const vendorId = await insertVendor('availability-default-vendor');
+    const planId = await insertPlan(vendorId, 'availability-default-plan');
+    const { rows } = await pool!.query<{ availability: string }>(
+      `SELECT availability FROM mr_plans WHERE id = $1`,
+      [planId],
+    );
+    expect(rows[0]!.availability).toBe('unknown');
+  });
+
+  it('重复 (plan_id,billing_period,currency) 第二条被唯一约束拒，price 可 NULL 但 currency 不可 NULL', async () => {
+    const vendorId = await insertVendor('period-price-vendor');
+    const planId = await insertPlan(vendorId, 'period-price-plan');
+    const ins = (price: string | null, currency: string | null = 'CNY') =>
+      pool!.query(
+        `INSERT INTO mr_plan_prices
+           (plan_id, billing_period, price, currency, source_url, last_checked, source_confidence)
+         VALUES ($1, 'annual', $2, $3, $4, $5, $6)`,
+        [
+          planId,
+          price,
+          currency,
+          QIANFAN_SOURCE_URL,
+          QIANFAN_LAST_CHECKED,
+          price === null ? 'needs_login_recheck' : 'official_doc',
+        ],
+      );
+
+    await ins(null);
+    await expect(ins(null)).rejects.toThrow();
+    await expect(ins(null, null)).rejects.toThrow();
   });
 });
 
@@ -914,7 +969,7 @@ describe.skipIf(!databaseUrl)('3.7 spec 场景断言', () => {
     ).toBe(false); // 有币无价
   });
 
-  it('⑥ 全部 8 个有限值集列 Zod 越界拒 + 合法接受', () => {
+  it('⑥ 全部有限值集列 Zod 越界拒 + 合法接受', () => {
     // 各枚举接受合法 / 拒越界（DB 零-CHECK 下 Zod 是唯一合法性闸）。
     const cases: Array<[
       { safeParse: (v: unknown) => { success: boolean } },
@@ -929,6 +984,8 @@ describe.skipIf(!databaseUrl)('3.7 spec 场景断言', () => {
       ],
       [mrSourceConfidenceSchema, ['official_doc', 'needs_login_recheck'], ['rumor']],
       [mrCategorySchema, ['coding_plan'], ['ide_member']],
+      [mrAvailabilitySchema, ['on_sale', 'discontinued', 'unknown'], ['retired']],
+      [mrBillingPeriodSchema, ['quarterly', 'annual'], ['monthly']],
       // 5b task 1.4：EUR 扩入合法（仍拒小写 / 非 ISO 4217）。
       [mrCurrencySchema, ['CNY', 'USD', 'EUR'], ['cny', 'JPY']],
       [mrReviewFlagStatusSchema, ['pending', 'resolved'], ['open']],

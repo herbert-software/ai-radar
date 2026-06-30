@@ -389,8 +389,8 @@ export const aiExperiences = pgTable(
 /* ────────────────────────────────────────────────────────────────────────
  * Model Radar（P5 / 5a，add-model-radar-data-model）—— 隔离的 `mr_*` bounded domain。
  *
- * 承载厂商/套餐/模型兼容/工具协议兼容/带类型限额/价格历史/来源与待复核状态。每张**断言事实**表
- * （`mr_plans`/`mr_plan_limits`/`mr_plan_clients`/`mr_plan_models`）各带 provenance 三字段；
+ * 承载厂商/套餐/模型兼容/工具协议兼容/带类型限额/周期价/价格历史/来源与待复核状态。每张**断言事实**表
+ * （`mr_plans`/`mr_plan_limits`/`mr_plan_clients`/`mr_plan_models`/`mr_plan_prices`）各带 provenance 三字段；
  * `mr_price_history` 为例外（append-only 历史行，`changed_at` 兼任核对时间，不单建 last_checked）。
  *
  * 全沿用既有惯例（design D7/D8/D10/D11/D12，经 grep 核实）：
@@ -470,6 +470,8 @@ export const mrPlans = pgTable(
     // 故 key 不含 category 仍正确（同厂跨桶全名天然不同 + 挡同名误录）。裸档位跨桶误撞属 5b 录入契约须避免。
     name: text('name').notNull(),
     category: text('category').notNull(),
+    // 产品生命周期，独立于 source_confidence / reviewStatus.pending；既有行迁移默认 unknown，不臆断在售。
+    availability: text('availability').notNull().default('unknown'),
     // 与 currency 同生同灭（Zod refine 兜）；needs_login_recheck 时两者皆 NULL 占位。
     currentPrice: numeric('current_price', { precision: 12, scale: 2 }),
     currency: varchar('currency', { length: 3 }),
@@ -485,6 +487,41 @@ export const mrPlans = pgTable(
       .defaultNow(),
   },
   (table) => [unique('mr_plans_vendor_id_name_key').on(table.vendorId, table.name)],
+);
+
+/**
+ * 套餐周期价表（断言事实表，带 provenance 三字段）。
+ * 只存月价之外的订阅周期（quarterly / annual）；canonical 月价仍唯一落在 mr_plans.current_price。
+ * `plan_id` 是裸 varchar(128) 引用，刻意不建 FK；引用完整性属录入事务契约与快照 fail-closed。
+ * `currency` NOT NULL，保证 UNIQUE(plan_id,billing_period,currency) 不被 PG NULL distinct 放过重复占位。
+ */
+export const mrPlanPrices = pgTable(
+  'mr_plan_prices',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    planId: varchar('plan_id', { length: 128 }).notNull(),
+    billingPeriod: text('billing_period').notNull(),
+    price: numeric('price', { precision: 12, scale: 2 }),
+    currency: varchar('currency', { length: 3 }).notNull(),
+    sourceUrl: text('source_url').notNull(),
+    lastChecked: timestamp('last_checked', { withTimezone: true }).notNull(),
+    sourceConfidence: text('source_confidence').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_plan_prices_plan_id_billing_period_currency_key').on(
+      table.planId,
+      table.billingPeriod,
+      table.currency,
+    ),
+  ],
 );
 
 /**
