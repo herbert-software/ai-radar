@@ -64,6 +64,13 @@
       "when": 1782301525857,
       "tag": "0008_special_gladiator",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1782816000000,
+      "tag": "0009_model_radar_price_state_and_periods",
+      "breakpoints": true
     }
   ]
 }

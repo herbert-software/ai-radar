@@ -58,6 +58,7 @@ async function cleanup() {
   await db.delete(schema.mrPlanModels).where(like(schema.mrPlanModels.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanLimits).where(like(schema.mrPlanLimits.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanClients).where(like(schema.mrPlanClients.sourceUrl, `${PREFIX}%`));
+  await db.delete(schema.mrPlanPrices).where(like(schema.mrPlanPrices.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlans).where(like(schema.mrPlans.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrModels).where(like(schema.mrModels.family, `${PREFIX}%`));
   await db.delete(schema.mrSource).where(like(schema.mrSource.sourceUrl, `${PREFIX}%`));
@@ -103,6 +104,36 @@ async function makeStalePlanWithJunction(suffix: string): Promise<string> {
     sourceUrl: `${PREFIX}src-${suffix}`,
     lastChecked: OLD,
     sourceConfidence: 'community',
+  });
+  return plan!.id;
+}
+
+async function makeStalePlanWithPeriodPrice(suffix: string): Promise<string> {
+  const [v] = await db!
+    .insert(schema.mrVendors)
+    .values({ normalizedName: `${PREFIX}v-period-${suffix}`, name: `V period ${suffix}` })
+    .returning();
+  const [plan] = await db!
+    .insert(schema.mrPlans)
+    .values({
+      vendorId: v!.id,
+      name: `${PREFIX}plan-period-${suffix}`,
+      category: 'coding_plan',
+      currentPrice: '20.00',
+      currency: 'USD',
+      sourceUrl: `${PREFIX}src-period-${suffix}`,
+      lastChecked: new Date(),
+      sourceConfidence: 'official_pricing',
+    })
+    .returning();
+  await db!.insert(schema.mrPlanPrices).values({
+    planId: plan!.id,
+    billingPeriod: 'annual',
+    price: '120.00',
+    currency: 'USD',
+    sourceUrl: `${PREFIX}src-period-${suffix}`,
+    lastChecked: OLD,
+    sourceConfidence: 'official_pricing',
   });
   return plan!.id;
 }
@@ -277,6 +308,31 @@ describeIfDb('7.3 flag 翻转 + dispose', () => {
     expect(pm[0]!.lastChecked!.getFullYear()).toBeGreaterThan(2000);
 
     // 再跑陈旧度：child 已新 → plan flag 不被重打标，仍 resolved。
+    await runStaleness(db!, { thresholdDays: 30 });
+    r = await flagRows(planId);
+    expect(r[0]!.status).toBe('resolved');
+  });
+
+  it('period price 触发的 plan flag markChecked(plan) 后刷周期价、不被重打标', async () => {
+    const planId = await makeStalePlanWithPeriodPrice('period');
+
+    await runStaleness(db!, { thresholdDays: 30 });
+    let r = await flagRows(planId);
+    expect(r).toHaveLength(1);
+    expect(r[0]!.status).toBe('pending');
+    expect(r[0]!.reason).toContain('周期价行陈旧');
+
+    const result = await markChecked(db!, { targetType: 'plan', targetId: planId });
+    expect(result).toEqual({ outcome: 'checked' });
+    r = await flagRows(planId);
+    expect(r[0]!.status).toBe('resolved');
+
+    const periodRows = await db!
+      .select()
+      .from(schema.mrPlanPrices)
+      .where(eq(schema.mrPlanPrices.planId, planId));
+    expect(periodRows[0]!.lastChecked!.getFullYear()).toBeGreaterThan(2000);
+
     await runStaleness(db!, { thresholdDays: 30 });
     r = await flagRows(planId);
     expect(r[0]!.status).toBe('resolved');

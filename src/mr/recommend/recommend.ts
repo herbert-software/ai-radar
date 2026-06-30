@@ -41,6 +41,16 @@ const USAGE_KNOBS: Record<UsageProfile, { demandedRounds: number; tokensPerRound
   heavy: { demandedRounds: 300, tokensPerRound: DEFAULT_TOKENS_PER_ROUND },
 };
 
+const BILLING_PERIOD_LABEL = {
+  quarterly: '季付',
+  annual: '年付',
+} as const;
+
+const BILLING_PERIOD_LOCK_MONTHS = {
+  quarterly: 3,
+  annual: 12,
+} as const;
+
 export interface RecommendInput {
   model?: string;
   tool?: string;
@@ -83,12 +93,68 @@ function windowReason(fw: FitsWindow): RuleReason {
   return { kind: 'window', detail: '额度口径未知、不保证不撞窗（⚠ 估算）' };
 }
 
+function formatMoney(n: number): string {
+  const rounded = Math.round((n + Number.EPSILON) * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function bestPeriodReason(plan: SnapshotPlan, preferredCurrency: MrCurrency): RuleReason | null {
+  if (plan.category === 'token_plan') return null;
+
+  const currency = plan.priceStatus === 'known' && plan.currency !== null ? plan.currency : preferredCurrency;
+  const options: Array<{
+    billingPeriod: 'monthly' | 'quarterly' | 'annual';
+    effectiveMonthly: number;
+    currency: MrCurrency;
+  }> = [];
+
+  if (plan.priceStatus === 'known' && plan.currentPrice !== null && plan.currency !== null) {
+    options.push({
+      billingPeriod: 'monthly',
+      effectiveMonthly: Number(plan.currentPrice),
+      currency: plan.currency,
+    });
+  }
+
+  for (const pp of plan.periodPrices) {
+    if (pp.priceStatus !== 'known' || pp.effectiveMonthly === null || pp.currency !== currency) continue;
+    options.push({
+      billingPeriod: pp.billingPeriod,
+      effectiveMonthly: pp.effectiveMonthly,
+      currency: pp.currency,
+    });
+  }
+
+  if (options.length === 0) return null;
+
+  const best = options.reduce((acc, option) => {
+    if (option.effectiveMonthly < acc.effectiveMonthly) return option;
+    if (option.effectiveMonthly === acc.effectiveMonthly && acc.billingPeriod !== 'monthly') return option;
+    return acc;
+  });
+
+  if (best.billingPeriod === 'monthly') {
+    return {
+      kind: 'best_period',
+      detail: `最佳周期=月付，有效月价 ${formatMoney(best.effectiveMonthly)} ${best.currency}`,
+    };
+  }
+
+  return {
+    kind: 'best_period',
+    detail:
+      `最佳周期=${BILLING_PERIOD_LABEL[best.billingPeriod]}，有效月价 ` +
+      `${formatMoney(best.effectiveMonthly)} ${best.currency}（含预付锁期 ${BILLING_PERIOD_LOCK_MONTHS[best.billingPeriod]} 个月）`,
+  };
+}
+
 type BaseVerdict = 'insufficient_data' | 'not_recommended' | 'eligible';
 
 /** 单候选判级（有序短路）+ 规则原因；不分配 primary/alternative（那需全局最低价信息）。 */
 function classify(
   plan: SnapshotPlan,
   input: RecommendInput,
+  currency: MrCurrency,
   knobs: { demandedRounds: number; tokensPerRound: number },
 ): { fw: FitsWindow; base: BaseVerdict; reasons: RuleReason[] } {
   const reasons: RuleReason[] = [];
@@ -96,15 +162,24 @@ function classify(
   if (input.tool) reasons.push({ kind: 'tool_match', detail: `支持工具 ${input.tool} ✓` });
   if (input.protocol) reasons.push({ kind: 'protocol_match', detail: `支持协议 ${input.protocol} ✓` });
 
+  // ⓪ 明确停售 → not_recommended，优先于未核价、待复核、超预算、撞窗。
   const fw = fitsWindow(plan.limits, knobs.demandedRounds, knobs.tokensPerRound);
+  if (plan.availability === 'discontinued') {
+    reasons.push({ kind: 'discontinued', detail: '已停售，不作推荐' });
+    return { fw, base: 'not_recommended', reasons };
+  }
+
   reasons.push(windowReason(fw));
 
-  // ① 未核价 或 待复核（含可能停售）→ insufficient_data。
+  const bestPeriod = bestPeriodReason(plan, currency);
+  if (bestPeriod) reasons.push(bestPeriod);
+
+  // ① 未核价 或 待复核 → insufficient_data。
   const known = plan.priceStatus === 'known';
   if (!known || plan.reviewStatus.pending) {
     if (!known) reasons.push({ kind: 'unreviewed', detail: '价格未核（priceStatus≠known），不参与「最便宜」首选' });
     if (plan.reviewStatus.pending) {
-      reasons.push({ kind: 'pending_review', detail: '存在待复核标记（含可能已停售），不作首选' });
+      reasons.push({ kind: 'pending_review', detail: '存在待复核标记，需人工确认，不作首选' });
     }
     return { fw, base: 'insufficient_data', reasons };
   }
@@ -140,6 +215,7 @@ function toCandidate(plan: SnapshotPlan, fw: FitsWindow, verdict: Verdict, reaso
     monthlyCost: known && plan.currentPrice !== null ? Number(plan.currentPrice) : null,
     currency: known ? plan.currency : null,
     priceStatus: plan.priceStatus,
+    availability: plan.availability,
     stale: plan.freshness.stale,
     fitsWindow: fw,
     verdict,
@@ -182,6 +258,8 @@ function composeNoEligible(candidates: RankedCandidate[], currency: MrCurrency):
   const parts: string[] = ['暂无可用首选'];
 
   const pending = candidates.filter((c) => c.verdict === 'insufficient_data').length;
+  const discontinued = candidates.filter((c) => c.availability === 'discontinued').length;
+  if (discontinued > 0) parts.push(`${discontinued} 个候选已停售`);
   if (pending > 0) parts.push(`${pending} 个候选待核（价格未核或待复核），不作首选`);
 
   // 超预算且非 exceeds（放宽预算即可用）：取最低超预算价作建议阈、数值重核（非二次 query）。
@@ -199,7 +277,9 @@ function composeNoEligible(candidates: RankedCandidate[], currency: MrCurrency):
   }
 
   // exceeds（额度不足）：建议降用量档，不误导为放宽预算。
-  const exceedsBlocked = candidates.filter((c) => c.verdict === 'not_recommended' && c.fitsWindow === 'exceeds').length;
+  const exceedsBlocked = candidates.filter(
+    (c) => c.verdict === 'not_recommended' && c.fitsWindow === 'exceeds' && c.availability !== 'discontinued',
+  ).length;
   if (exceedsBlocked > 0) parts.push(`${exceedsBlocked} 个候选额度不足（撞窗 exceeds），建议降低用量档`);
 
   return parts.join('；') + '。';
@@ -223,7 +303,7 @@ export async function recommend(
   // 判级 + 按升序首个 eligible 取 primary（不另手搓排序；裸 cheapest 被淘汰则自然顺延次低）。
   let primaryAssigned = false;
   const candidates: RankedCandidate[] = ordered.map((plan) => {
-    const { fw, base, reasons } = classify(plan, input, knobs);
+    const { fw, base, reasons } = classify(plan, input, currency, knobs);
     let verdict: Verdict;
     if (base === 'eligible') {
       if (!primaryAssigned) {

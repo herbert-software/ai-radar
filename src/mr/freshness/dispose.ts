@@ -28,6 +28,7 @@ import {
   mrPlanClients,
   mrPlanLimits,
   mrPlanModels,
+  mrPlanPrices,
   mrPlans,
   mrReviewFlag,
   mrSource,
@@ -168,6 +169,10 @@ export async function markChecked(
         .update(mrPlanModels)
         .set({ lastChecked: ts })
         .where(eq(mrPlanModels.planId, target.targetId));
+      await tx
+        .update(mrPlanPrices)
+        .set({ lastChecked: ts })
+        .where(eq(mrPlanPrices.planId, target.targetId));
     }
     // vendor 标的：身份表无 last_checked 列，仅 resolve（已在上方完成）。
     return { outcome: 'checked' };

@@ -49,6 +49,7 @@ async function cleanup() {
   if (srcIds.length) {
     await db.delete(schema.mrPlanSources).where(inArray(schema.mrPlanSources.sourceId, srcIds));
   }
+  await db.delete(schema.mrPlanPrices).where(like(schema.mrPlanPrices.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanModels).where(like(schema.mrPlanModels.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanClients).where(like(schema.mrPlanClients.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanLimits).where(like(schema.mrPlanLimits.sourceUrl, `${PREFIX}%`));
@@ -155,6 +156,7 @@ describeIfDb('2.5 快照构建', () => {
     expect(plan!.priceStatus).toBe('known');
     expect(plan!.currentPrice).toBe('20.00');
     expect(plan!.currency).toBe('USD');
+    expect(plan!.availability).toBe('unknown');
     expect(plan!.provenance.sourceConfidence).toBe('official_pricing');
     expect(plan!.provenance.sourceUrl).toBe(`${PREFIX}src-full`);
     // 去规范化关系
@@ -177,6 +179,7 @@ describeIfDb('2.5 快照构建', () => {
     expect(plan!.limits[0]!.value).toBe('1000000');
     expect(plan!.limits[0]!.window).toBe('month');
     expect(plan!.limits[0]!.provenance.lastCheckedDate).toBe(nowDate);
+    expect(plan!.periodPrices).toEqual([]);
     // 价格事实 date = trunc(plan.last_checked)
     expect(plan!.provenance.lastCheckedDate).toBe(nowDate);
     expect(plan!.sources).toEqual([
@@ -318,6 +321,88 @@ describeIfDb('2.5 快照构建', () => {
 
     const plan = await snapPlan(planId);
     expect(plan!.freshness.stale).toBe(true);
+  });
+
+  it('周期价去规范化读回 + effectiveMonthly + provenance date，且纳入 freshness', async () => {
+    const vendorId = await makeVendor('period');
+    const planId = await makePlan(vendorId, 'period', {
+      currentPrice: '49.00',
+      currency: 'CNY',
+      lastChecked: NOW,
+    });
+    await db!.insert(schema.mrPlanPrices).values({
+      planId,
+      billingPeriod: 'annual',
+      price: '468.00',
+      currency: 'CNY',
+      sourceUrl: `${PREFIX}src-period-annual`,
+      lastChecked: OLD,
+      sourceConfidence: 'official_pricing',
+    });
+    await db!.insert(schema.mrPlanPrices).values({
+      planId,
+      billingPeriod: 'quarterly',
+      price: null,
+      currency: 'CNY',
+      sourceUrl: `${PREFIX}src-period-quarterly`,
+      lastChecked: NOW,
+      sourceConfidence: 'needs_login_recheck',
+    });
+
+    const plan = await snapPlan(planId);
+    expect(plan!.periodPrices).toEqual([
+      {
+        billingPeriod: 'annual',
+        price: '468.00',
+        currency: 'CNY',
+        priceStatus: 'known',
+        provenance: {
+          sourceUrl: `${PREFIX}src-period-annual`,
+          sourceConfidence: 'official_pricing',
+          lastCheckedDate: OLD.toISOString().slice(0, 10),
+        },
+        effectiveMonthly: 39,
+      },
+      {
+        billingPeriod: 'quarterly',
+        price: null,
+        currency: 'CNY',
+        priceStatus: 'unknown',
+        provenance: {
+          sourceUrl: `${PREFIX}src-period-quarterly`,
+          sourceConfidence: 'needs_login_recheck',
+          lastCheckedDate: NOW.toISOString().slice(0, 10),
+        },
+        effectiveMonthly: null,
+      },
+    ]);
+    expect(plan!.freshness.stale).toBe(true);
+  });
+
+  it('token_plan 周期价不生成 effectiveMonthly', async () => {
+    const vendorId = await makeVendor('token-period');
+    const planId = await makePlan(vendorId, 'token-period', {
+      currentPrice: '5.00',
+      currency: 'USD',
+    });
+    await db!
+      .update(schema.mrPlans)
+      .set({ category: 'token_plan' })
+      .where(eq(schema.mrPlans.id, planId));
+    await db!.insert(schema.mrPlanPrices).values({
+      planId,
+      billingPeriod: 'annual',
+      price: '120.00',
+      currency: 'USD',
+      sourceUrl: `${PREFIX}src-token-period`,
+      lastChecked: NOW,
+      sourceConfidence: 'official_pricing',
+    });
+
+    const plan = await snapPlan(planId);
+    expect(plan!.category).toBe('token_plan');
+    expect(plan!.periodPrices[0]!.priceStatus).toBe('known');
+    expect(plan!.periodPrices[0]!.effectiveMonthly).toBeNull();
   });
 
   it('unknown price 无损读回（占位 NULL 与非官方 confidence 带价均 unknown）', async () => {

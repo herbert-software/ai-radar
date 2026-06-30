@@ -30,13 +30,14 @@ const HUGE_THRESHOLD_DAYS = 36_500;
 
 interface Rows {
   planLastChecked: Date;
+  periodPriceLastChecked: Date;
   modelLastChecked: Date;
   clientLastChecked: Date;
   limitLastChecked: Date;
   sourceLastChecked: Date | null;
 }
 
-/** 构造覆盖 plan 价格事实 + model/client/limit 事实 + 关联源的最小一致行集。 */
+/** 构造覆盖 plan 价格事实 + period/model/client/limit 事实 + 关联源的最小一致行集。 */
 function makeRows(o: Rows) {
   return new Map<unknown, unknown[]>([
     [schema.mrVendors, [{ id: 'v1', name: 'Vendor', normalizedName: 'vendor' }]],
@@ -48,6 +49,7 @@ function makeRows(o: Rows) {
           vendorId: 'v1',
           name: 'Coding Plan Pro',
           category: 'coding_plan',
+          availability: 'unknown',
           currentPrice: '20.00',
           currency: 'USD',
           sourceUrl: 'https://x/pricing',
@@ -100,6 +102,21 @@ function makeRows(o: Rows) {
       ],
     ],
     [
+      schema.mrPlanPrices,
+      [
+        {
+          id: 'pp1',
+          planId: 'p1',
+          billingPeriod: 'annual',
+          price: '120.00',
+          currency: 'USD',
+          sourceUrl: 'https://x/annual',
+          sourceConfidence: 'official_pricing',
+          lastChecked: o.periodPriceLastChecked,
+        },
+      ],
+    ],
+    [
       schema.mrSource,
       [
         {
@@ -134,6 +151,7 @@ function build(rows: Rows, now: Date) {
 
 const baseRows = (): Rows => ({
   planLastChecked: new Date('2026-06-20T12:00:00Z'),
+  periodPriceLastChecked: new Date('2026-06-20T12:00:00Z'),
   modelLastChecked: new Date('2026-06-20T12:00:00Z'),
   clientLastChecked: new Date('2026-06-20T12:00:00Z'),
   limitLastChecked: new Date('2026-06-20T12:00:00Z'),
@@ -152,6 +170,7 @@ describe('1.3 per-fact lastCheckedDate 哈希稳定性（无 DB）', () => {
     // 各 provenance date 完全由 last_checked（2026-06-20）派生，与 now 无关。
     expect(p1.provenance.lastCheckedDate).toBe('2026-06-20');
     expect(p2.provenance.lastCheckedDate).toBe('2026-06-20');
+    expect(p1.periodPrices[0]!.provenance.lastCheckedDate).toBe('2026-06-20');
     expect(p1.models[0]!.provenance.lastCheckedDate).toBe('2026-06-20');
     expect(p1.sources[0]!.lastCheckedDate).toBe('2026-06-20');
     expect(p1.freshness.stale).toBe(false);
@@ -176,6 +195,7 @@ describe('1.3 per-fact lastCheckedDate 哈希稳定性（无 DB）', () => {
     const nearMidnight = new Date('2026-06-24T20:00:00Z');
     const rows: Rows = {
       planLastChecked: nearMidnight,
+      periodPriceLastChecked: nearMidnight,
       modelLastChecked: nearMidnight,
       clientLastChecked: nearMidnight,
       limitLastChecked: nearMidnight,
@@ -184,6 +204,7 @@ describe('1.3 per-fact lastCheckedDate 哈希稳定性（无 DB）', () => {
     const now = new Date('2026-06-25T01:00:00Z');
     const utcBuilt = await build(rows, now);
     expect(utcBuilt.plans[0]!.provenance.lastCheckedDate).toBe('2026-06-24'); // UTC 日，非 Shanghai 的 06-25
+    expect(utcBuilt.plans[0]!.periodPrices[0]!.provenance.lastCheckedDate).toBe('2026-06-24');
     const utcVersion = computeSnapshotVersion(utcBuilt);
 
     // 翻转 process.env.TZ 再构建：toISOString 不受本地 TZ 影响 → date/version 不变（无论 Node 是否运行时拾取 TZ）。
@@ -192,6 +213,7 @@ describe('1.3 per-fact lastCheckedDate 哈希稳定性（无 DB）', () => {
     try {
       const shBuilt = await build(rows, now);
       expect(shBuilt.plans[0]!.provenance.lastCheckedDate).toBe('2026-06-24');
+      expect(shBuilt.plans[0]!.periodPrices[0]!.provenance.lastCheckedDate).toBe('2026-06-24');
       expect(computeSnapshotVersion(shBuilt)).toBe(utcVersion);
     } finally {
       if (savedTz === undefined) delete process.env.TZ;
@@ -210,6 +232,7 @@ describe('1.3 per-fact lastCheckedDate 哈希稳定性（无 DB）', () => {
     // provenance date 为日粒度（YYYY-MM-DD，无时分秒）→ 不泄露 raw 秒级 last_checked。
     for (const date of [
       plan.provenance.lastCheckedDate,
+      plan.periodPrices[0]!.provenance.lastCheckedDate,
       plan.models[0]!.provenance.lastCheckedDate,
       plan.clients[0]!.provenance.lastCheckedDate,
       plan.limits[0]!.provenance.lastCheckedDate,

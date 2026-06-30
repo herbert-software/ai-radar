@@ -33,6 +33,7 @@
 import type { db as defaultDb } from '../../db/index.js';
 import {
   isOfficialConfidence,
+  mrBillingPeriodSchema,
   mrReviewFlagStatusSchema,
   mrReviewFlagTargetTypeSchema,
 } from '../../db/mr-schema.zod.js';
@@ -41,6 +42,7 @@ import {
   mrPlanClients,
   mrPlanLimits,
   mrPlanModels,
+  mrPlanPrices,
   mrPlanSources,
   mrPlans,
   mrReviewFlag,
@@ -51,6 +53,7 @@ import {
   modelRadarSnapshotSchema,
   type ModelRadarSnapshot,
 } from './dto.js';
+import { effectiveMonthly } from '../effective-monthly.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测（对齐 staleness.ts / flag.ts）。 */
 type DbLike = typeof defaultDb;
@@ -117,6 +120,10 @@ export async function buildModelRadarSnapshot(
       const planModels = await tx.select().from(mrPlanModels).orderBy(mrPlanModels.id);
       const planClients = await tx.select().from(mrPlanClients).orderBy(mrPlanClients.id);
       const planLimits = await tx.select().from(mrPlanLimits).orderBy(mrPlanLimits.id);
+      const planPrices = await tx
+        .select()
+        .from(mrPlanPrices)
+        .orderBy(mrPlanPrices.planId, mrPlanPrices.billingPeriod, mrPlanPrices.currency);
       const sources = await tx.select().from(mrSource).orderBy(mrSource.id);
       const planSources = await tx.select().from(mrPlanSources).orderBy(mrPlanSources.id);
       const reviewFlags = await tx.select().from(mrReviewFlag).orderBy(mrReviewFlag.id);
@@ -124,10 +131,19 @@ export async function buildModelRadarSnapshot(
       const vendorById = new Map(vendors.map((v) => [v.id, v]));
       const modelById = new Map(models.map((m) => [m.id, m]));
       const sourceById = new Map(sources.map((s) => [s.id, s]));
+      const planIds = new Set(plans.map((p) => p.id));
+      for (const pp of planPrices) {
+        if (!planIds.has(pp.planId)) {
+          throw new Error(
+            `快照构建：plan_price ${pp.id} 引用不存在的 plan ${pp.planId}`,
+          );
+        }
+      }
 
       const modelsByPlan = groupBy(planModels, (r) => r.planId);
       const clientsByPlan = groupBy(planClients, (r) => r.planId);
       const limitsByPlan = groupBy(planLimits, (r) => r.planId);
+      const pricesByPlan = groupBy(planPrices, (r) => r.planId);
       const planSourcesByPlan = groupBy(planSources, (r) => r.planId);
 
       // pending flag 集（仅 status='pending' 计入；resolved 不触发待复核）。
@@ -203,6 +219,30 @@ export async function buildModelRadarSnapshot(
           },
         }));
 
+        const priceRows = pricesByPlan.get(plan.id) ?? [];
+        const dtoPeriodPrices = priceRows.map((pp) => {
+          const billingPeriod = mrBillingPeriodSchema.parse(pp.billingPeriod);
+          const priceStatus =
+            pp.price !== null && isOfficialConfidence(pp.sourceConfidence)
+              ? 'known'
+              : 'unknown';
+          return {
+            billingPeriod,
+            price: pp.price,
+            currency: pp.currency,
+            priceStatus,
+            provenance: {
+              sourceUrl: pp.sourceUrl,
+              sourceConfidence: pp.sourceConfidence,
+              lastCheckedDate: truncToUtcDate(pp.lastChecked),
+            },
+            effectiveMonthly:
+              plan.category === 'token_plan'
+                ? null
+                : effectiveMonthly(pp.price, billingPeriod, priceStatus),
+          };
+        });
+
         const sourceRows = (planSourcesByPlan.get(plan.id) ?? []).map((ps) => {
           const source = sourceById.get(ps.sourceId);
           if (!source) {
@@ -229,6 +269,7 @@ export async function buildModelRadarSnapshot(
         const stale =
           isStale(plan.lastChecked, threshold) ||
           limitRows.some((l) => isStale(l.lastChecked, threshold)) ||
+          priceRows.some((p) => isStale(p.lastChecked, threshold)) ||
           clientRows.some((c) => isStale(c.lastChecked, threshold)) ||
           modelRows.some((m) => isStale(m.lastChecked, threshold)) ||
           sourceRows.some((s) => isStale(s.lastChecked, threshold));
@@ -253,6 +294,7 @@ export async function buildModelRadarSnapshot(
           vendorName: vendor.name,
           name: plan.name,
           category: plan.category,
+          availability: plan.availability,
           currentPrice: plan.currentPrice,
           currency: plan.currency,
           priceStatus,
@@ -264,6 +306,7 @@ export async function buildModelRadarSnapshot(
           },
           freshness: { stale },
           reviewStatus: { pending },
+          periodPrices: dtoPeriodPrices,
           models: dtoModels,
           clients: dtoClients,
           limits: dtoLimits,

@@ -38,6 +38,7 @@ const NOW = new Date();
 async function cleanup() {
   if (!db) return;
   await db.delete(schema.mrReviewFlag).where(like(schema.mrReviewFlag.targetId, `${PREFIX}%`));
+  await db.delete(schema.mrPlanPrices).where(like(schema.mrPlanPrices.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanModels).where(like(schema.mrPlanModels.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanLimits).where(like(schema.mrPlanLimits.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlans).where(like(schema.mrPlans.sourceUrl, `${PREFIX}%`));
@@ -127,6 +128,45 @@ describeIfDb('7.6 陈旧度', () => {
     expect(r).toHaveLength(1);
     expect(r[0]!.targetType).toBe('plan');
     expect(r[0]!.reason).toContain('限额行陈旧');
+  });
+
+  it('period price 超期经所属 plan 进复核', async () => {
+    const vendorId = await makeVendor('period');
+    const planId = await makePlan(vendorId, 'period', NOW);
+    await db!.insert(schema.mrPlanPrices).values({
+      planId,
+      billingPeriod: 'annual',
+      price: '120.00',
+      currency: 'USD',
+      sourceUrl: `${PREFIX}src-period`,
+      lastChecked: OLD,
+      sourceConfidence: 'official_pricing',
+    });
+
+    await runStaleness(db!, { thresholdDays: 30 });
+    const r = await flagRows(planId);
+    expect(r).toHaveLength(1);
+    expect(r[0]!.targetType).toBe('plan');
+    expect(r[0]!.reason).toContain('周期价行陈旧');
+  });
+
+  it('孤儿 period price 不应再给不存在的 plan 打标', async () => {
+    const vendorId = await makeVendor('orphan-period');
+    const planId = await makePlan(vendorId, 'orphan-period', NOW);
+    await db!.insert(schema.mrPlanPrices).values({
+      planId,
+      billingPeriod: 'annual',
+      price: '120.00',
+      currency: 'USD',
+      sourceUrl: `${PREFIX}src-orphan-period`,
+      lastChecked: OLD,
+      sourceConfidence: 'official_pricing',
+    });
+    await db!.delete(schema.mrPlans).where(eq(schema.mrPlans.id, planId));
+
+    await runStaleness(db!, { thresholdDays: 30 });
+    const r = await flagRows(planId);
+    expect(r).toHaveLength(0);
   });
 
   it('source last_checked NULL 也进复核', async () => {

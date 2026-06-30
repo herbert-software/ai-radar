@@ -44,6 +44,12 @@ type SourceConfidence =
 /** 分桶 facet（与 5a mrCategorySchema 取值一致）。 */
 type Category = 'ide_membership' | 'coding_plan' | 'token_plan' | 'enterprise_seat';
 
+/** 产品生命周期（与 add-model-radar-price-state-and-periods availability 取值一致）。 */
+type Availability = 'on_sale' | 'discontinued' | 'unknown';
+
+/** 月价之外的订阅周期。 */
+type BillingPeriod = 'quarterly' | 'annual';
+
 /** 抓取策略（与 5a mrFetchStrategySchema 取值一致）。 */
 type FetchStrategy = 'http' | 'browser' | 'manual';
 
@@ -70,11 +76,22 @@ interface SeedClient {
   clientId: string;
 }
 
+/** 周期价 fixture（订阅型桶专用；token_plan 不写）。 */
+interface SeedPeriodPrice {
+  billingPeriod: BillingPeriod;
+  price: number | null;
+  currency: 'CNY' | 'USD' | 'EUR';
+  sourceUrl: string;
+  sourceConfidence: SourceConfidence;
+}
+
 /** 套餐 fixture（plan + 其 child 事实行 + 定位用源 URL）。 */
 interface SeedPlan {
   /** 套餐全名（含产品上下文，task 1.5）。 */
   name: string;
   category: Category;
+  /** 产品生命周期；未知也显式写 unknown，不从价格/confidence 推导。 */
+  availability: Availability;
   /** numeric；null = needs_login_recheck 占位（与 currency 同生同灭）。 */
   currentPrice: number | null;
   /** ISO 4217 大写；与 currentPrice 同生同灭（null 占位）。 */
@@ -90,6 +107,7 @@ interface SeedPlan {
   limits: SeedLimit[];
   models: SeedModel[];
   clients: SeedClient[];
+  periodPrices?: SeedPeriodPrice[];
 }
 
 /** 抓取源 fixture（定位边 = 此源 ↔ 同 vendor 全部 plan）。 */
@@ -130,11 +148,21 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'GLM Coding Plan Lite',
         category: 'coding_plan',
+        availability: 'on_sale',
         // 5d-C 人在环已核（web-search + 实勘真页）：真月付标准价 ¥49/月（排首月促销、非年付÷12）。
         currentPrice: 49,
         currency: 'CNY',
         sourceUrl: 'https://docs.bigmodel.cn/cn/coding-plan/overview',
         sourceConfidence: 'official_pricing',
+        periodPrices: [
+          {
+            billingPeriod: 'annual',
+            price: 468,
+            currency: 'CNY',
+            sourceUrl: 'https://docs.bigmodel.cn/cn/coding-plan/overview',
+            sourceConfidence: 'official_pricing',
+          },
+        ],
         limits: [
           // 额度类型确定（按请求滚动窗），具体 value 无把握 → null 占位。
           { limitType: 'rolling_5h_requests', value: null, window: '5h' },
@@ -148,6 +176,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'GLM Coding Plan Pro',
         category: 'coding_plan',
+        availability: 'on_sale',
         // 5d-C 人在环已核：真月付标准价 ¥149/月。
         currentPrice: 149,
         currency: 'CNY',
@@ -171,6 +200,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'Kimi Open Platform Token Plan',
         category: 'token_plan',
+        availability: 'unknown',
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://platform.moonshot.cn/docs/pricing',
@@ -194,6 +224,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'MiniMax Open Platform Token Plan',
         category: 'token_plan',
+        availability: 'unknown',
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://platform.minimaxi.com/document/price',
@@ -215,6 +246,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'MiMo Token Plan',
         category: 'token_plan',
+        availability: 'unknown',
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://xiaomimimo.com',
@@ -235,6 +267,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'StepFun Open Platform Token Plan',
         category: 'token_plan',
+        availability: 'unknown',
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://platform.stepfun.com/docs/pricing',
@@ -258,6 +291,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'Trae Pro',
         category: 'ide_membership',
+        availability: 'unknown',
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://www.trae.ai/pricing',
@@ -281,6 +315,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'Qoder Pro',
         category: 'ide_membership',
+        availability: 'unknown',
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://qoder.com/pricing',
@@ -301,6 +336,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'Comate Pro',
         category: 'ide_membership',
+        availability: 'unknown',
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://comate.baidu.com/pricing',
@@ -321,6 +357,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'CodeBuddy Pro',
         category: 'ide_membership',
+        availability: 'unknown',
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://copilot.tencent.com/pricing',
@@ -347,6 +384,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: '百炼 Coding Plan',
         category: 'coding_plan',
+        availability: 'on_sale',
         // 5d-C 人在环已核：真月付标准价 ¥200/月。
         currentPrice: 200,
         currency: 'CNY',
@@ -369,6 +407,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: '千帆 Coding Plan',
         category: 'coding_plan',
+        availability: 'on_sale',
         // 5d-C 人在环已核：真月付标准价 ¥40/月。
         currentPrice: 40,
         currency: 'CNY',
@@ -392,6 +431,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: '腾讯混元 Coding Plan',
         category: 'coding_plan',
+        availability: 'discontinued',
         // 5d-C 核实：腾讯混元 Coding Plan 现已停售（无在售订阅）→ 价保持 NULL、不计入 cheapest，
         // 经 reviewFlagReason 打 mr_review_flag「已停售」，不留普通待核（spec「已停售 plan 不留作普通待核」）。
         currentPrice: null,
@@ -417,6 +457,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: '火山方舟 Coding Plan',
         category: 'coding_plan',
+        availability: 'on_sale',
         // 5d-C 人在环已核：真月付标准价 ¥40/月。
         currentPrice: 40,
         currency: 'CNY',
@@ -440,6 +481,7 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: '讯飞星火 Coding Plan',
         category: 'coding_plan',
+        availability: 'on_sale',
         // 5d-C 人在环已核（登录后真页）：真月付标准价 ¥19/月（无忧档）。
         currentPrice: 19,
         currency: 'CNY',

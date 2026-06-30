@@ -161,13 +161,14 @@ export function queryModelRadarSnapshot(
   const groups: SnapshotPlanGroup[] = [];
   for (const g of grouped.values()) {
     if (g.currency !== null) {
-      // 已知币种组：组内全为已知价，数值升序、cheapest = 最低价（稳定排序，等价时取先入即 id 升序）。
+      // 已知币种组：组内全为已知价，数值升序；停售 plan 可列出但不参与 cheapest/comparable 候选。
       const plans = [...g.plans].sort((a, b) => Number(a.currentPrice) - Number(b.currentPrice));
+      const cheapest = plans.find((p) => p.availability !== 'discontinued') ?? null;
       groups.push({
         sortScope: { category: g.category, currency: g.currency },
         plans,
-        cheapestPlanId: plans[0]!.id,
-        comparable: true,
+        cheapestPlanId: cheapest?.id ?? null,
+        comparable: cheapest !== null,
         unknownCount: 0,
       });
     } else {

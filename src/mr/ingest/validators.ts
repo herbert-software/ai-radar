@@ -23,6 +23,7 @@ import {
   mrClientTypeSchema,
   mrCurrencySchema,
   mrFetchStrategySchema,
+  mrPlanPriceSchema,
   mrLimitTypeSchema,
   mrPlanWriteSchema,
   mrSourceConfidenceSchema,
@@ -90,6 +91,13 @@ export const mrPlanModelWriteSchema = z.object({
 export const mrSourceWriteSchema = z.object({
   fetchStrategy: mrFetchStrategySchema,
 });
+
+/**
+ * `upsertPlanPeriodPrice` 写校验器（add-model-radar-price-state-and-periods D6）。
+ * 复用 5a/Group A 的 `mrPlanPriceSchema`，覆盖 billing_period/currency/source_confidence
+ * 以及周期价 confidence↔price 绑定；`monthly` 镜像行会在发 SQL 前被拒。
+ */
+export const mrPlanPeriodPriceWriteSchema = mrPlanPriceSchema;
 
 /**
  * 改价路径写校验器（design D1/D4）。`recordPriceChange` 写 `mr_price_history` 前必校验 provenance 有限值列：

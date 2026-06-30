@@ -16,18 +16,21 @@
  *
  * 各表事实字段（design D2，lint/test 据此判「盲覆盖」）：
  * - plan = `current_price/currency/source_url/source_confidence` + **`category`**（5a 唯一键 (vendor_id,name)
- *   不含 category，同 (vendor_id,name) 重录但 category 异**必须打 conflict、不静默 no-op**）。
+ *   不含 category，同 (vendor_id,name) 重录但 category 异**必须打 conflict、不静默 no-op**）+
+ *   `availability`（仅 INSERT 落库；既有行差异打 flag，不盲覆盖）。
  * - limit = `value/window/source_url/source_confidence`（window 是唯一键组件，异 window 走新行不冲突）。
  * - client/model junction = `source_confidence/source_url`。
  * - `last_checked` 是可自由刷新的 provenance（非事实字段）；本模块录入不主动刷它（刷新归 dispose/staleness）。
  */
 import { and, eq, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../../db/index.js';
+import { mrAvailabilitySchema } from '../../db/mr-schema.zod.js';
 import {
   mrModels,
   mrPlanClients,
   mrPlanLimits,
   mrPlanModels,
+  mrPlanPrices,
   mrPlanSources,
   mrPlans,
   mrSource,
@@ -38,6 +41,7 @@ import {
   mrPlanClientWriteSchema,
   mrPlanLimitWriteSchema,
   mrPlanModelWriteSchema,
+  mrPlanPeriodPriceWriteSchema,
   mrPlanWriteValidator,
   mrSourceUrlSchema,
   mrSourceWriteSchema,
@@ -192,6 +196,8 @@ export interface PlanWriteInput {
   vendorId: string;
   name: string;
   category: string;
+  /** 产品生命周期；未传按 schema 默认 unknown。 */
+  availability?: string;
   /** numeric(12,2)，与 currency 同生同灭。 */
   currentPrice: number | string | null;
   currency: string | null;
@@ -238,6 +244,7 @@ export async function upsertPlan(
 ): Promise<FactWriteOutcome> {
   const parsed = mrPlanWriteValidator.parse({
     category: p.category,
+    availability: p.availability,
     currentPrice: p.currentPrice,
     currency: p.currency,
     sourceConfidence: p.sourceConfidence,
@@ -259,6 +266,7 @@ export async function upsertPlan(
         vendorId: p.vendorId,
         name: p.name,
         category: parsed.category,
+        availability: parsed.availability,
         currentPrice: p.currentPrice == null ? null : String(p.currentPrice),
         currency: p.currency,
         sourceUrl: p.sourceUrl,
@@ -273,6 +281,7 @@ export async function upsertPlan(
       .select({
         id: mrPlans.id,
         category: mrPlans.category,
+        availability: mrPlans.availability,
         currentPrice: mrPlans.currentPrice,
         currency: mrPlans.currency,
         sourceUrl: mrPlans.sourceUrl,
@@ -297,6 +306,22 @@ export async function upsertPlan(
         field: 'category',
         existing: existing.category,
         incoming: parsed.category,
+      };
+    }
+
+    // availability 异 → conflict + 打 flag，不由 upsertPlan 盲覆盖 lifecycle。
+    if (existing.availability !== parsed.availability) {
+      await setReviewFlag(
+        tx,
+        { targetType: 'plan', targetId: existing.id },
+        `plan availability 冲突: 既有 ${existing.availability} 异于 ${parsed.availability}`,
+      );
+      return {
+        outcome: 'conflict',
+        id: existing.id,
+        field: 'availability',
+        existing: existing.availability,
+        incoming: parsed.availability,
       };
     }
 
@@ -373,6 +398,193 @@ export async function upsertPlan(
   // 提交后触发 rebuild。结构性 INSERT（inserted/noop/conflict 等单条 ad-hoc 结构写）不即时刷 ETag——归
   // seed/策展脚本末尾触发或 5d 后台周期 rebuild 兜（design D8）。runSnapshotRebuild never-throws。
   if (result.outcome === 'price-delegated') {
+    await runSnapshotRebuild({ dbh });
+  }
+  return result;
+}
+
+/** 授权 lifecycle 写结果。 */
+export type PlanAvailabilityWriteOutcome =
+  | { outcome: 'updated'; id: string; availability: string }
+  | { outcome: 'noop'; id: string; availability: string }
+  | { outcome: 'not-found'; id: string };
+
+/**
+ * 人工/seed 授权 lifecycle setter（add-model-radar-price-state-and-periods D6）。
+ * 保鲜回路/抓取链不得调用此入口；结构守卫在 eslint 中禁止它们 import ingest writer。
+ */
+export async function setPlanAvailability(
+  dbh: DbLike,
+  planId: string,
+  availabilityInput: string,
+): Promise<PlanAvailabilityWriteOutcome> {
+  const availability = mrAvailabilitySchema.parse(availabilityInput);
+  const result = await dbh.transaction(async (tx): Promise<PlanAvailabilityWriteOutcome> => {
+    const rows = await tx
+      .select({ id: mrPlans.id, availability: mrPlans.availability })
+      .from(mrPlans)
+      .where(eq(mrPlans.id, planId))
+      .limit(1);
+    const existing = rows[0];
+    if (!existing) return { outcome: 'not-found', id: planId };
+    if (existing.availability === availability) {
+      return { outcome: 'noop', id: existing.id, availability };
+    }
+    await tx
+      .update(mrPlans)
+      .set({ availability, updatedAt: sql`now()` })
+      .where(eq(mrPlans.id, existing.id));
+    return { outcome: 'updated', id: existing.id, availability };
+  });
+
+  if (result.outcome === 'updated') {
+    await runSnapshotRebuild({ dbh });
+  }
+  return result;
+}
+
+/** 周期价授权写结果。 */
+export type PlanPeriodPriceWriteOutcome =
+  | { outcome: 'inserted'; id: string }
+  | { outcome: 'refreshed'; id: string }
+  | { outcome: 'noop'; id: string }
+  | { outcome: 'conflict'; id: string; field: string; existing: unknown; incoming: unknown }
+  | { outcome: 'not-found'; id: string }
+  | { outcome: 'noop-race' };
+
+const SUBSCRIPTION_CATEGORIES = new Set([
+  'ide_membership',
+  'coding_plan',
+  'enterprise_seat',
+]);
+
+/** 周期价录入参数。 */
+export interface PlanPeriodPriceWriteInput {
+  planId: string;
+  billingPeriod: string;
+  /** numeric(12,2)；null = 已知币种下待核占位。 */
+  price: number | string | null;
+  /** 必填币种；币种未知时调用方不应写占位行。 */
+  currency: string;
+  sourceUrl: string;
+  sourceConfidence: string;
+  lastChecked?: Date;
+}
+
+/**
+ * 人工/seed 授权周期价 writer。只写 `mr_plan_prices` 的 quarterly/annual 行，月价仍由
+ * `mr_plans.current_price` 单 SOT 表达。相同 `(plan,period,currency)` 且价格事实相同则刷新
+ * provenance/last_checked；价格事实冲突走 guarded-write：打 plan flag，不盲覆盖。
+ */
+export async function upsertPlanPeriodPrice(
+  dbh: DbLike,
+  p: PlanPeriodPriceWriteInput,
+): Promise<PlanPeriodPriceWriteOutcome> {
+  mrSourceUrlSchema.parse(p.sourceUrl);
+  const lastChecked = p.lastChecked ?? new Date();
+  const parsed = mrPlanPeriodPriceWriteSchema.parse({
+    plan_id: p.planId,
+    billing_period: p.billingPeriod,
+    price: p.price,
+    currency: p.currency,
+    source_url: p.sourceUrl,
+    last_checked: lastChecked,
+    source_confidence: p.sourceConfidence,
+  });
+
+  const result = await dbh.transaction(async (tx): Promise<PlanPeriodPriceWriteOutcome> => {
+    const planRows = await tx
+      .select({ id: mrPlans.id, category: mrPlans.category })
+      .from(mrPlans)
+      .where(eq(mrPlans.id, parsed.plan_id))
+      .limit(1);
+    const plan = planRows[0];
+    if (!plan) return { outcome: 'not-found', id: parsed.plan_id };
+    if (!SUBSCRIPTION_CATEGORIES.has(plan.category)) {
+      throw new Error(
+        `mr_plan_prices 仅允许订阅型桶（ide_membership/coding_plan/enterprise_seat），拒绝 token_plan 或未知桶: ${plan.category}`,
+      );
+    }
+
+    const inserted = await tx
+      .insert(mrPlanPrices)
+      .values({
+        planId: parsed.plan_id,
+        billingPeriod: parsed.billing_period,
+        price: parsed.price == null ? null : String(parsed.price),
+        currency: parsed.currency,
+        sourceUrl: parsed.source_url,
+        sourceConfidence: parsed.source_confidence,
+        lastChecked: parsed.last_checked,
+      })
+      .onConflictDoNothing({
+        target: [
+          mrPlanPrices.planId,
+          mrPlanPrices.billingPeriod,
+          mrPlanPrices.currency,
+        ],
+      })
+      .returning({ id: mrPlanPrices.id });
+    if (inserted.length > 0) return { outcome: 'inserted', id: inserted[0]!.id };
+
+    const existingRows = await tx
+      .select({
+        id: mrPlanPrices.id,
+        price: mrPlanPrices.price,
+        sourceUrl: mrPlanPrices.sourceUrl,
+        sourceConfidence: mrPlanPrices.sourceConfidence,
+        lastChecked: mrPlanPrices.lastChecked,
+      })
+      .from(mrPlanPrices)
+      .where(
+        and(
+          eq(mrPlanPrices.planId, parsed.plan_id),
+          eq(mrPlanPrices.billingPeriod, parsed.billing_period),
+          eq(mrPlanPrices.currency, parsed.currency),
+        ),
+      )
+      .limit(1);
+    const existing = existingRows[0];
+    if (!existing) return { outcome: 'noop-race' };
+
+    if (!numericEq(existing.price, parsed.price)) {
+      await setReviewFlag(
+        tx,
+        { targetType: 'plan', targetId: parsed.plan_id },
+        `plan_period_price 价格冲突（${parsed.billing_period}/${parsed.currency}）: 既有 ${existing.price} 异于 ${parsed.price}`,
+      );
+      return {
+        outcome: 'conflict',
+        id: existing.id,
+        field: 'price',
+        existing: existing.price,
+        incoming: parsed.price,
+      };
+    }
+
+    const shouldRefresh =
+      existing.sourceUrl !== parsed.source_url ||
+      existing.sourceConfidence !== parsed.source_confidence ||
+      existing.lastChecked.getTime() !== parsed.last_checked.getTime();
+    if (!shouldRefresh) return { outcome: 'noop', id: existing.id };
+
+    await tx
+      .update(mrPlanPrices)
+      .set({
+        sourceUrl: parsed.source_url,
+        sourceConfidence: parsed.source_confidence,
+        lastChecked: parsed.last_checked,
+        updatedAt: sql`now()`,
+      })
+      .where(eq(mrPlanPrices.id, existing.id));
+    return { outcome: 'refreshed', id: existing.id };
+  });
+
+  if (
+    result.outcome === 'inserted' ||
+    result.outcome === 'refreshed' ||
+    result.outcome === 'conflict'
+  ) {
     await runSnapshotRebuild({ dbh });
   }
   return result;

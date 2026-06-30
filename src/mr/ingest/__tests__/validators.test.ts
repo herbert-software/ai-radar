@@ -8,8 +8,10 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  getMrPlanPriceStatus,
   mrLimitTypeSchema,
   mrCurrencySchema,
+  mrPlanPriceSchema,
   mrPriceAmountSchema,
 } from '../../../db/mr-schema.zod.js';
 import {
@@ -213,6 +215,65 @@ describe('1.6 confidence↔price 绑定（共享 schema，发 SQL 前拒）', ()
       mrPriceHistoryWriteSchema.parse({ currency: 'CNY', sourceConfidence: 'official_pricing' })
         .sourceConfidence,
     ).toBe('official_pricing');
+  });
+});
+
+describe('add-model-radar-price-state-and-periods：周期价 Zod 地基', () => {
+  const base = {
+    plan_id: 'plan-1',
+    billing_period: 'annual',
+    currency: 'CNY',
+    source_url: 'https://example.com/pricing',
+    last_checked: new Date('2026-06-30T00:00:00.000Z'),
+  } as const;
+
+  it('只接受 quarterly/annual，拒 monthly 镜像行', () => {
+    expect(
+      mrPlanPriceSchema.safeParse({
+        ...base,
+        billing_period: 'quarterly',
+        price: '120.00',
+        source_confidence: 'official_doc',
+      }).success,
+    ).toBe(true);
+    expect(
+      mrPlanPriceSchema.safeParse({
+        ...base,
+        billing_period: 'monthly',
+        price: '40.00',
+        source_confidence: 'official_doc',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('逐行守 confidence↔price：非官方 confidence 不得带非 NULL price，NULL 占位合法', () => {
+    expect(
+      mrPlanPriceSchema.safeParse({
+        ...base,
+        price: '468.00',
+        source_confidence: 'official_doc',
+      }).success,
+    ).toBe(true);
+    expect(
+      mrPlanPriceSchema.safeParse({
+        ...base,
+        price: '468.00',
+        source_confidence: 'needs_login_recheck',
+      }).success,
+    ).toBe(false);
+    expect(
+      mrPlanPriceSchema.safeParse({
+        ...base,
+        price: null,
+        source_confidence: 'needs_login_recheck',
+      }).success,
+    ).toBe(true);
+  });
+
+  it("周期价 priceStatus='known' iff price 非 NULL + official confidence", () => {
+    expect(getMrPlanPriceStatus({ price: '468.00', source_confidence: 'official_pricing' })).toBe('known');
+    expect(getMrPlanPriceStatus({ price: '468.00', source_confidence: 'official_community' })).toBe('unknown');
+    expect(getMrPlanPriceStatus({ price: null, source_confidence: 'official_doc' })).toBe('unknown');
   });
 });
 

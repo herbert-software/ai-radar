@@ -82,6 +82,7 @@ async function cleanup() {
     await db.delete(schema.mrPlanModels).where(inArray(schema.mrPlanModels.planId, planIds));
     await db.delete(schema.mrPlanClients).where(inArray(schema.mrPlanClients.planId, planIds));
     await db.delete(schema.mrPlanLimits).where(inArray(schema.mrPlanLimits.planId, planIds));
+    await db.delete(schema.mrPlanPrices).where(inArray(schema.mrPlanPrices.planId, planIds));
     await db
       .delete(schema.mrReviewFlag)
       .where(and(eq(schema.mrReviewFlag.targetType, 'plan'), inArray(schema.mrReviewFlag.targetId, planIds)));

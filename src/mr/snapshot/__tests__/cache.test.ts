@@ -55,6 +55,7 @@ function makePlan(overrides: Partial<SnapshotPlan> = {}): SnapshotPlan {
     vendorName: 'Vendor',
     name: 'Coding Plan Pro',
     category: 'coding_plan',
+    availability: 'unknown',
     currentPrice: '20.00',
     currency: 'USD',
     priceStatus: 'known',
@@ -65,6 +66,7 @@ function makePlan(overrides: Partial<SnapshotPlan> = {}): SnapshotPlan {
     },
     freshness: { stale: false },
     reviewStatus: { pending: false },
+    periodPrices: [],
     models: [],
     clients: [],
     limits: [],
@@ -109,6 +111,8 @@ describe('5.2 版本 = 服务表征内容哈希（纯函数）', () => {
       name: 'Coding Plan Pro',
       vendorName: 'Vendor',
       vendorId: 'v1',
+      periodPrices: [],
+      availability: 'unknown',
       id: 'p1',
     };
     const b = makeSnapshot([reordered]);
@@ -131,6 +135,69 @@ describe('5.2 版本 = 服务表征内容哈希（纯函数）', () => {
     const clean = computeSnapshotVersion(makeSnapshot([makePlan({ reviewStatus: { pending: false } })]));
     const pending = computeSnapshotVersion(makeSnapshot([makePlan({ reviewStatus: { pending: true } })]));
     expect(pending).not.toBe(clean);
+  });
+
+  it('availability 变化 → version 变', () => {
+    const v0 = computeSnapshotVersion(makeSnapshot([makePlan({ availability: 'on_sale' })]));
+    const v1 = computeSnapshotVersion(makeSnapshot([makePlan({ availability: 'discontinued' })]));
+    expect(v1).not.toBe(v0);
+  });
+
+  it('period row price/provenance/date/effectiveMonthly 变化 → version 变；无变更 rebuild 稳定', () => {
+    const period = {
+      billingPeriod: 'annual' as const,
+      price: '468.00',
+      currency: 'CNY' as const,
+      priceStatus: 'known' as const,
+      provenance: {
+        sourceUrl: 'https://x/annual',
+        sourceConfidence: 'official_pricing' as const,
+        lastCheckedDate: '2026-06-20',
+      },
+      effectiveMonthly: 39,
+    };
+    const base = makeSnapshot([makePlan({ currency: 'CNY', periodPrices: [period] })]);
+    const same = makeSnapshot([makePlan({ currency: 'CNY', periodPrices: [{ ...period }] })]);
+    expect(computeSnapshotVersion(same)).toBe(computeSnapshotVersion(base));
+
+    const priceChanged = makeSnapshot([
+      makePlan({
+        currency: 'CNY',
+        periodPrices: [{ ...period, price: '456.00' }],
+      }),
+    ]);
+    const effectiveMonthlyChanged = makeSnapshot([
+      makePlan({
+        currency: 'CNY',
+        periodPrices: [{ ...period, effectiveMonthly: 38 }],
+      }),
+    ]);
+    const provenanceChanged = makeSnapshot([
+      makePlan({
+        currency: 'CNY',
+        periodPrices: [
+          {
+            ...period,
+            provenance: { ...period.provenance, sourceUrl: 'https://x/new-annual' },
+          },
+        ],
+      }),
+    ]);
+    const dateChanged = makeSnapshot([
+      makePlan({
+        currency: 'CNY',
+        periodPrices: [
+          {
+            ...period,
+            provenance: { ...period.provenance, lastCheckedDate: '2026-06-21' },
+          },
+        ],
+      }),
+    ]);
+    expect(computeSnapshotVersion(priceChanged)).not.toBe(computeSnapshotVersion(base));
+    expect(computeSnapshotVersion(effectiveMonthlyChanged)).not.toBe(computeSnapshotVersion(base));
+    expect(computeSnapshotVersion(provenanceChanged)).not.toBe(computeSnapshotVersion(base));
+    expect(computeSnapshotVersion(dateChanged)).not.toBe(computeSnapshotVersion(base));
   });
 });
 

@@ -74,6 +74,7 @@ async function cleanup() {
   if (srcIds.length) {
     await db.delete(schema.mrPlanSources).where(inArray(schema.mrPlanSources.sourceId, srcIds));
   }
+  await db.delete(schema.mrPlanPrices).where(like(schema.mrPlanPrices.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanLimits).where(like(schema.mrPlanLimits.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlans).where(like(schema.mrPlans.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrSource).where(like(schema.mrSource.sourceUrl, `${PREFIX}%`));
