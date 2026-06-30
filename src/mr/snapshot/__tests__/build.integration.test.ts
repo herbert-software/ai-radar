@@ -37,6 +37,8 @@ const describeIfDb = databaseUrl ? describe : describe.skip;
 
 const OLD = new Date('2000-01-01T00:00:00Z');
 const NOW = new Date();
+// build.ts env-clean 后 thresholdDays 必填、无默认；显式喂 = env.MR_STALENESS_THRESHOLD_DAYS 默认（与排程同口径），保行为等价。
+const THRESHOLD_DAYS = 30;
 
 async function cleanup() {
   if (!db) return;
@@ -96,7 +98,7 @@ async function makePlan(vendorId: string, suffix: string, opts: PlanOpts = {}): 
 
 /** 取快照中指定 id 的 plan（builder 全局读，按 id 定位本套件行）。 */
 async function snapPlan(planId: string) {
-  const snap = await buildModelRadarSnapshot(db!, NOW);
+  const snap = await buildModelRadarSnapshot(db!, NOW, THRESHOLD_DAYS);
   return snap.plans.find((p) => p.id === planId);
 }
 
@@ -245,7 +247,7 @@ describeIfDb('2.5 快照构建', () => {
       })
       .returning();
     try {
-      await expect(buildModelRadarSnapshot(db!, NOW)).rejects.toThrow();
+      await expect(buildModelRadarSnapshot(db!, NOW, THRESHOLD_DAYS)).rejects.toThrow();
     } finally {
       // 立即清理，避免坏 flag 污染同库其它套件的全局快照构建。
       await db!.delete(schema.mrReviewFlag).where(eq(schema.mrReviewFlag.id, bad!.id));
@@ -272,7 +274,7 @@ describeIfDb('2.5 快照构建', () => {
       })
       .returning();
     try {
-      await expect(buildModelRadarSnapshot(db!, NOW)).rejects.toThrow();
+      await expect(buildModelRadarSnapshot(db!, NOW, THRESHOLD_DAYS)).rejects.toThrow();
     } finally {
       // 立即清理坏 junction，避免污染同库其它套件的全局快照构建。
       await db!.delete(schema.mrPlanModels).where(eq(schema.mrPlanModels.id, pm!.id));
@@ -388,7 +390,7 @@ describeIfDb('2.5 快照构建', () => {
       expect(planBId).toBeDefined();
 
       // 未提交 → plan B 及其 limit 原子不可见。
-      const snap1 = await buildModelRadarSnapshot(db!, NOW);
+      const snap1 = await buildModelRadarSnapshot(db!, NOW, THRESHOLD_DAYS);
       expect(snap1.plans.find((p) => p.id === planBId)).toBeUndefined();
 
       // 提交。
@@ -396,7 +398,7 @@ describeIfDb('2.5 快照构建', () => {
       await writer;
 
       // 提交后 → plan B 与其 limit 原子可见（不撕裂）。
-      const snap2 = await buildModelRadarSnapshot(db!, NOW);
+      const snap2 = await buildModelRadarSnapshot(db!, NOW, THRESHOLD_DAYS);
       const found = snap2.plans.find((p) => p.id === planBId);
       expect(found).toBeDefined();
       expect(found!.limits).toHaveLength(1);
@@ -423,7 +425,7 @@ describeIfDb('2.5 快照构建', () => {
       })
       .returning();
     try {
-      await expect(buildModelRadarSnapshot(db!, NOW)).rejects.toThrow();
+      await expect(buildModelRadarSnapshot(db!, NOW, THRESHOLD_DAYS)).rejects.toThrow();
     } finally {
       // 立即清理，避免坏行污染同库其它套件的全局快照构建。
       await db!.delete(schema.mrPlans).where(eq(schema.mrPlans.id, bad!.id));

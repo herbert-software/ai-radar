@@ -30,14 +30,22 @@
  */
 import { createHash } from 'node:crypto';
 import { db as defaultDb } from '../../db/index.js';
+import { env } from '../../config/env.js';
 import { buildModelRadarSnapshot } from './build.js';
 import type { ModelRadarSnapshot } from './dto.js';
 
 /** db 句柄类型（drizzle 实例或事务），对齐 build.ts。 */
 type DbLike = typeof defaultDb;
 
-/** 快照构建函数签名（默认真 builder；测试注入桩验缓存语义，不触 DB）。 */
-export type SnapshotBuildFn = (dbh: DbLike, now: Date) => Promise<ModelRadarSnapshot>;
+/**
+ * 快照构建函数签名（默认真 builder；测试注入桩验缓存语义，不触 DB）。
+ * `thresholdDays` 由 cache 显式喂（build.ts env-clean 后无默认，design D5）——cache 只在 app 进程跑、import env 无妨。
+ */
+export type SnapshotBuildFn = (
+  dbh: DbLike,
+  now: Date,
+  thresholdDays: number,
+) => Promise<ModelRadarSnapshot>;
 
 /** 缓存条目：服务表征快照 + 其内容哈希（= 公开 version/ETag）。 */
 export interface CachedSnapshot {
@@ -97,7 +105,8 @@ export async function rebuildModelRadarSnapshot(
   if (inFlight) return inFlight;
   // 先 build（可抛）；抛错时不执行替换 → cached 不变（fail-closed，不覆盖旧快照）。finally 清空 inFlight 使下次可重试。
   inFlight = (async () => {
-    const snapshot = await buildFn(dbh, now);
+    // 显式喂 staleness 阈值（build.ts env-clean 后必填、无默认）：与排程/MCP 同口径 `MR_STALENESS_THRESHOLD_DAYS`。
+    const snapshot = await buildFn(dbh, now, env.MR_STALENESS_THRESHOLD_DAYS);
     const version = computeSnapshotVersion(snapshot);
     cached = { snapshot, version };
     return cached;

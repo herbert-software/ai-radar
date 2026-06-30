@@ -1,7 +1,7 @@
 /**
  * Model Radar（P5 / 5c，add-model-radar-compare-api）只读快照构建器（task 2.2/2.3/2.4，design D1/D2/D8）。
  *
- * `buildModelRadarSnapshot(db, now)`：在**单事务 point-in-time 一致**视图内读构建所需 9 张 `mr_*`，
+ * `buildModelRadarSnapshot(db, now, thresholdDays)`：在**单事务 point-in-time 一致**视图内读构建所需 9 张 `mr_*`，
  * 去规范化为 `ModelRadarSnapshot`，经 Zod 校验后返回。
  *
  * 读 9 张表（**不读** `mr_price_history`——比价只需 current 价；**不读** `mr_catalog_version`——5c 公开
@@ -28,8 +28,9 @@
  * fail-closed（task 2.4 / spec「schema 校验失败不对外服务」）：构建结果缺必需 provenance/非法枚举/引用悬空时
  * 抛错、**不返回坏快照**。缓存/不覆盖旧快照/冷启动 503 是组 D 缓存层职责——本 builder 只保证校验失败抛错。
  */
-import { db as defaultDb } from '../../db/index.js';
-import { env } from '../../config/env.js';
+// env-clean（design D5）：仅 `type DbLike = typeof defaultDb` 用 → `import type`（verbatimModuleSyntax 下运行期擦除），
+// 使 MCP 进程（仅 DATABASE_URL）可 `await import` 本模块而**不**触 `db/index.ts`→`config/env.ts` 的全局 parseEnv。
+import type { db as defaultDb } from '../../db/index.js';
 import {
   isOfficialConfidence,
   mrReviewFlagStatusSchema,
@@ -90,13 +91,15 @@ function groupBy<T>(rows: readonly T[], key: (r: T) => string): Map<string, T[]>
  *
  * @param dbh    db 实例或已开事务句柄（注入桩/集成测用）。
  * @param now    参考时刻（**可注入**：供 CI 断言陈旧/阈值穿越）。staleness 阈值 = now − thresholdDays。
- * @param thresholdDays 陈旧阈值天数（默认 env.MR_STALENESS_THRESHOLD_DAYS，与排程同源）。
+ * @param thresholdDays 陈旧阈值天数（**必填**，由调用方显式喂同一 `MR_STALENESS_THRESHOLD_DAYS` 口径——
+ *   app 进程经 cache.ts 喂 `env.MR_STALENESS_THRESHOLD_DAYS`、MCP 进程经 `mcpEnvSchema` 同源值；
+ *   env-clean 后本模块不再顶层 import `config/env.ts`，故不设默认值）。
  * @returns 经 Zod 校验的快照；校验失败时**抛错**（fail-closed，不返回坏快照）。
  */
 export async function buildModelRadarSnapshot(
   dbh: DbLike,
   now: Date,
-  thresholdDays: number = env.MR_STALENESS_THRESHOLD_DAYS,
+  thresholdDays: number,
 ): Promise<ModelRadarSnapshot> {
   const threshold = new Date(now.getTime() - thresholdDays * DAY_MS);
 

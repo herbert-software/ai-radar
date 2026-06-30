@@ -11,7 +11,6 @@ import { describe, expect, it } from 'vitest';
 import {
   ageBadge,
   cheapestInfo,
-  estimateRounds,
   facetOptions,
   freshnessSortKey,
   oldestFactBadge,
@@ -20,6 +19,7 @@ import {
   sortPlansByFreshness,
   sourceHost,
 } from '../render.js';
+import { estimateRounds } from '../../snapshot/limits.js';
 import { client, group, known, limit, model, source, unknown } from './fixtures.js';
 
 describe('7.4 per-fact age 徽标 live（render_now − lastCheckedDate，相对文案只在 render 层算）', () => {

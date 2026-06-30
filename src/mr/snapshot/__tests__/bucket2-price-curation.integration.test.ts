@@ -56,6 +56,8 @@ const db = pool ? drizzle(pool, { schema }) : null;
 const describeIfDb = isLocalDb ? describe : describe.skip;
 
 const SEED_NORMALIZED_NAMES = SEED_VENDORS.map((v) => v.normalizedName);
+// build.ts env-clean 后 thresholdDays 必填、无默认；显式喂 = env.MR_STALENESS_THRESHOLD_DAYS 默认（与排程同口径），保行为等价。
+const THRESHOLD_DAYS = 30;
 
 /** 按 fixture 的 vendor normalized_name 反查并清理全部自造行（无前缀，按 vendor 链下钻删；仿 seed.integration）。 */
 async function cleanup() {
@@ -116,7 +118,7 @@ describeIfDb('2.1/2.3 桶2 真价策展 → 快照 → 比价分组退出验证'
           .where(inArray(schema.mrVendors.normalizedName, SEED_NORMALIZED_NAMES))
       ).map((v) => v.id),
     );
-    const snapshot = await buildModelRadarSnapshot(db!, new Date());
+    const snapshot = await buildModelRadarSnapshot(db!, new Date(), THRESHOLD_DAYS);
     const seedPlans = snapshot.plans.filter((p) => seedVendorIds.has(p.vendorId));
 
     const { groups } = queryModelRadarSnapshot(

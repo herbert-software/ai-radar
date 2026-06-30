@@ -212,6 +212,14 @@ describe('5.1/5.4 缓存 fail-closed + 失效 + 只读命中', () => {
     await getModelRadarSnapshot(dummyDb, NOW, build);
     expect(build).toHaveBeenCalledTimes(1);
   });
+
+  it('cache 显式喂 thresholdDays 给 buildFn（build.ts env-clean 后必填、无默认；design D5）', async () => {
+    // build.ts 删 `import { env }` 后 thresholdDays 必填；cache 须从 env.MR_STALENESS_THRESHOLD_DAYS 显式喂。
+    // 钉死「cache 喂第三参（number）」——否则 build.ts env-clean 后会用到 undefined 阈值（NaN 全陈旧）。
+    const spy = vi.fn(async () => makeSnapshot());
+    await rebuildModelRadarSnapshot(dummyDb, NOW, spy);
+    expect(spy).toHaveBeenCalledWith(dummyDb, NOW, expect.any(Number));
+  });
 });
 
 describe('5.3b rebuild job body never-throws（fail-closed）', () => {

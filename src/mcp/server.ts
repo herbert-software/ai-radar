@@ -1,7 +1,7 @@
 /**
  * MCP 查询 server 入口（design D1/D7/D8，task 2.2）。
  *
- * 与流水线**并列的独立查询进程**（stdio transport）：暴露 7 工具（5 查询 + 2 标记 + push_event_now），
+ * 与流水线**并列的独立查询进程**（stdio transport）：暴露 8 工具（5 查询含 recommend_coding_subscription + 2 标记 + push_event_now），
  * **绝不参与主流程调度**——不 import/注册任何 cron/BullMQ/worker/runDailyWorkflow。
  *
  * **N2 / D8（堵传递 import 崩纯查询）**：本文件 top-level **只** static import MCP 自带的宽松 env、
@@ -68,7 +68,7 @@ async function main(): Promise<void> {
   // 设置运行上下文一次：各 handler（组 B/C 实现）经 getContext() 取 env + db。
   setContext({ env, db });
 
-  // 3. 建 McpServer + 注册全部 7 工具（统一 registerTool）。
+  // 3. 建 McpServer + 注册全部 8 工具（统一 registerTool）。
   const server = new McpServer({
     name: 'ai-radar-mcp',
     version: '0.1.0',

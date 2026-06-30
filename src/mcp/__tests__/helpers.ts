@@ -4,7 +4,7 @@
  * 两种被测姿势：
  *   ① 直接调 `xxxTool.handler(args, {})`——验 handler 内部契约（DB 行为、isError、幂等）。
  *      调前须 `setContext({ env, db })` 注入测试 db + 局部宽松 env（含 PUSH_TIMEZONE）。
- *   ② 经真 `McpServer`（registerTool 全部 7 工具，与 server.ts 同口径）+ `Client`（InMemoryTransport
+ *   ② 经真 `McpServer`（registerTool 全部 8 工具，与 server.ts 同口径）+ `Client`（InMemoryTransport
  *      成对）——验 **SDK 层**契约：list_tools、入参依 inputSchema 自动拒、声明 outputSchema 则
  *      structuredContent 被强制校验。
  *
@@ -44,12 +44,13 @@ export function makeEnv(overrides: Partial<McpEnv> = {}): McpEnv {
   return {
     DATABASE_URL: databaseUrl ?? 'postgres://x:x@localhost:5432/x',
     PUSH_TIMEZONE: 'Asia/Shanghai',
+    MR_STALENESS_THRESHOLD_DAYS: 30,
     ...overrides,
   };
 }
 
 /**
- * 起一个真 McpServer（注册全部 7 工具，与 server.ts 同口径）并经 InMemoryTransport 连一个 Client。
+ * 起一个真 McpServer（注册全部 8 工具，与 server.ts 同口径）并经 InMemoryTransport 连一个 Client。
  *
  * 用于验 SDK 层契约（list_tools / 入参自动校验 / outputSchema 强制校验）。调用方负责先 setContext。
  *

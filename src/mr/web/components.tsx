@@ -10,10 +10,10 @@
 import type { FC, PropsWithChildren } from 'hono/jsx';
 import { mrCurrencySchema } from '../../db/mr-schema.zod.js';
 import type { SnapshotPlan, SnapshotPlanGroup, SnapshotProvenance } from '../snapshot/dto.js';
+import { estimateRounds } from '../snapshot/limits.js';
 import {
   ageBadge,
   cheapestInfo,
-  estimateRounds,
   oldestFactBadge,
   resolveTokensPerRound,
   safeHref,

@@ -61,6 +61,8 @@ const db = pool ? drizzle(pool, { schema }) : null;
 const describeIfDb = databaseUrl ? describe : describe.skip;
 
 const NOW = new Date();
+// build.ts env-clean 后 thresholdDays 必填、无默认；显式喂 = env.MR_STALENESS_THRESHOLD_DAYS 默认（与 cache/排程同口径），保行为等价。
+const THRESHOLD_DAYS = 30;
 
 async function cleanup() {
   if (!db) return;
@@ -236,12 +238,12 @@ describeIfDb('5.4 rebuild 耦合 + 版本失效', () => {
 
     // 按本套件 plan id 过滤后哈希（隔离同库其它行的 staleness 干扰）。
     const versionAt = async (now: Date): Promise<string> => {
-      const snap = await buildModelRadarSnapshot(db!, now);
+      const snap = await buildModelRadarSnapshot(db!, now, THRESHOLD_DAYS);
       const plan = snap.plans.find((p) => p.id === planId)!;
       return computeSnapshotVersion({ plans: [plan] });
     };
     const staleAt = async (now: Date): Promise<boolean> => {
-      const snap = await buildModelRadarSnapshot(db!, now);
+      const snap = await buildModelRadarSnapshot(db!, now, THRESHOLD_DAYS);
       return snap.plans.find((p) => p.id === planId)!.freshness.stale;
     };
 
@@ -291,7 +293,7 @@ describeIfDb('4.2 周期 rebuild body（注入推进 now）：stale 翻转 + fla
 
     // 隔离 version：按本套件 plan id 过滤后哈希，避免同库其它行 staleness 跨 now 翻转污染全局哈希。
     const isoVersion = async (now: Date): Promise<string> => {
-      const snap = await buildModelRadarSnapshot(db!, now);
+      const snap = await buildModelRadarSnapshot(db!, now, THRESHOLD_DAYS);
       return computeSnapshotVersion({ plans: [snap.plans.find((p) => p.id === planId)!] });
     };
 

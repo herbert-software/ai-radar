@@ -6,7 +6,8 @@
  * render 层算、**绝不进快照内容哈希 / 不碰 money-path**（最划算/价格排序仍由 queryModelRadarSnapshot 决定，
  * 见 model-radar-page.tsx）。
  */
-import type { SnapshotLimit, SnapshotPlan, SnapshotPlanGroup } from '../snapshot/dto.js';
+import type { SnapshotPlan, SnapshotPlanGroup } from '../snapshot/dto.js';
+import { DEFAULT_TOKENS_PER_ROUND } from '../snapshot/limits.js';
 
 const MS_PER_DAY = 86_400_000;
 
@@ -210,54 +211,17 @@ export const TOKENS_PER_ROUND_OPTIONS = [
   { value: 40_000, label: '重度 ≈40k/轮' },
 ] as const;
 
-/** 默认每轮 token 假设（保守中等值；可经 query-param 覆盖。ponytail: 物理世界靠这颗旋钮校准，模型看不见真实耗用）。 */
-export const DEFAULT_TOKENS_PER_ROUND = 15_000;
-
 /** 合法旋钮值白名单（= 预设三档；旋钮是 `<select>`，合法值只有这三个）。 */
 const TOKENS_PER_ROUND_VALUES = new Set<number>(TOKENS_PER_ROUND_OPTIONS.map((o) => o.value));
-
-/** 区间假设展宽（±50%）：每轮实际耗 token 落在 (1±SPREAD)·假设 内 → 轮次上下界。 */
-const ESTIMATE_SPREAD = 0.5;
 
 /**
  * 解析 query-param `tokensPerRound`（web-only，**不入 .strict() schema / 不进哈希**）。
  * 只认预设三档（白名单）：非预设值（含 crafted `5e-324`/`9999` 等任意有限正数）→ 默认——
  * 既防 `total/极小假设` 算出 Infinity/巨数误导估算，也保证下拉回显与生效值一致。
+ * （`estimateRounds`/`DEFAULT_TOKENS_PER_ROUND` 等估算核心已下沉至 `src/mr/snapshot/limits.ts`、render 改 import。）
  */
 export function resolveTokensPerRound(raw: string | undefined): number {
   if (raw == null) return DEFAULT_TOKENS_PER_ROUND;
   const n = Number(raw);
   return TOKENS_PER_ROUND_VALUES.has(n) ? n : DEFAULT_TOKENS_PER_ROUND;
-}
-
-export interface RoundsEstimate {
-  /** 估算依据的限额事实（快照既供，不引新事实）。 */
-  basis: { limitType: string; value: string; window: string };
-  tokensPerRound: number;
-  /** 轮次下界（每轮偏耗）/上界（每轮偏省），向下取整。 */
-  low: number;
-  high: number;
-}
-
-/**
- * 估算中等任务轮次区间（task 5.1 / design D5）：取首个 token 额度限额事实（`monthly_tokens`、`value` 非 null）
- * ÷「每轮 token 假设」→ 区间（±50% 给上下界）。**只在快照既供限额上算、绝不引快照外新事实、绝不进内容哈希**。
- * 无 token 额度 / `value` 为 NULL（不限/占位）/ 旋钮非正 → 返回 null（render 不输出区间，不 NaN、不抛）。
- * ponytail: 只认 `monthly_tokens`——本页 gate 到 coding_plan，credit/fast_pass（Token Plan / 快速通道）非按 token 计，要时再扩。
- */
-export function estimateRounds(
-  limits: SnapshotLimit[],
-  tokensPerRound: number,
-): RoundsEstimate | null {
-  if (!Number.isFinite(tokensPerRound) || tokensPerRound <= 0) return null;
-  const tokenLimit = limits.find((l) => l.limitType === 'monthly_tokens' && l.value !== null);
-  if (!tokenLimit || tokenLimit.value === null) return null;
-  const total = Number(tokenLimit.value);
-  if (!Number.isFinite(total) || total <= 0) return null;
-  return {
-    basis: { limitType: tokenLimit.limitType, value: tokenLimit.value, window: tokenLimit.window },
-    tokensPerRound,
-    low: Math.floor(total / (tokensPerRound * (1 + ESTIMATE_SPREAD))),
-    high: Math.floor(total / (tokensPerRound * (1 - ESTIMATE_SPREAD))),
-  };
 }

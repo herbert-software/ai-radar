@@ -29,6 +29,9 @@ const mcpEnvSchema = z.object({
   // 真正的 sender 工厂由 push_event_now handler 动态 import，本处不读其内容做发送。
   FEISHU_WEBHOOK_URL: z.string().url().optional(),
   FEISHU_SIGN_SECRET: z.string().min(1).optional(),
+  // Model Radar 快照陈旧阈值天数（与 `src/config/env.ts` 同口径/同默认，**不硬编码裸常量**、防 stale 口径漂移）：
+  // recommend_coding_subscription handler 现 build 快照时显式喂给 env-clean 的 build.ts（design D5）。
+  MR_STALENESS_THRESHOLD_DAYS: z.coerce.number().int().positive().default(30),
 });
 
 /** MCP 宽松 env 类型。 */
