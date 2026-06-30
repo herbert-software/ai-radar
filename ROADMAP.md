@@ -20,13 +20,13 @@
 | **P2** ✅ | 扩源 + 双通道 + 产品发现 | 3–4 周 | W5 ~ W8 | 07-14 ~ 08-10 | 一线大厂官方 RSS（OpenAI/DeepMind/HuggingFace，T1）/Product Hunt/arXiv collector、飞书通道、`ai_products` 表 + **硬规则产品合并**、实时重大发布告警、周报。**Reddit 经鉴权/限流调研移出关键路径**（条款风险，详见 `expand-sources-dual-channel-products` 提案非目标）；Meta/Anthropic 无原生 RSS 的 HTML 抓取列 T2 次批（Mistral 经实测有原生 RSS，已随后续扩源接入，连同 Microsoft AI） | P1 | **退出标准达成**（见下「P2 退出标准达成」）：双通道均不重复推；每日产品发现推送；实时告警跑通；周报跑通 |
 | **P3** ✅ | 语义去重 + 知识库 | 3–4 周 | W9 ~ W12 | 08-11 ~ 09-07 | pgvector embedding 去重 + LLM 二次判断、`ai_news_events` 事件合并、KB 入库（本地表 → Dify HTTP）、只入 `long_term_value≥70` | P2 + 真实数据积累 | **退出标准达成**（见下「P3 退出标准达成」，阈值实测复校列为持续运营动作）：中英文同一事件被识别为一条；KB 可检索 |
 | **P4** ✅ | MCP 查询入口 | 1.5–2 周 | W9 ~ W11（与 P3 并行） | 08-11 ~ 08-24 | MCP server：`get_today_ai_digest` / `search_ai_events` / `search_ai_products` / `mark_*` / `push_event_now` | P2 | **退出标准达成**（见下「P4 退出标准达成」）：从 Claude/Cursor 查到当日日报与历史 |
-| **P5** ⭐ | **Model Radar — 编程订阅比价 + 选型（编程垂类，已提优先级，现关键路径下一步）** | 5–7 周 | —（P0–P4 提前完成，按日历重定基线） | 06-25 ~ 08-09 | 见下「[P5 Model Radar 步骤拆解](#p5-model-radar-步骤拆解)」5a–5e：数据模型+provenance / 录入+保鲜回路 / 桶2数据+比价检索API / Web 比价页 / 垂类选型推荐器 | P2（产品·事件流）+ P4（MCP） | 比价页 10s 内答「谁含 GLM-5.2 / 谁支持 Claude Code / 同档谁最划算 / 谁最近变了」；每条价/兼容/额度带 `source_url`+`last_checked`+`source_confidence`；陈旧项可被 ai-radar 变更流标「待复核」 |
+| **P5** ✅ | **Model Radar — 编程订阅比价 + 选型（编程垂类，5a–5e 全部落地并归档）** | 5–7 周 | —（P0–P4 提前完成，按日历重定基线） | 06-25 ~ 08-09 | 见下「[P5 Model Radar 步骤拆解](#p5-model-radar-步骤拆解)」5a–5e：数据模型+provenance / 录入+保鲜回路 / 桶2数据+比价检索API / Web 比价页 / 垂类选型推荐器 | P2（产品·事件流）+ P4（MCP） | **退出标准达成**：比价页 10s 内答「谁含 GLM-4.6 / 谁支持 Claude Code / 同档谁最划算 / 谁最近变了」（5d-B）；推荐器答「重度 Claude Code + GLM-4.6 最便宜可用」+ 撞窗 + 月成本 + 依据（5e）；每条价/兼容/额度带 `source_url`+`last_checked`+`source_confidence`；陈旧项可被 ai-radar 变更流标「待复核」 |
 | **P6** | 泛化选型顾问（原 P5：任意工具 / 任意任务） | 3–5 周 | — | Model Radar 之后 | `ai_tools` + `task_patterns` 表、规则召回、RAG、LLM 解释、`recommend_ai_tools_for_task`；把 Model Radar 验证过的「规则召回 → RAG → LLM 解释」推荐器从编程订阅垂类泛化到「做某事用哪个 AI 工具」 | P5 | 「内部知识库选 Dify/RAGFlow/FastGPT」给出首选/备选/不推荐/落地步骤 |
 | **P7** | Web 控制台（内部人工干预面板，可选） | 按需 | — | — | 复用 P5 前端栈的人工干预面板 | P5 | — |
 
-**关键路径**：P0 → P1 → P2 → P3 → **P5（Model Radar）**。P0–P4 已上线（含情报流 / 双通道 / 语义去重 / 知识库 / MCP）；**下一关键里程碑 = P5 Model Radar**（约 **5–7 周**），泛化顾问（P6）作为其超集后置。
+**关键路径**：P0 → P1 → P2 → P3 → **P5（Model Radar）✅**。P0–P5 已上线（含情报流 / 双通道 / 语义去重 / 知识库 / MCP / **Model Radar 比价页 + 选型推荐器**）；**P5 Model Radar 全部步骤（5a–5e）落地完毕**，下一里程碑 = **P6 泛化选型顾问**（Model Radar 超集，把验证过的「规则召回 → RAG → LLM 解释」从编程垂类泛化到「做某事用哪个 AI 工具」）。
 
-> **进度（截至 2026-06-30）**：**P0–P4 关键路径全部落地**，外加 roadmap 外的「AI 博主经验挖掘」链（归档 `add-ai-blogger-experience-mining`）。**P5 Model Radar：5a / 5b / 5c / 5d-A / 5d-B 已落地并归档**——5a 数据模型（`add-model-radar-data-model`）、5b 录入+保鲜回路+三档抓取变更检测（`add-model-radar-ingestion-freshness`，PR #45）、5c 比价/检索 API + 只读快照 + 桶2数据红线（`add-model-radar-compare-api`，PR #46）、5d-A 快照跨进程失效 Redis pub/sub + 服务进程周期 rebuild（`add-model-radar-snapshot-cross-process-invalidation`，PR #47）、5d-B Hono JSX SSR 比价 Web 页 + per-fact age 徽标（`add-model-radar-compare-web-page`，PR #48）；主规范现有 `model-radar-catalog`(5a) / `model-radar-ingestion`(5b+5c 红线) / `model-radar-compare-api`(5c+5d-A) / `model-radar-compare-web`(5d-B) 四谱。**5d-C 桶2真价人工策展已实现**（PR #49：经既有授权改价入口录入 6 家 CNY 官方真月价，比价页转出真实最划算 = 讯飞 ¥19；browser egress 生产启用 + 自动抓取已**拆出延后**为独立步骤，见步骤表）。**下一步 = 5e（推荐器 + MCP）**；原通用「AI 工具选型顾问」为 P6 泛化目标。未结持续运营动作：P3 语义阈值真实数据复校（见下「P3 退出标准达成」）、桶2 真实价格策展（**5d-C 已录 6 家 CNY 官方真月价**、比价页转出真实 cheapest；browser egress 启用已拆出延后、不为前置）。
+> **进度（截至 2026-06-30）**：**P0–P4 关键路径全部落地**，外加 roadmap 外的「AI 博主经验挖掘」链（归档 `add-ai-blogger-experience-mining`）。**P5 Model Radar：5a / 5b / 5c / 5d-A / 5d-B / 5d-C / 5e 全部落地并归档**——5a 数据模型（`add-model-radar-data-model`）、5b 录入+保鲜回路+三档抓取变更检测（`add-model-radar-ingestion-freshness`，PR #45）、5c 比价/检索 API + 只读快照 + 桶2数据红线（`add-model-radar-compare-api`，PR #46）、5d-A 快照跨进程失效 Redis pub/sub + 服务进程周期 rebuild（`add-model-radar-snapshot-cross-process-invalidation`，PR #47）、5d-B Hono JSX SSR 比价 Web 页 + per-fact age 徽标（`add-model-radar-compare-web-page`，PR #48）、5d-C 桶2真价人工策展（`add-model-radar-bucket2-price-curation`，PR #49：经既有授权改价入口录 6 家 CNY 官方真月价，比价页转出真实最划算 = 讯飞 ¥19）、**5e 垂类选型推荐器 v1（规则 + 模板）+ MCP 单工具**（`add-model-radar-recommender`，PR #50：vetted money-path 召回 + `fitsWindow` 撞窗纯数值原语 + 四态有序 verdict + 模板解释层 + env-clean MCP `recommend_coding_subscription`；退出用例「重度 Claude Code + GLM-4.6」→ 首选 GLM Lite ¥49）；主规范现有 `model-radar-catalog`(5a) / `model-radar-ingestion`(5b+5c 红线) / `model-radar-compare-api`(5c+5d-A) / `model-radar-compare-web`(5d-B) / `model-radar-recommender`(5e) 五谱。**P5 Model Radar 全部步骤（5a–5e）落地完毕**（browser egress 生产启用 + 自动抓取已**拆出延后**为独立步骤、不在 P5 关键路径，见步骤表）；下一步 = **P6 泛化选型顾问**（Model Radar 超集，把「规则召回 → RAG → LLM 解释」从编程垂类泛化）或持续运营。未结持续运营动作：P3 语义阈值真实数据复校（见下「P3 退出标准达成」）；**5e v2**（RAG 证据 + LLM 解释，仅换可插拔解释层、召回不动）。
 
 ## P5 Model Radar 步骤拆解
 
@@ -58,7 +58,7 @@
 | **5d-B** ✅ | Web 比价页（项目**首个真前端**，Hono JSX SSR + 前后端同栈复用 Zod schema）：筛选 chips + 可排序表 + 行展开看全字段与来源 + 陈旧(plan)/age(per-fact)徽标；「估算中等任务轮次」做成**带旋钮的区间**、视觉次于官方原始额度、挂 ⚠ 估算；per-fact `lastCheckedDate` 进哈希仍稳定 | ~1.5 周 | **已落地归档**（PR #48）：浏览器 10s 内答四问、每格可溯源；首个公开页 XSS/CSP 基线 + WCAG 2.2 AA |
 | **5d-C** | **桶2真价人工策展执行（本变更，`add-model-radar-bucket2-price-curation`）**：经既有授权改价入口 `recordPriceChange` 把桶2 coding_plan 可核实**真月付(month-to-month)标准价**从 `needs_login_recheck` 占位转已核官方价（仅年/季付者留占位、不÷12 admit；促销/限时价不录）；经既有 5d-A 链自动流到只读快照/比价页，零新接线 | ~0.5 周 | **条件化（非保证）**：某 (coding_plan, currency) 同档可核到**可比 ≥2 同币种** → 比价页从「数据不足」转出真实最划算；不达 → 诚实留「数据不足」（不凑数） |
 | **browser egress 生产启用**（延后，独立步骤）| browser-worker 生产 egress 部署封锁（封 RFC1918/link-local/metadata、启动自检 fail-closed，5c-④）+ 自动 Playwright 抓取——经 6/6 评审判定在 Docker Desktop 目标上**不可正向验证** + 结构上**重复 ingestion 既有需求**，已从 5d-C **剥离延后**到真开自动抓取那步（届时 **MODIFY** `model-radar-ingestion`「Playwright 沙箱锁定」补部署机制 + 正向勘验，即用即验）| 延后（不在本期）| 真开自动抓取时验：egress fail-closed 实跑勘验 + browser-worker 受控生产消费 |
-| **5e** | 垂类选型推荐器：规则硬筛（含某模型/工具/预算）→ RAG 证据（接知识库 + 变更流）→ LLM 解释 → 首选/备选/不推荐/落地；MCP 暴露 `recommend_coding_subscription` | ~1–1.5 周 | 「重度用 Claude Code + GLM-5.2 最便宜可用」给出排名 + 是否撞窗 + 月成本 + 依据 |
+| **5e** ✅ | 垂类选型推荐器 **v1（规则 + 模板，LLM/RAG 留 v2）**：规则硬筛召回（经 vetted `queryModelRadarSnapshot` money-path、含某模型/工具/预算、currency/budget 不喂 query 锁币种组）+ 撞窗判定（snapshot 层 `fitsWindow` 纯数值原语、按 limitType 分派、口径未知不假装）+ 四态有序 verdict（首选/备选/不推荐/待核）+ **可插拔模板解释层**（`ExplanationInput→Promise`、`evidence?` 槽留 v2 RAG+LLM、召回不动）；MCP 单工具 `recommend_coding_subscription`（env-clean 动态取快照、只读 fail-closed） | ~1–1.5 周 | **已落地归档**（PR #50）：「重度用 Claude Code + **GLM-4.6** 最便宜可用」→ 首选 GLM Lite ¥49 + 撞窗(现数据口径未知如实标「额度口径未知」) + 月成本 + per-fact 依据；从 Claude/Cursor 直接调用 |
 
 > 桶2 之后按需补桶：Token/Credit Plan（GLM/MiniMax/MiMo/Step/Kimi，价格有区分但 credit 口径异构需归一化护栏）、IDE会员（Trae/Qoder/Comate/CodeBuddy/Raccoon，最异构）、企业席位。渠道/代理转售包列**第二阶段**单独表，不混入厂商官方榜。
 
@@ -81,6 +81,19 @@
 | 数据红线（未核价不冒充已核） | ✅ 已实现 | confidence↔price 绑定落共享 `mrPlanWriteSchema`（覆盖 `upsertPlan` 新建插入）+ `recordPriceChange` 官方断言；金额量级无关校验（负/NaN/Infinity/超 scale/JS 进制字面量全拒）；provenance `sourceUrl` 非空（读写两侧）。 |
 
 > **持续运营动作（未结，非「写完即完成」）**：桶2 真实价格策展——本期 5 家（百炼/千帆/腾讯/火山/讯飞）结构性录入但 **0 已核价**（NULL + `needs_login_recheck` 占位），真实价由 **5d-C 桶2真价人工策展**（`add-model-radar-bucket2-price-curation`）经既有授权改价入口 `recordPriceChange` 人工录入——与 browser/egress 启用**正交、不以其为前置**（egress 勘验已拆出延后到真开自动抓取那步）。常驻周期 rebuild worker（链7）+ 跨进程 Redis pub/sub 失效**已随 5d-A 装配并归档**（PR #47；5c 当时仅交付可调 rebuild job body + CI 测，5d-A 接 live 消费者）。
+
+### 5e 退出标准达成
+
+`add-model-radar-recommender` 提案已实现并归档（PR #50 合并；主规范新增 `model-radar-recommender` 5 需求）。退出标准由纯函数推荐器 + DB 精确事实保障并有测试覆盖（`src/mr/recommend` / `src/mr/snapshot/limits` / `src/mcp/tools/recommend-coding` 全量 vitest 全绿）。经 **3 轮 propose review-loop + 2 轮 code review-loop**（Codex + Code Reviewer + Reality Checker §1b + MCP Builder 增援 + Ponytail）+ CodeRabbit 复审收敛。tech-plan 锁 **v1=规则+模板**，RAG 证据 + LLM 解释为 v2（仅换可插拔解释层、召回不动）。
+
+| 退出标准 | 状态 | 实现与证据 |
+| --- | --- | --- |
+| 「重度 Claude Code + GLM-4.6 最便宜可用」给出排名 | ✅ 已实现 | 召回经 vetted `queryModelRadarSnapshot`（**不手搓 money-path**）；四态有序 verdict（`insufficient_data` > `not_recommended` > `primary`(eligible 最低) > `alternative`）；退出用例测 → 首选 GLM Lite ¥49、Pro ¥149 转 alternative。 |
+| 是否撞窗 + 月成本 + 依据 | ✅ 已实现 | 撞窗经 snapshot 层纯数值原语 `fitsWindow`（6-arm 按 limitType 分派、空限额/口径未知→`unknown` 不假装、多限额取最紧）、标 **⚠ 估算**不进哈希；现数据桶2 全 `value:NULL` → 如实标「额度口径未知」；每条候选带 per-fact `source_url`/`lastCheckedDate`/`source_confidence`。 |
+| 从 Claude/Cursor 直接调用 | ✅ 已实现 | MCP 单工具 `recommend_coding_subscription`（native ZodRawShape 入参 + `.describe()` 枚举、`structuredContent`+`readOnlyHint`）；**env-clean 动态取快照**（`build.ts` `import type` + `thresholdDays` 必填，仅 `DATABASE_URL` 的 MCP 进程现 build 不崩，`query-chain-env` 静态+剪裁-env 实跑双守卫）；只读、快照不可用 fail-closed（不编推荐）。 |
+
+> **诚实红线（程序+DB 保障）**：价格/兼容/额度 = DB 精确事实、规则不离谱；撞窗 = ⚠ 估算、不进哈希；未核价/待核标 `insufficient_data` 不冤判「不推荐」（沿用比价页「数据不足」诚实）；不跨桶/跨币 FX（锁请求币种组、剔他币种已知价）；解释层 v1 无 LLM、`evidence?` 槽留 v2。
+> **5e v2（未结，后续）**：把模板解释层换为 RAG 证据（接知识库 + 变更流）+ LLM 解释，召回/候选 schema 不动（`ExplanationInput→Promise` 接口已留缝）。
 
 ## P1 退出标准达成
 
