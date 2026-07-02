@@ -6,8 +6,15 @@
  * render 层算、**绝不进快照内容哈希 / 不碰 money-path**（最划算/价格排序仍由 queryModelRadarSnapshot 决定，
  * 见 model-radar-page.tsx）。
  */
-import type { SnapshotPlan, SnapshotPlanGroup } from '../snapshot/dto.js';
+import type { MrBillingPeriod } from '../../db/mr-schema.zod.js';
+import type { SnapshotPeriodPrice, SnapshotPlan, SnapshotPlanGroup } from '../snapshot/dto.js';
 import { DEFAULT_TOKENS_PER_ROUND } from '../snapshot/limits.js';
+
+/** 周期名（子行文案 + 最佳周期徽标 + 溯源行标签共用）。 */
+export const PERIOD_LABELS: Record<MrBillingPeriod, string> = {
+  quarterly: '季付',
+  annual: '年付',
+};
 
 const MS_PER_DAY = 86_400_000;
 
@@ -228,4 +235,72 @@ export function resolveTokensPerRound(raw: string | undefined): number {
   if (raw == null) return DEFAULT_TOKENS_PER_ROUND;
   const n = Number(raw);
   return TOKENS_PER_ROUND_VALUES.has(n) ? n : DEFAULT_TOKENS_PER_ROUND;
+}
+
+// ───────────────────────── 周期价 / 最佳周期 / availability（组 A / task 1.x，design D2/D3/D4）─────────────────────────
+
+/**
+ * 最佳周期判定（task 1.1 / design D3）——**单一**抑制之家，组件层不再设并行守卫。
+ * 只比**同币种**（`periodPrice.currency === plan.currency`）的已核周期价，取最低 `effectiveMonthly`，
+ * 仅当**严格低于** canonical 月价时返回其 `billingPeriod`，否则 null。返回 null 的全部情形：
+ * 月价 `priceStatus!=='known'`（无合法基线）/ `availability=discontinued`（停售抑制）/ 无同币种已核周期价 /
+ * 月付最低 / 平局。同币种季年并列最低 → 确定性择 annual（更长承诺）。
+ * 判定用**未取整精确** `effectiveMonthly` 与 `Number(plan.currentPrice)` 基线（currentPrice 是 string，须 `Number()`）——
+ * 纯读 DTO、不重算、不碰 money-path、不新增哈希输入。
+ */
+export function bestPeriod(plan: SnapshotPlan): MrBillingPeriod | null {
+  if (plan.priceStatus !== 'known' || plan.currentPrice === null) return null;
+  if (plan.availability === 'discontinued') return null;
+  const baseline = Number(plan.currentPrice);
+
+  let winner: MrBillingPeriod | null = null;
+  let bestVal = Infinity;
+  for (const pp of plan.periodPrices) {
+    if (pp.priceStatus !== 'known' || pp.currency !== plan.currency || pp.effectiveMonthly === null) {
+      continue;
+    }
+    const em = pp.effectiveMonthly;
+    // 严格更低取之；相等时 annual 优先（更长承诺）→ 与迭代序无关的确定性择一。
+    if (em < bestVal || (em === bestVal && pp.billingPeriod === 'annual')) {
+      bestVal = em;
+      winner = pp.billingPeriod;
+    }
+  }
+  return winner !== null && bestVal < baseline ? winner : null;
+}
+
+export interface AvailabilityBadge {
+  kind: 'discontinued' | 'unknown';
+  /** 文字标签（a11y：状态不靠颜色/emoji 单独承载）。 */
+  label: string;
+  /** 装饰 emoji（渲染时 `aria-hidden`）。 */
+  emoji: string;
+}
+
+/**
+ * availability 徽标判定（task 1.2 / design D4）：`discontinued`→已停售、`unknown`→状态未知、
+ * `on_sale`→无标（返回 null，组件不渲染）。与 age/status 徽标同风格（文字标签 + 装饰 emoji）。
+ */
+export function availabilityBadge(availability: SnapshotPlan['availability']): AvailabilityBadge | null {
+  if (availability === 'discontinued') return { kind: 'discontinued', label: '已停售', emoji: '🚫' };
+  if (availability === 'unknown') return { kind: 'unknown', label: '状态未知', emoji: '❓' };
+  return null; // on_sale 默认态，静默
+}
+
+/** 折算月价展示值：四舍五入到最多两位小数并去末尾 0（`79` 而非 `79.00`；`91.58` 保留）。仅展示、不改写 DTO。 */
+function displayMonthly(effectiveMonthly: number): string {
+  return String(Math.round(effectiveMonthly * 100) / 100);
+}
+
+/**
+ * 周期子行折算文案（task 1.3 / design D2）：
+ * 已核 → `{周期} {currency} {price}（≈{currency} {折算展示值}/月）`（币种代码 + 空格 + 金额）；
+ * 未核 → `{周期} 待核`（不编造折算）。
+ */
+export function periodPriceLine(pp: SnapshotPeriodPrice): string {
+  const period = PERIOD_LABELS[pp.billingPeriod];
+  if (pp.priceStatus !== 'known' || pp.price === null || pp.effectiveMonthly === null) {
+    return `${period} 待核`;
+  }
+  return `${period} ${pp.currency} ${pp.price}（≈${pp.currency} ${displayMonthly(pp.effectiveMonthly)}/月）`;
 }
