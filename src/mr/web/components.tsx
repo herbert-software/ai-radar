@@ -13,8 +13,12 @@ import type { SnapshotPlan, SnapshotPlanGroup, SnapshotProvenance } from '../sna
 import { estimateRounds } from '../snapshot/limits.js';
 import {
   ageBadge,
+  availabilityBadge,
+  bestPeriod,
   cheapestInfo,
   oldestFactBadge,
+  periodPriceLine,
+  PERIOD_LABELS,
   resolveTokensPerRound,
   safeHref,
   sortPlansByFreshness,
@@ -22,6 +26,7 @@ import {
   withParams,
   TOKENS_PER_ROUND_OPTIONS,
   type AgeBadge,
+  type AvailabilityBadge,
   type FacetOptions,
   type FreshnessSort,
 } from './render.js';
@@ -74,6 +79,14 @@ const PAGE_CSS = `
   .badge-cheap { background: #d6f5d6; color: #134a13; font-weight: 600; }
   .badge-stale { background: #fde2e2; color: #8a1c1c; }
   .badge-review { background: #fff0d6; color: #7a4a00; }
+  .badge-best-period { background: #e2e8ff; color: #2c3e9e; font-weight: 600; }  /* 最佳周期：区别于绿色「最划算」 */
+  .badge-discontinued { background: #ebebeb; color: #3a3a3a; }                   /* 已停售：中性 dead 态 */
+  .badge-unknown { background: #e6ecf5; color: #274060; }                        /* 状态未知：次级态 */
+  /* 周期子行：视觉次于月价（小字），文字自身承载周期/折算，颜色仅装饰。 */
+  .period-price { font-size: .85rem; color: #444; margin-top: .2rem; }
+  .price-struck { text-decoration: line-through; }
+  /* 停售行降权：整行置灰（背景 + 文字 #4a4a4a 仍 ≥4.5:1）；状态靠「已停售」徽标 + 月价删除线承载，灰仅装饰。 */
+  .row-discontinued td, .row-discontinued th { background: #f7f7f7; color: #4a4a4a; }
   .age-today { color: #134a13; }
   .age-days { color: #7a4a00; }
   .age-unchecked, .unchecked { color: #595959; font-style: italic; }
@@ -96,6 +109,20 @@ const AgeBadgeView: FC<{ badge: AgeBadge }> = ({ badge }) => {
       {badge.label}
     </span>
   );
+};
+
+/** availability 徽标（emoji `aria-hidden`，状态由文字承载）；on_sale 静默由 `availabilityBadge` 返 null 决定，此处只渲实心徽标。 */
+const AvailabilityBadgeView: FC<{ badge: AvailabilityBadge }> = ({ badge }) => (
+  <span class={`badge ${badge.kind === 'discontinued' ? 'badge-discontinued' : 'badge-unknown'}`}>
+    <span aria-hidden="true">{badge.emoji}</span>
+    {badge.label}
+  </span>
+);
+
+/** 套餐名旁的 availability 小标：仅 discontinued/unknown 出标，on_sale → 不渲染（含前导空格由调用点提供）。 */
+const AvailabilityTag: FC<{ availability: SnapshotPlan['availability'] }> = ({ availability }) => {
+  const badge = availabilityBadge(availability);
+  return badge ? <AvailabilityBadgeView badge={badge} /> : null;
 };
 
 /**
@@ -286,6 +313,9 @@ const ProvenanceDetails: FC<{ plan: SnapshotPlan; now: Date }> = ({ plan, now })
     <summary>溯源</summary>
     <ul>
       <ProvenanceLine label="价格" prov={plan.provenance} now={now} />
+      {plan.periodPrices.map((pp) => (
+        <ProvenanceLine label={`${PERIOD_LABELS[pp.billingPeriod]}价（${pp.currency}）`} prov={pp.provenance} now={now} />
+      ))}
       {plan.models.map((m) => (
         <ProvenanceLine label={`模型 ${modelLabel(m.family, m.version)}`} prov={m.provenance} now={now} />
       ))}
@@ -306,37 +336,59 @@ const ProvenanceDetails: FC<{ plan: SnapshotPlan; now: Date }> = ({ plan, now })
   </details>
 );
 
-/** 价格格：已核 → 币种+价（不 format，防 NPE）+ 最划算标 + age；未核 → 「待核」占位（task 3.2/4.2）。 */
+/**
+ * 价格格（拆段，task 2.1/2.2/2.3）：月价段与周期段各自独立渲染，月价待核不遮蔽已核周期子行。
+ * 月价段保留 `currentPrice!==null && currency!==null` null-format 守卫（防 SSR NPE）；停售时月价删除线。
+ * 周期子行文案用 `periodPriceLine`（不带内联 age，D6）；最佳周期徽标挂在 `bestPeriod` 命中的子行（停售抑制已在 bestPeriod 内实现）。
+ */
 const PriceCell: FC<{ plan: SnapshotPlan; now: Date; isCheapest: boolean }> = ({ plan, now, isCheapest }) => {
-  if (plan.priceStatus === 'known' && plan.currentPrice !== null && plan.currency !== null) {
-    return (
-      <td>
-        <span>
-          {plan.currency} {plan.currentPrice}
-        </span>
-        {isCheapest ? (
-          <>
-            {' '}
-            <span class="badge badge-cheap">
-              <span aria-hidden="true">⭐</span>最划算
-            </span>
-          </>
-        ) : null}
-        <br />
-        <AgeBadgeView badge={ageBadge(plan.provenance.lastCheckedDate, now)} />
-      </td>
-    );
-  }
+  const winner = bestPeriod(plan);
+  const struck = plan.availability === 'discontinued';
   return (
     <td>
-      <span class="unchecked">待核</span>
+      {plan.priceStatus === 'known' && plan.currentPrice !== null && plan.currency !== null ? (
+        <>
+          <span class={struck ? 'price-struck' : undefined}>
+            {plan.currency} {plan.currentPrice}
+          </span>
+          {isCheapest ? (
+            <>
+              {' '}
+              <span class="badge badge-cheap">
+                <span aria-hidden="true">⭐</span>最划算
+              </span>
+            </>
+          ) : null}
+          <br />
+          <AgeBadgeView badge={ageBadge(plan.provenance.lastCheckedDate, now)} />
+        </>
+      ) : (
+        <span class="unchecked">待核</span>
+      )}
+      {plan.periodPrices.map((pp) => (
+        <div class="period-price">
+          {periodPriceLine(pp)}
+          {winner !== null && pp.billingPeriod === winner && pp.currency === plan.currency ? (
+            <>
+              {' '}
+              <span class="badge badge-best-period">
+                <span aria-hidden="true">🏆</span>最佳周期 · {PERIOD_LABELS[pp.billingPeriod]}
+              </span>
+            </>
+          ) : null}
+        </div>
+      ))}
     </td>
   );
 };
 
-/** plan 级状态徽标：🔴 待复核 / 陈旧（freshness.stale + reviewStatus.pending 聚合，禁冒充 per-cell，task 4.1）。 */
+/**
+ * plan 级状态徽标（task 2.4）：🔴 待复核 / 陈旧 / availability（三者正交聚合，禁冒充 per-cell）。
+ * availability 先于「正常」提前返回求值——`unknown` 的 fresh+已复核行不被吞成「正常」（D4）。
+ */
 const PlanStatusCell: FC<{ plan: SnapshotPlan }> = ({ plan }) => {
-  if (!plan.freshness.stale && !plan.reviewStatus.pending) {
+  const avail = availabilityBadge(plan.availability);
+  if (!avail && !plan.freshness.stale && !plan.reviewStatus.pending) {
     return (
       <td>
         <span class="muted">正常</span>
@@ -354,7 +406,8 @@ const PlanStatusCell: FC<{ plan: SnapshotPlan }> = ({ plan }) => {
         <span class="badge badge-stale">
           <span aria-hidden="true">🟠</span>陈旧
         </span>
-      ) : null}
+      ) : null}{' '}
+      {avail ? <AvailabilityBadgeView badge={avail} /> : null}
     </td>
   );
 };
@@ -451,8 +504,10 @@ const GroupTable: FC<{
       </thead>
       <tbody>
         {plans.map((p) => (
-          <tr>
-            <th scope="row">{p.name}</th>
+          <tr class={p.availability === 'discontinued' ? 'row-discontinued' : undefined}>
+            <th scope="row">
+              {p.name} <AvailabilityTag availability={p.availability} />
+            </th>
             <td>{p.vendorName}</td>
             <PriceCell plan={p} now={now} isCheapest={info.showCheapest && p.id === info.cheapestPlanId} />
             <td>

@@ -11,6 +11,7 @@ import type {
   SnapshotClient,
   SnapshotLimit,
   SnapshotModel,
+  SnapshotPeriodPrice,
   SnapshotPlan,
   SnapshotPlanGroup,
   SnapshotProvenance,
@@ -76,6 +77,28 @@ export function unknown(id: string, over: Partial<SnapshotPlan> = {}): SnapshotP
     clients: [],
     limits: [],
     sources: [],
+    ...over,
+  };
+}
+
+/**
+ * 季/年付周期价行。`price===null` → 未核（priceStatus=unknown，effectiveMonthly 必为 null，对齐 dto.superRefine）；
+ * 否则已核，`em` 须为 `price/divisor`（quarterly÷3、annual÷12）以合 superRefine。
+ */
+export function periodPrice(
+  billingPeriod: SnapshotPeriodPrice['billingPeriod'],
+  price: string | null,
+  currency: SnapshotPeriodPrice['currency'],
+  em: number | null,
+  over: Partial<SnapshotPeriodPrice> = {},
+): SnapshotPeriodPrice {
+  return {
+    billingPeriod,
+    price,
+    currency,
+    priceStatus: price === null ? 'unknown' : 'known',
+    provenance: prov(),
+    effectiveMonthly: em,
     ...over,
   };
 }
