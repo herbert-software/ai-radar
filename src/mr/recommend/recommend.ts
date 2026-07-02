@@ -51,6 +51,17 @@ const BILLING_PERIOD_LOCK_MONTHS = {
   annual: 12,
 } as const;
 
+/**
+ * 最佳周期平局偏好序 `monthly > annual > quarterly`（严格更低者先胜、相等取 rank 更高者）——
+ * 与比价页 `bestPeriod`（render.ts）对齐、且与 periodPrices 顺序无关。
+ * 键于本地合成联合类型（含 monthly，非 MrBillingPeriod 的 quarterly|annual）。
+ */
+const BILLING_PERIOD_TIEBREAK_RANK: Record<'monthly' | 'quarterly' | 'annual', number> = {
+  monthly: 3,
+  annual: 2,
+  quarterly: 1,
+} as const;
+
 export interface RecommendInput {
   model?: string;
   tool?: string;
@@ -129,7 +140,12 @@ function bestPeriodReason(plan: SnapshotPlan, preferredCurrency: MrCurrency): Ru
 
   const best = options.reduce((acc, option) => {
     if (option.effectiveMonthly < acc.effectiveMonthly) return option;
-    if (option.effectiveMonthly === acc.effectiveMonthly && acc.billingPeriod !== 'monthly') return option;
+    if (
+      option.effectiveMonthly === acc.effectiveMonthly &&
+      BILLING_PERIOD_TIEBREAK_RANK[option.billingPeriod] > BILLING_PERIOD_TIEBREAK_RANK[acc.billingPeriod]
+    ) {
+      return option;
+    }
     return acc;
   });
 

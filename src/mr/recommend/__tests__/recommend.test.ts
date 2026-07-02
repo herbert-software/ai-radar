@@ -261,6 +261,81 @@ describe('4.4/5d 最佳周期标注（不改 canonical 月价排名）', () => {
   });
 });
 
+describe('最佳周期平局规则确定性且与比价页一致（align-recommender-best-period-tiebreak）', () => {
+  it('同币种 quarterly==annual 且均严格低于月价 → 报「年付」（与比价页一致）', async () => {
+    // bit-精确相等：季付 30→10、年付 120→10，月付 15>10（触发周期↔周期 rank 平局臂）。
+    const s = snap(
+      mkPlan('tie', {
+        price: '15',
+        // annual 先于 quarterly：旧「顺序相关」reduce 会切到后出现的 quarterly，此测据此守住 rank 修复。
+        periodPrices: [
+          mkPeriodPrice({ billingPeriod: 'annual', price: '120', effectiveMonthly: 10 }),
+          mkPeriodPrice({ billingPeriod: 'quarterly', price: '30', effectiveMonthly: 10 }),
+        ],
+      }),
+    );
+    const r = await recommend(s, { tool: 'claude-code', currency: 'CNY' });
+    const best = r.candidates[0]!.reasons.find((reason) => reason.kind === 'best_period');
+    expect(best?.detail).toContain('最佳周期=年付');
+  });
+
+  it('顺序无关：periodPrices 以 [annual, quarterly] 与 [quarterly, annual] 两序输入均得「年付」', async () => {
+    const q = mkPeriodPrice({ billingPeriod: 'quarterly', price: '30', effectiveMonthly: 10 });
+    const a = mkPeriodPrice({ billingPeriod: 'annual', price: '120', effectiveMonthly: 10 });
+    for (const periodPrices of [[a, q], [q, a]]) {
+      const s = snap(mkPlan('tie', { price: '15', periodPrices }));
+      const r = await recommend(s, { tool: 'claude-code', currency: 'CNY' });
+      const best = r.candidates[0]!.reasons.find((reason) => reason.kind === 'best_period');
+      expect(best?.detail).toContain('最佳周期=年付');
+    }
+  });
+
+  it('monthly==annual 平局（无更低）→ 报「月付」（等价成本不建议锁期）', async () => {
+    const s = snap(
+      mkPlan('meq', {
+        price: '10',
+        periodPrices: [mkPeriodPrice({ billingPeriod: 'annual', price: '120', effectiveMonthly: 10 })],
+      }),
+    );
+    const r = await recommend(s, { tool: 'claude-code', currency: 'CNY' });
+    const best = r.candidates[0]!.reasons.find((reason) => reason.kind === 'best_period');
+    expect(best?.detail).toContain('最佳周期=月付');
+  });
+
+  it('三方等价（monthly==quarterly==annual）→ 报「月付」（rank 顶为 monthly，等价不锁期）', async () => {
+    const s = snap(
+      mkPlan('threeway', {
+        price: '10',
+        periodPrices: [
+          mkPeriodPrice({ billingPeriod: 'annual', price: '120', effectiveMonthly: 10 }),
+          mkPeriodPrice({ billingPeriod: 'quarterly', price: '30', effectiveMonthly: 10 }),
+        ],
+      }),
+    );
+    const r = await recommend(s, { tool: 'claude-code', currency: 'CNY' });
+    const best = r.candidates[0]!.reasons.find((reason) => reason.kind === 'best_period');
+    expect(best?.detail).toContain('最佳周期=月付');
+  });
+
+  it('回归：某周期严格更低 → 仍报该周期；异币种周期不参与（token_plan 经 recall gate 不可达、其 null 守卫见 recommend.ts 单元路径）', async () => {
+    // 季付 30→10 严格低于月付 15、年付 120→10（等价）；strict-lower 先行 → 报季付。
+    const s = snap(
+      mkPlan('strictlower', {
+        price: '15',
+        periodPrices: [
+          mkPeriodPrice({ billingPeriod: 'quarterly', price: '24', effectiveMonthly: 8 }),
+          mkPeriodPrice({ billingPeriod: 'annual', price: '120', effectiveMonthly: 10 }),
+          mkPeriodPrice({ billingPeriod: 'annual', currency: 'USD', price: '12', effectiveMonthly: 1 }), // 异币种不参与
+        ],
+      }),
+    );
+    const r = await recommend(s, { tool: 'claude-code', currency: 'CNY' });
+    const best = r.candidates[0]!.reasons.find((reason) => reason.kind === 'best_period');
+    expect(best?.detail).toContain('最佳周期=季付');
+    expect(best?.detail).toContain('有效月价 8 CNY');
+  });
+});
+
 describe('4.5 撞窗判级（⚠ 估算、口径未知不假装）', () => {
   it('现数据桶2 全 value:NULL → 所有候选 unknown「不保证不撞窗」', async () => {
     const s = snap(
